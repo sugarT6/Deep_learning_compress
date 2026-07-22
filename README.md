@@ -1,4 +1,4 @@
-# Stage 4: causal Transformer residual model
+# Stage 4: causal Transformer residual model with Q/R-mer
 
 This repository contains the stage-4 FASTQ quality residual entropy model. It
 keeps the stage-3 H5 feature construction, read split, training sampler,
@@ -30,15 +30,20 @@ normalized read length
 q_hat embedding
 previous decoded quality embedding
 previous decoded residual embedding
+Q-mer history embeddings for k = 2,3,4,6,8
+Residual-mer history embeddings for k = 2,3,4,6,8
 ```
 
-The first position uses BOS tokens for previous quality and residual. This
-initial version deliberately does not use Q-mer or R-mer features.
+The first position uses BOS tokens for previous quality and residual. Q/R-mer
+tokens use the same bucket definitions, causal history construction, stride-1
+hashing, and default vocabulary size 4096 as the stage-3 Q/R-mer experiment.
+No token includes the current or a future true quality/residual.
 
 ## Default model
 
 ```text
 feature concatenation
+  (including five Q-mer and five residual-mer embeddings)
 -> Linear + ReLU + Dropout
 -> sinusoidal positional encoding
 -> 2 causal Transformer encoder layers
@@ -56,6 +61,7 @@ num_layers = 2
 feedforward_dim = 512
 context_length = 256 positions, including the current position
 dropout = 0.1
+Q/R-mer embedding dimension = 8 per window
 ```
 
 Within each Transformer layer, position `i` directly attends only to positions
@@ -91,7 +97,7 @@ python train_sequence_residual_transformer.py \
   --steps-per-epoch 2000 \
   --batch-reads 64 \
   --eval-max-reads-per-file 5000 \
-  --output-dir runs/transformer_residual
+  --output-dir runs/transformer_residual_qrmer
 ```
 
 Small smoke run:
@@ -110,20 +116,23 @@ python train_sequence_residual_transformer.py \
 Training writes:
 
 ```text
-runs/transformer_residual/config.json
-runs/transformer_residual/train_log.csv
-runs/transformer_residual/best.pt
+runs/transformer_residual_qrmer/config.json
+runs/transformer_residual_qrmer/train_log.csv
+runs/transformer_residual_qrmer/best.pt
 ```
 
 The best checkpoint is selected by the lowest validation
 `model_avg_bits_per_quality`.
 
+For a controlled no-mer ablation, pass both `--qmer-ks ''` and `--rmer-ks ''`
+and use a separate output directory.
+
 ## Prediction and evaluation
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual/best.pt \
-  --output-csv runs/transformer_residual/predict_metrics.csv
+  runs/transformer_residual_qrmer/best.pt \
+  --output-csv runs/transformer_residual_qrmer/predict_metrics.csv
 ```
 
 The default split is the last 20% test reads. Use `--split all` to evaluate the
@@ -131,11 +140,15 @@ whole H5 file. Optional detailed outputs remain compatible with stage 3:
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual/best.pt \
-  --sample-predictions runs/transformer_residual/samples.csv \
-  --quality-prob-log runs/transformer_residual/predict_quality_prob.log \
+  runs/transformer_residual_qrmer/best.pt \
+  --sample-predictions runs/transformer_residual_qrmer/samples.csv \
+  --quality-prob-log runs/transformer_residual_qrmer/predict_quality_prob.log \
   --quality-prob-log-rows 1000
 ```
+
+The Q/R-mer settings are restored from the checkpoint during prediction. Old
+stage-4 checkpoints without Q/R-mer configuration remain loadable and use no
+Q/R-mer embeddings.
 
 ## Metrics
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -40,6 +41,20 @@ Q_BOS_TOKEN = ALPHABET_SIZE
 Q_TOKEN_COUNT = ALPHABET_SIZE + 1
 R_BOS_TOKEN = RESIDUAL_CLASSES
 R_TOKEN_COUNT = RESIDUAL_CLASSES + 1
+
+DEFAULT_MER_KS = (2, 3, 4, 6, 8)
+DEFAULT_MER_STRIDE = 1
+DEFAULT_MER_VOCAB_SIZE = 4096
+
+# Quality buckets: 0-9, 10-19, 20-24, 25-29, 30-34, 35-39, 40+.
+Q_BUCKET_COUNT = 7
+Q_MER_BOS_BUCKET = Q_BUCKET_COUNT
+Q_MER_BASE = Q_BUCKET_COUNT + 1
+
+# Residual buckets: <-4, -4, -3, -2, -1, 0, 1, 2, 3, 4, >4.
+R_BUCKET_COUNT = 11
+R_MER_BOS_BUCKET = R_BUCKET_COUNT
+R_MER_BASE = R_BUCKET_COUNT + 1
 
 # 质量值 alphabet 固定为 95，对应 Phred+33 后的 quality id: 0..94。
 # residual = q_true - q_hat，因此 residual 范围是 -94..94，共 189 类。
@@ -85,6 +100,8 @@ class SequenceBatch:
         True at real quality positions and false on padding.
     lengths:
         Original read lengths before padding.
+    qmer_tokens / rmer_tokens:
+        Causal Q/R-mer history tokens, shape [batch, max_len, num_windows].
     baseline_bits:
         Sum of -log2 P0(q_true) over real positions in this batch.
     zero_true_freq:
@@ -98,6 +115,8 @@ class SequenceBatch:
     targets: np.ndarray
     valid_mask: np.ndarray
     lengths: np.ndarray
+    qmer_tokens: np.ndarray
+    rmer_tokens: np.ndarray
     baseline_bits: float
     zero_true_freq: int
 
@@ -215,10 +234,87 @@ def _residual_log_probs(probs: np.ndarray, q_hat: np.ndarray) -> np.ndarray:
     return np.log(np.maximum(gathered, EPS)).astype(np.float32, copy=False)
 
 
+def normalize_mer_ks(values: Iterable[int] | None) -> tuple[int, ...]:
+    """Normalize Q/R-mer window lengths."""
+
+    if values is None:
+        return tuple()
+    return tuple(int(value) for value in values if int(value) > 0)
+
+
+def quality_to_bucket(q: np.ndarray) -> np.ndarray:
+    """Map quality ids 0..94 to seven coarse history buckets."""
+
+    q_i = q.astype(np.int64, copy=False)
+    buckets = np.empty_like(q_i, dtype=np.int64)
+    buckets[q_i <= 9] = 0
+    buckets[(q_i >= 10) & (q_i <= 19)] = 1
+    buckets[(q_i >= 20) & (q_i <= 24)] = 2
+    buckets[(q_i >= 25) & (q_i <= 29)] = 3
+    buckets[(q_i >= 30) & (q_i <= 34)] = 4
+    buckets[(q_i >= 35) & (q_i <= 39)] = 5
+    buckets[q_i >= 40] = 6
+    return buckets
+
+
+def residual_to_bucket(residual: np.ndarray) -> np.ndarray:
+    """Map raw residual values to eleven coarse history buckets."""
+
+    r_i = residual.astype(np.int64, copy=False)
+    buckets = np.empty_like(r_i, dtype=np.int64)
+    buckets[r_i < -4] = 0
+    buckets[r_i == -4] = 1
+    buckets[r_i == -3] = 2
+    buckets[r_i == -2] = 3
+    buckets[r_i == -1] = 4
+    buckets[r_i == 0] = 5
+    buckets[r_i == 1] = 6
+    buckets[r_i == 2] = 7
+    buckets[r_i == 3] = 8
+    buckets[r_i == 4] = 9
+    buckets[r_i > 4] = 10
+    return buckets
+
+
+def build_mer_tokens_for_read(
+    buckets: np.ndarray,
+    ks: tuple[int, ...],
+    stride: int,
+    base: int,
+    bos_bucket: int,
+    vocab_size: int,
+) -> np.ndarray:
+    """Hash causal history windows into fixed-size token vocabularies."""
+
+    length = int(buckets.shape[0])
+    if not ks:
+        return np.zeros((length, 0), dtype=np.int64)
+    if stride <= 0:
+        raise ValueError("mer stride must be positive")
+    if vocab_size <= 0:
+        raise ValueError("mer vocab size must be positive")
+
+    tokens = np.zeros((length, len(ks)), dtype=np.int64)
+    for pos in range(length):
+        for mer_idx, k in enumerate(ks):
+            code = 0
+            for distance in range(k, 0, -1):
+                hist_pos = pos - distance * stride
+                bucket = int(buckets[hist_pos]) if hist_pos >= 0 else bos_bucket
+                code = (code * base + bucket) % vocab_size
+            tokens[pos, mer_idx] = code
+    return tokens
+
+
 def build_sequence_batch(
     freqs: np.ndarray,
     observed: np.ndarray,
     local_offsets: np.ndarray,
+    qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    mer_stride: int = DEFAULT_MER_STRIDE,
+    qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+    rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
 ) -> SequenceBatch:
     """Build one padded batch from a contiguous group of reads.
 
@@ -252,6 +348,9 @@ def build_sequence_batch(
             ]
         )
 
+    qmer_ks_t = normalize_mer_ks(qmer_ks)
+    rmer_ks_t = normalize_mer_ks(rmer_ks)
+
     # 1. 从 H5 freqs 得到原始 predictor 概率分布 P0(q)。
     freqs_f, probs, log_probs = _quality_probs(freqs)
     observed_i = observed.astype(np.int64, copy=False)
@@ -284,6 +383,8 @@ def build_sequence_batch(
     q_hat_tokens = np.zeros((batch_size, max_len), dtype=np.int64)
     prev_q_tokens = np.full((batch_size, max_len), Q_BOS_TOKEN, dtype=np.int64)
     prev_r_tokens = np.full((batch_size, max_len), R_BOS_TOKEN, dtype=np.int64)
+    qmer_tokens = np.zeros((batch_size, max_len, len(qmer_ks_t)), dtype=np.int64)
+    rmer_tokens = np.zeros((batch_size, max_len, len(rmer_ks_t)), dtype=np.int64)
     targets = np.full((batch_size, max_len), PAD_TARGET, dtype=np.int64)
     valid_mask = np.zeros((batch_size, max_len), dtype=bool)
 
@@ -307,6 +408,27 @@ def build_sequence_batch(
         q_hat_tokens[read_idx, :length] = q_hat[start_i:end_i]
         targets[read_idx, :length] = targets_flat[start_i:end_i]
         valid_mask[read_idx, :length] = True
+
+        # Tokens use only positions before the current one. Missing history at
+        # the read start is represented by a dedicated BOS bucket.
+        read_q_buckets = quality_to_bucket(observed_i[start_i:end_i])
+        read_r_buckets = residual_to_bucket(residual[start_i:end_i])
+        qmer_tokens[read_idx, :length, :] = build_mer_tokens_for_read(
+            buckets=read_q_buckets,
+            ks=qmer_ks_t,
+            stride=mer_stride,
+            base=Q_MER_BASE,
+            bos_bucket=Q_MER_BOS_BUCKET,
+            vocab_size=qmer_vocab_size,
+        )
+        rmer_tokens[read_idx, :length, :] = build_mer_tokens_for_read(
+            buckets=read_r_buckets,
+            ks=rmer_ks_t,
+            stride=mer_stride,
+            base=R_MER_BASE,
+            bos_bucket=R_MER_BOS_BUCKET,
+            vocab_size=rmer_vocab_size,
+        )
 
         # teacher forcing 历史特征：
         #   训练时 prev_q/prev_r 使用真实的前一位；
@@ -334,6 +456,8 @@ def build_sequence_batch(
         targets=targets,
         valid_mask=valid_mask,
         lengths=read_lengths,
+        qmer_tokens=qmer_tokens,
+        rmer_tokens=rmer_tokens,
         baseline_bits=baseline_bits,
         zero_true_freq=zero_true_freq,
     )
@@ -352,11 +476,21 @@ class ContiguousReadBatchSampler:
         train_fraction: float,
         batch_reads: int,
         seed: int,
+        qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+        rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+        mer_stride: int = DEFAULT_MER_STRIDE,
+        qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+        rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     ) -> None:
         self.files = files
         self.train_fraction = train_fraction
         self.batch_reads = batch_reads
         self.rng = random.Random(seed)
+        self.qmer_ks = normalize_mer_ks(qmer_ks)
+        self.rmer_ks = normalize_mer_ks(rmer_ks)
+        self.mer_stride = int(mer_stride)
+        self.qmer_vocab_size = int(qmer_vocab_size)
+        self.rmer_vocab_size = int(rmer_vocab_size)
         self.infos = [inspect_h5(path) for path in files]
         self.train_reads = [split_reads(info.read_count, train_fraction)[0] for info in self.infos]
 
@@ -379,6 +513,11 @@ class ContiguousReadBatchSampler:
                         path,
                         read_start,
                         read_start + read_count,
+                        qmer_ks=self.qmer_ks,
+                        rmer_ks=self.rmer_ks,
+                        mer_stride=self.mer_stride,
+                        qmer_vocab_size=self.qmer_vocab_size,
+                        rmer_vocab_size=self.rmer_vocab_size,
                     ),
                     path,
                 )
@@ -393,6 +532,11 @@ def read_h5_read_range(
     path: Path,
     read_start: int,
     read_stop: int,
+    qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    mer_stride: int = DEFAULT_MER_STRIDE,
+    qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+    rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
 ) -> SequenceBatch:
     """Load a half-open read range [read_start, read_stop) from one H5 file."""
 
@@ -416,6 +560,11 @@ def read_h5_read_range(
         freqs=freqs,
         observed=observed,
         local_offsets=local_offsets,
+        qmer_ks=qmer_ks,
+        rmer_ks=rmer_ks,
+        mer_stride=mer_stride,
+        qmer_vocab_size=qmer_vocab_size,
+        rmer_vocab_size=rmer_vocab_size,
     )
 
 
@@ -425,6 +574,11 @@ def iter_read_batches(
     split: str,
     batch_reads: int,
     max_reads: int | None = None,
+    qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    mer_stride: int = DEFAULT_MER_STRIDE,
+    qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+    rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
 ) -> Iterator[SequenceBatch]:
     """Iterate deterministic read batches for train/test/all evaluation."""
 
@@ -451,6 +605,11 @@ def iter_read_batches(
                 path,
                 cursor,
                 end,
+                qmer_ks=qmer_ks,
+                rmer_ks=rmer_ks,
+                mer_stride=mer_stride,
+                qmer_vocab_size=qmer_vocab_size,
+                rmer_vocab_size=rmer_vocab_size,
             )
         except ValueError as exc:
             # 顺序评估时，如果某个 batch 恰好全是空 read，就直接跳过。
@@ -465,8 +624,8 @@ class ResidualTransformer(nn.Module):
 
     Position ``i`` may attend to itself because its input contains only the
     current H5 predictor features plus history shifted by one position. Future
-    tokens are hidden by a causal sliding-window mask. Q/R-mer inputs are not
-    part of this stage-4 model.
+    tokens are hidden by a causal sliding-window mask. Q/R-mer embeddings add
+    multi-scale summaries built exclusively from already decoded history.
     """
 
     def __init__(
@@ -475,6 +634,12 @@ class ResidualTransformer(nn.Module):
         q_hat_embed_dim: int = 16,
         prev_q_embed_dim: int = 16,
         prev_r_embed_dim: int = 32,
+        qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+        rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+        qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+        rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+        qmer_embed_dim: int = 8,
+        rmer_embed_dim: int = 8,
         d_model: int = 256,
         num_heads: int = 4,
         num_layers: int = 2,
@@ -496,11 +661,26 @@ class ResidualTransformer(nn.Module):
         self.continuous_dim = int(continuous_dim)
         self.d_model = int(d_model)
         self.context_length = int(context_length)
+        self.qmer_ks = normalize_mer_ks(qmer_ks)
+        self.rmer_ks = normalize_mer_ks(rmer_ks)
         self.q_hat_embedding = nn.Embedding(ALPHABET_SIZE, q_hat_embed_dim)
         self.prev_q_embedding = nn.Embedding(Q_TOKEN_COUNT, prev_q_embed_dim)
         self.prev_r_embedding = nn.Embedding(R_TOKEN_COUNT, prev_r_embed_dim)
+        self.qmer_embeddings = nn.ModuleList(
+            [nn.Embedding(qmer_vocab_size, qmer_embed_dim) for _ in self.qmer_ks]
+        )
+        self.rmer_embeddings = nn.ModuleList(
+            [nn.Embedding(rmer_vocab_size, rmer_embed_dim) for _ in self.rmer_ks]
+        )
 
-        combined_dim = continuous_dim + q_hat_embed_dim + prev_q_embed_dim + prev_r_embed_dim
+        combined_dim = (
+            continuous_dim
+            + q_hat_embed_dim
+            + prev_q_embed_dim
+            + prev_r_embed_dim
+            + len(self.qmer_ks) * qmer_embed_dim
+            + len(self.rmer_ks) * rmer_embed_dim
+        )
         self.input_projection = nn.Sequential(
             nn.Linear(combined_dim, d_model),
             nn.ReLU(),
@@ -555,6 +735,8 @@ class ResidualTransformer(nn.Module):
         q_hat: torch.Tensor,
         prev_q: torch.Tensor,
         prev_r: torch.Tensor,
+        qmer_tokens: torch.Tensor | None = None,
+        rmer_tokens: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pieces = [
@@ -563,6 +745,16 @@ class ResidualTransformer(nn.Module):
             self.prev_q_embedding(prev_q),
             self.prev_r_embedding(prev_r),
         ]
+        if self.qmer_embeddings:
+            if qmer_tokens is None:
+                raise ValueError("qmer_tokens are required by this checkpoint")
+            for mer_idx, embedding in enumerate(self.qmer_embeddings):
+                pieces.append(embedding(qmer_tokens[:, :, mer_idx]))
+        if self.rmer_embeddings:
+            if rmer_tokens is None:
+                raise ValueError("rmer_tokens are required by this checkpoint")
+            for mer_idx, embedding in enumerate(self.rmer_embeddings):
+                pieces.append(embedding(rmer_tokens[:, :, mer_idx]))
         x = self.input_projection(torch.cat(pieces, dim=-1))
         x = x + self._position_encoding(x)
 
@@ -570,10 +762,19 @@ class ResidualTransformer(nn.Module):
             if torch.any(lengths <= 0) or torch.any(lengths > x.shape[1]):
                 raise ValueError("lengths must be in [1, sequence_length]")
 
-        out = self.transformer(
-            x,
-            mask=self._attention_mask(x.shape[1], x.device),
-        )
+        # PyTorch 2.0 canonicalizes a boolean Transformer mask before entering
+        # its no-grad fast path and emits a spurious conversion warning. The
+        # mask remains causal and correct; suppress only that exact warning.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Converting mask without torch.bool dtype to bool.*",
+                category=UserWarning,
+            )
+            out = self.transformer(
+                x,
+                mask=self._attention_mask(x.shape[1], x.device),
+            )
         return self.output_head(out)
 
 
@@ -588,6 +789,8 @@ def batch_to_torch(batch: SequenceBatch, device: torch.device) -> dict[str, torc
         "targets": torch.from_numpy(batch.targets).to(device),
         "valid_mask": torch.from_numpy(batch.valid_mask).to(device),
         "lengths": torch.from_numpy(batch.lengths).to(device),
+        "qmer_tokens": torch.from_numpy(batch.qmer_tokens).to(device),
+        "rmer_tokens": torch.from_numpy(batch.rmer_tokens).to(device),
     }
 
 
@@ -629,6 +832,12 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransform
         q_hat_embed_dim=int(config["q_hat_embed_dim"]),
         prev_q_embed_dim=int(config["prev_q_embed_dim"]),
         prev_r_embed_dim=int(config["prev_r_embed_dim"]),
+        qmer_ks=config.get("qmer_ks", []),
+        rmer_ks=config.get("rmer_ks", []),
+        qmer_vocab_size=int(config.get("qmer_vocab_size", DEFAULT_MER_VOCAB_SIZE)),
+        rmer_vocab_size=int(config.get("rmer_vocab_size", DEFAULT_MER_VOCAB_SIZE)),
+        qmer_embed_dim=int(config.get("qmer_embed_dim", 8)),
+        rmer_embed_dim=int(config.get("rmer_embed_dim", 8)),
         d_model=int(config["d_model"]),
         num_heads=int(config["num_heads"]),
         num_layers=int(config["num_layers"]),

@@ -20,6 +20,9 @@ except ImportError:  # pragma: no cover
 
 from sequence_residual_transformer_model import (
     CONTINUOUS_FEATURE_DIM,
+    DEFAULT_MER_KS,
+    DEFAULT_MER_STRIDE,
+    DEFAULT_MER_VOCAB_SIZE,
     PAD_TARGET,
     RESIDUAL_CLASSES,
     ContiguousReadBatchSampler,
@@ -43,6 +46,18 @@ def fmt6(value: float) -> str:
     return f"{value:.6f}"
 
 
+def parse_int_list(text: str) -> tuple[int, ...]:
+    """Parse comma-separated positive integers, or an empty string."""
+
+    text = text.strip()
+    if not text:
+        return tuple()
+    values = tuple(int(item.strip()) for item in text.split(",") if item.strip())
+    if any(value <= 0 for value in values):
+        raise argparse.ArgumentTypeError("all values must be positive integers")
+    return values
+
+
 @torch.no_grad()
 def evaluate_model(
     model: ResidualTransformer,
@@ -52,6 +67,11 @@ def evaluate_model(
     batch_reads: int,
     max_reads_per_file: int | None,
     device: torch.device,
+    qmer_ks: tuple[int, ...],
+    rmer_ks: tuple[int, ...],
+    mer_stride: int,
+    qmer_vocab_size: int,
+    rmer_vocab_size: int,
 ) -> dict[str, float]:
     """Evaluate compression metrics on a deterministic read split."""
 
@@ -73,6 +93,11 @@ def evaluate_model(
             split=split,
             batch_reads=batch_reads,
             max_reads=max_reads_per_file,
+            qmer_ks=qmer_ks,
+            rmer_ks=rmer_ks,
+            mer_stride=mer_stride,
+            qmer_vocab_size=qmer_vocab_size,
+            rmer_vocab_size=rmer_vocab_size,
         ):
             tensors = batch_to_torch(batch, device)
             # 模型输出 [batch, seq_len, 189]，每一维对应一个 residual 类别。
@@ -81,6 +106,8 @@ def evaluate_model(
                 q_hat=tensors["q_hat"],
                 prev_q=tensors["prev_q"],
                 prev_r=tensors["prev_r"],
+                qmer_tokens=tensors["qmer_tokens"],
+                rmer_tokens=tensors["rmer_tokens"],
                 lengths=tensors["lengths"],
             )
             # 只屏蔽 q_hat + residual 超出 [0, 94] 的物理非法类别。
@@ -132,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("runs/transformer_residual"),
+        default=Path("runs/transformer_residual_qrmer"),
         help="directory for checkpoints, config, and train log",
     )
     parser.add_argument("--train-fraction", type=float, default=0.8)
@@ -159,6 +186,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q-hat-embed-dim", type=int, default=16)
     parser.add_argument("--prev-q-embed-dim", type=int, default=16)
     parser.add_argument("--prev-r-embed-dim", type=int, default=32)
+    parser.add_argument(
+        "--qmer-ks",
+        type=parse_int_list,
+        default=DEFAULT_MER_KS,
+        help="comma-separated Q-mer history windows; use '' to disable",
+    )
+    parser.add_argument(
+        "--rmer-ks",
+        type=parse_int_list,
+        default=DEFAULT_MER_KS,
+        help="comma-separated residual-mer history windows; use '' to disable",
+    )
+    parser.add_argument("--mer-stride", type=int, default=DEFAULT_MER_STRIDE)
+    parser.add_argument("--qmer-vocab-size", type=int, default=DEFAULT_MER_VOCAB_SIZE)
+    parser.add_argument("--rmer-vocab-size", type=int, default=DEFAULT_MER_VOCAB_SIZE)
+    parser.add_argument("--qmer-embed-dim", type=int, default=8)
+    parser.add_argument("--rmer-embed-dim", type=int, default=8)
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
@@ -196,6 +240,12 @@ def main() -> int:
         raise SystemExit("--d-model must be positive and divisible by --num-heads")
     if args.feedforward_dim <= 0 or args.context_length <= 0:
         raise SystemExit("--feedforward-dim and --context-length must be positive")
+    if args.mer_stride <= 0:
+        raise SystemExit("--mer-stride must be positive")
+    if args.qmer_vocab_size <= 0 or args.rmer_vocab_size <= 0:
+        raise SystemExit("Q/R-mer vocabulary sizes must be positive")
+    if args.qmer_embed_dim <= 0 or args.rmer_embed_dim <= 0:
+        raise SystemExit("Q/R-mer embedding dimensions must be positive")
 
     # 固定随机种子，方便比较不同模型/参数的实验结果。
     torch.manual_seed(args.seed)
@@ -216,7 +266,7 @@ def main() -> int:
     config = {
         "model_type": "causal_transformer_direct_residual",
         "output_parameterization": "direct_residual_logits",
-        "uses_qr_mer": False,
+        "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
         "input_files": [str(path) for path in files],
         "file_rows": {str(info.path): info.rows for info in infos},
         "file_reads": {str(info.path): info.read_count for info in infos},
@@ -239,6 +289,13 @@ def main() -> int:
         "q_hat_embed_dim": args.q_hat_embed_dim,
         "prev_q_embed_dim": args.prev_q_embed_dim,
         "prev_r_embed_dim": args.prev_r_embed_dim,
+        "qmer_ks": list(args.qmer_ks),
+        "rmer_ks": list(args.rmer_ks),
+        "mer_stride": args.mer_stride,
+        "qmer_vocab_size": args.qmer_vocab_size,
+        "rmer_vocab_size": args.rmer_vocab_size,
+        "qmer_embed_dim": args.qmer_embed_dim,
+        "rmer_embed_dim": args.rmer_embed_dim,
         "d_model": args.d_model,
         "num_heads": args.num_heads,
         "num_layers": args.num_layers,
@@ -260,13 +317,24 @@ def main() -> int:
         train_fraction=args.train_fraction,
         batch_reads=args.batch_reads,
         seed=args.seed,
+        qmer_ks=args.qmer_ks,
+        rmer_ks=args.rmer_ks,
+        mer_stride=args.mer_stride,
+        qmer_vocab_size=args.qmer_vocab_size,
+        rmer_vocab_size=args.rmer_vocab_size,
     )
-    # Transformer 输入与阶段 3 一致，但本阶段不加入 Q/R-mer 特征。
+    # Transformer 输入与阶段 3 Q/R-mer 版本使用相同的 causal features。
     model = ResidualTransformer(
         continuous_dim=CONTINUOUS_FEATURE_DIM,
         q_hat_embed_dim=args.q_hat_embed_dim,
         prev_q_embed_dim=args.prev_q_embed_dim,
         prev_r_embed_dim=args.prev_r_embed_dim,
+        qmer_ks=args.qmer_ks,
+        rmer_ks=args.rmer_ks,
+        qmer_vocab_size=args.qmer_vocab_size,
+        rmer_vocab_size=args.rmer_vocab_size,
+        qmer_embed_dim=args.qmer_embed_dim,
+        rmer_embed_dim=args.rmer_embed_dim,
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
@@ -328,6 +396,8 @@ def main() -> int:
                     q_hat=tensors["q_hat"],
                     prev_q=tensors["prev_q"],
                     prev_r=tensors["prev_r"],
+                    qmer_tokens=tensors["qmer_tokens"],
+                    rmer_tokens=tensors["rmer_tokens"],
                     lengths=tensors["lengths"],
                 )
                 # 对每个位置独立 mask 不可能 residual，避免模型给非法质量值分配概率。
@@ -365,6 +435,11 @@ def main() -> int:
                 batch_reads=args.eval_batch_reads,
                 max_reads_per_file=eval_limit,
                 device=device,
+                qmer_ks=args.qmer_ks,
+                rmer_ks=args.rmer_ks,
+                mer_stride=args.mer_stride,
+                qmer_vocab_size=args.qmer_vocab_size,
+                rmer_vocab_size=args.rmer_vocab_size,
             )
             elapsed = time.time() - started
             row = {
