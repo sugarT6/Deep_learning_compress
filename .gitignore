@@ -1,0 +1,17 @@
+# Local FASTQ/HDF5 data must never enter this repository.
+/fq/
+/h5/
+*.fq
+*.fastq
+*.fq.gz
+*.fastq.gz
+*.h5
+
+# Training artifacts and local caches.
+/runs/
+*.pt
+*.pth
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
