@@ -30,8 +30,8 @@ normalized read length
 q_hat embedding
 previous decoded quality embedding
 previous decoded residual embedding
-Q-mer history embeddings for k = 2,3,4,6,8
-Residual-mer history embeddings for k = 2,3,4,6,8
+Q-mer history embeddings for k = 2,3,4
+Residual-mer history embeddings for k = 2,3,4,6
 ```
 
 The first position uses BOS tokens for previous quality and residual. Q/R-mer
@@ -43,7 +43,7 @@ No token includes the current or a future true quality/residual.
 
 ```text
 feature concatenation
-  (including five Q-mer and five residual-mer embeddings)
+  (including three Q-mer and four residual-mer embeddings)
 -> Linear + ReLU + Dropout
 -> sinusoidal positional encoding
 -> 2 causal Transformer encoder layers

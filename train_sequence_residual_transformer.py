@@ -20,9 +20,10 @@ except ImportError:  # pragma: no cover
 
 from sequence_residual_transformer_model import (
     CONTINUOUS_FEATURE_DIM,
-    DEFAULT_MER_KS,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
+    DEFAULT_QMER_KS,
+    DEFAULT_RMER_KS,
     PAD_TARGET,
     RESIDUAL_CLASSES,
     ContiguousReadBatchSampler,
@@ -189,13 +190,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--qmer-ks",
         type=parse_int_list,
-        default=DEFAULT_MER_KS,
+        default=DEFAULT_QMER_KS,
         help="comma-separated Q-mer history windows; use '' to disable",
     )
     parser.add_argument(
         "--rmer-ks",
         type=parse_int_list,
-        default=DEFAULT_MER_KS,
+        default=DEFAULT_RMER_KS,
         help="comma-separated residual-mer history windows; use '' to disable",
     )
     parser.add_argument("--mer-stride", type=int, default=DEFAULT_MER_STRIDE)

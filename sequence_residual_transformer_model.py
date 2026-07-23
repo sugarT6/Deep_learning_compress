@@ -42,7 +42,8 @@ Q_TOKEN_COUNT = ALPHABET_SIZE + 1
 R_BOS_TOKEN = RESIDUAL_CLASSES
 R_TOKEN_COUNT = RESIDUAL_CLASSES + 1
 
-DEFAULT_MER_KS = (2, 3, 4, 6, 8)
+DEFAULT_QMER_KS = (2, 3, 4)
+DEFAULT_RMER_KS = (2, 3, 4, 6)
 DEFAULT_MER_STRIDE = 1
 DEFAULT_MER_VOCAB_SIZE = 4096
 
@@ -310,8 +311,8 @@ def build_sequence_batch(
     freqs: np.ndarray,
     observed: np.ndarray,
     local_offsets: np.ndarray,
-    qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
-    rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
+    rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -476,8 +477,8 @@ class ContiguousReadBatchSampler:
         train_fraction: float,
         batch_reads: int,
         seed: int,
-        qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
-        rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+        qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
+        rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
         mer_stride: int = DEFAULT_MER_STRIDE,
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -532,8 +533,8 @@ def read_h5_read_range(
     path: Path,
     read_start: int,
     read_stop: int,
-    qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
-    rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
+    rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -574,8 +575,8 @@ def iter_read_batches(
     split: str,
     batch_reads: int,
     max_reads: int | None = None,
-    qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
-    rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+    qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
+    rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -634,8 +635,8 @@ class ResidualTransformer(nn.Module):
         q_hat_embed_dim: int = 16,
         prev_q_embed_dim: int = 16,
         prev_r_embed_dim: int = 32,
-        qmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
-        rmer_ks: Iterable[int] | None = DEFAULT_MER_KS,
+        qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
+        rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         qmer_embed_dim: int = 8,
