@@ -46,7 +46,7 @@ feature concatenation
   (including three Q-mer and four residual-mer embeddings)
 -> Linear + ReLU + Dropout
 -> sinusoidal positional encoding
--> 2 causal Transformer encoder layers
+-> 4 causal Transformer encoder layers
 -> Linear(d_model -> 189)
 -> physical invalid-residual mask
 -> softmax P(r_i)
@@ -57,7 +57,7 @@ Default dimensions:
 ```text
 d_model = 256
 num_heads = 4
-num_layers = 2
+num_layers = 4
 feedforward_dim = 512
 context_length = 256 positions, including the current position
 dropout = 0.1

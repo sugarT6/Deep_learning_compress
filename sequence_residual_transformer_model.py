@@ -643,7 +643,7 @@ class ResidualTransformer(nn.Module):
         rmer_embed_dim: int = 8,
         d_model: int = 256,
         num_heads: int = 4,
-        num_layers: int = 2,
+        num_layers: int = 4,
         feedforward_dim: int = 512,
         context_length: int = 256,
         dropout: float = 0.1,
