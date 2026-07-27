@@ -30,8 +30,8 @@ normalized read length
 q_hat embedding
 previous decoded quality embedding
 previous decoded residual embedding
-Q-mer history embeddings for k = 2,3,4
-Residual-mer history embeddings for k = 2,3,4,6
+Q-mer history embeddings for k = 4,6
+Residual-mer history embeddings for k = 4,6
 ```
 
 The first position uses BOS tokens for previous quality and residual. Q/R-mer
@@ -43,7 +43,7 @@ No token includes the current or a future true quality/residual.
 
 ```text
 feature concatenation
-  (including three Q-mer and four residual-mer embeddings)
+  (including two Q-mer and two residual-mer embeddings)
 -> Linear + ReLU + Dropout
 -> sinusoidal positional encoding
 -> 4 causal Transformer encoder layers
@@ -63,6 +63,10 @@ context_length = 256 positions, including the current position
 dropout = 0.1
 Q/R-mer embedding dimension = 8 per window
 ```
+
+Q/R-mer token construction is vectorized across all positions in each read.
+It preserves the original causal stride-1 hash exactly while avoiding
+per-position Python loops during H5 batch construction.
 
 Within each Transformer layer, position `i` directly attends only to positions
 `max(0, i-255)..i`. With stacked layers, information can propagate farther

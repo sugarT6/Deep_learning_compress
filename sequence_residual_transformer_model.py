@@ -42,8 +42,8 @@ Q_TOKEN_COUNT = ALPHABET_SIZE + 1
 R_BOS_TOKEN = RESIDUAL_CLASSES
 R_TOKEN_COUNT = RESIDUAL_CLASSES + 1
 
-DEFAULT_QMER_KS = (2, 3, 4)
-DEFAULT_RMER_KS = (2, 3, 4, 6)
+DEFAULT_QMER_KS = (4, 6)
+DEFAULT_RMER_KS = (4, 6)
 DEFAULT_MER_STRIDE = 1
 DEFAULT_MER_VOCAB_SIZE = 4096
 
@@ -285,25 +285,44 @@ def build_mer_tokens_for_read(
     bos_bucket: int,
     vocab_size: int,
 ) -> np.ndarray:
-    """Hash causal history windows into fixed-size token vocabularies."""
+    """Hash causal history windows into fixed-size token vocabularies.
 
-    length = int(buckets.shape[0])
+    All positions in a read are updated together with NumPy operations.  The
+    only Python loops left are over the small number of window sizes and the
+    few digits within each window.  This is exactly equivalent to evaluating
+    every position independently, but avoids the previous per-position Python
+    loop in the batch-construction hot path.
+    """
+
+    buckets_i = np.asarray(buckets, dtype=np.int64)
+    if buckets_i.ndim != 1:
+        raise ValueError("mer buckets must be a 1-D array")
+    length = int(buckets_i.shape[0])
     if not ks:
         return np.zeros((length, 0), dtype=np.int64)
+    if any(k <= 0 for k in ks):
+        raise ValueError("mer window lengths must be positive")
     if stride <= 0:
         raise ValueError("mer stride must be positive")
     if vocab_size <= 0:
         raise ValueError("mer vocab size must be positive")
 
-    tokens = np.zeros((length, len(ks)), dtype=np.int64)
-    for pos in range(length):
-        for mer_idx, k in enumerate(ks):
-            code = 0
-            for distance in range(k, 0, -1):
-                hist_pos = pos - distance * stride
-                bucket = int(buckets[hist_pos]) if hist_pos >= 0 else bos_bucket
-                code = (code * base + bucket) % vocab_size
-            tokens[pos, mer_idx] = code
+    # Prefix enough BOS buckets for the largest window.  For a window of k,
+    # padded[position + window_start + digit*stride] maps to the causal
+    # history positions position-k*stride, ..., position-stride.
+    max_history = max(ks) * stride
+    padded = np.full(max_history + length, bos_bucket, dtype=np.int64)
+    padded[max_history:] = buckets_i
+    positions = np.arange(length, dtype=np.int64)
+
+    tokens = np.empty((length, len(ks)), dtype=np.int64)
+    for mer_idx, k in enumerate(ks):
+        code = np.zeros(length, dtype=np.int64)
+        window_start = max_history - k * stride
+        for digit in range(k):
+            history = padded[positions + window_start + digit * stride]
+            code = (code * base + history) % vocab_size
+        tokens[:, mer_idx] = code
     return tokens
 
 
