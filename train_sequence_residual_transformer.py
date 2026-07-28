@@ -160,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("runs/transformer_residual_qrmer"),
+        default=Path("runs/transformer_residual_4layer_qrmer_234_b128"),
         help="directory for checkpoints, config, and train log",
     )
     parser.add_argument("--train-fraction", type=float, default=0.8)
@@ -169,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-reads",
         type=int,
-        default=64,
+        default=128,
         help="number of contiguous reads sampled per training batch",
     )
     parser.add_argument(

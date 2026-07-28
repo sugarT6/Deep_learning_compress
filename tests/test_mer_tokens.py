@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -7,6 +8,7 @@ from sequence_residual_transformer_model import (
     DEFAULT_RMER_KS,
     build_mer_tokens_for_read,
 )
+from train_sequence_residual_transformer import build_parser
 
 
 def reference_mer_tokens(
@@ -33,8 +35,19 @@ def reference_mer_tokens(
 
 class MerTokenTest(unittest.TestCase):
     def test_default_windows(self) -> None:
-        self.assertEqual(DEFAULT_QMER_KS, (4, 6))
-        self.assertEqual(DEFAULT_RMER_KS, (4, 6))
+        self.assertEqual(DEFAULT_QMER_KS, (2, 3, 4))
+        self.assertEqual(DEFAULT_RMER_KS, (2, 3, 4))
+
+    def test_training_defaults(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertEqual(args.batch_reads, 128)
+        self.assertEqual(args.qmer_ks, (2, 3, 4))
+        self.assertEqual(args.rmer_ks, (2, 3, 4))
+        self.assertEqual(args.num_layers, 4)
+        self.assertEqual(
+            args.output_dir,
+            Path("runs/transformer_residual_4layer_qrmer_234_b128"),
+        )
 
     def test_vectorized_tokens_match_scalar_reference(self) -> None:
         rng = np.random.default_rng(20260727)

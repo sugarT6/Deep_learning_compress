@@ -30,8 +30,8 @@ normalized read length
 q_hat embedding
 previous decoded quality embedding
 previous decoded residual embedding
-Q-mer history embeddings for k = 4,6
-Residual-mer history embeddings for k = 4,6
+Q-mer history embeddings for k = 2,3,4
+Residual-mer history embeddings for k = 2,3,4
 ```
 
 The first position uses BOS tokens for previous quality and residual. Q/R-mer
@@ -43,7 +43,7 @@ No token includes the current or a future true quality/residual.
 
 ```text
 feature concatenation
-  (including two Q-mer and two residual-mer embeddings)
+  (including three Q-mer and three residual-mer embeddings)
 -> Linear + ReLU + Dropout
 -> sinusoidal positional encoding
 -> 4 causal Transformer encoder layers
@@ -62,6 +62,7 @@ feedforward_dim = 512
 context_length = 256 positions, including the current position
 dropout = 0.1
 Q/R-mer embedding dimension = 8 per window
+training batch = 128 contiguous reads
 ```
 
 Q/R-mer token construction is vectorized across all positions in each read.
@@ -99,10 +100,18 @@ Run from this repository directory:
 python train_sequence_residual_transformer.py \
   --epochs 10 \
   --steps-per-epoch 2000 \
-  --batch-reads 64 \
+  --batch-reads 128 \
   --eval-max-reads-per-file 5000 \
-  --output-dir runs/transformer_residual_qrmer
+  --output-dir runs/transformer_residual_4layer_qrmer_234_b128
 ```
+
+With 2,000 steps per epoch, increasing `batch_reads` from 64 to 128 doubles
+the number of sampled reads per epoch while keeping the number of optimizer
+updates fixed. Dense Transformer attention memory grows approximately
+linearly with this batch setting and quadratically with the longest padded
+read in a batch. If a 128-read batch exceeds GPU memory, use 64 reads and
+increase `--steps-per-epoch` to 4000 to retain the same sampled-read budget
+with more optimizer updates.
 
 Small smoke run:
 
@@ -120,9 +129,9 @@ python train_sequence_residual_transformer.py \
 Training writes:
 
 ```text
-runs/transformer_residual_qrmer/config.json
-runs/transformer_residual_qrmer/train_log.csv
-runs/transformer_residual_qrmer/best.pt
+runs/transformer_residual_4layer_qrmer_234_b128/config.json
+runs/transformer_residual_4layer_qrmer_234_b128/train_log.csv
+runs/transformer_residual_4layer_qrmer_234_b128/best.pt
 ```
 
 The best checkpoint is selected by the lowest validation
@@ -135,8 +144,8 @@ and use a separate output directory.
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_qrmer/best.pt \
-  --output-csv runs/transformer_residual_qrmer/predict_metrics.csv
+  runs/transformer_residual_4layer_qrmer_234_b128/best.pt \
+  --output-csv runs/transformer_residual_4layer_qrmer_234_b128/predict_metrics.csv
 ```
 
 The default split is the last 20% test reads. Use `--split all` to evaluate the
@@ -144,9 +153,9 @@ whole H5 file. Optional detailed outputs remain compatible with stage 3:
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_qrmer/best.pt \
-  --sample-predictions runs/transformer_residual_qrmer/samples.csv \
-  --quality-prob-log runs/transformer_residual_qrmer/predict_quality_prob.log \
+  runs/transformer_residual_4layer_qrmer_234_b128/best.pt \
+  --sample-predictions runs/transformer_residual_4layer_qrmer_234_b128/samples.csv \
+  --quality-prob-log runs/transformer_residual_4layer_qrmer_234_b128/predict_quality_prob.log \
   --quality-prob-log-rows 1000
 ```
 
