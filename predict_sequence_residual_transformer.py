@@ -19,9 +19,11 @@ from sequence_residual_transformer_model import (
     PAD_TARGET,
     RESIDUAL_CLASSES,
     RESIDUAL_MIN,
+    base_sidecar_path_for_h5,
     batch_to_torch,
     discover_h5_files,
     inspect_h5,
+    inspect_base_sidecar,
     iter_read_batches,
     load_checkpoint,
     mask_invalid_residual_logits,
@@ -60,6 +62,7 @@ def evaluate_file(
     max_reads: int | None,
     device: torch.device,
     mer_params: dict[str, object],
+    base_sidecar_path: Path | None,
 ) -> dict[str, float | int | str]:
     # 预测阶段同样按压缩目标评估：真实 residual 在模型分布下的 -log2 概率。
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TARGET, reduction="sum")
@@ -75,6 +78,7 @@ def evaluate_file(
         split=split,
         batch_reads=batch_reads,
         max_reads=max_reads,
+        base_sidecar_path=base_sidecar_path,
         **mer_params,
     ):
         tensors = batch_to_torch(batch, device)
@@ -87,6 +91,7 @@ def evaluate_file(
             prev_r=tensors["prev_r"],
             qmer_tokens=tensors["qmer_tokens"],
             rmer_tokens=tensors["rmer_tokens"],
+            base_ids=tensors["base_ids"],
             lengths=tensors["lengths"],
         )
         # 预测/评估时也必须做同样的非法 residual mask，保持训练和解码一致。
@@ -132,6 +137,7 @@ def write_prediction_samples(
     sample_reads: int,
     device: torch.device,
     mer_params: dict[str, object],
+    base_sidecar_path: Path | None,
 ) -> None:
     """Write position-level examples from the first sample_reads reads."""
 
@@ -144,6 +150,7 @@ def write_prediction_samples(
             split=split,
             batch_reads=sample_reads,
             max_reads=sample_reads,
+            base_sidecar_path=base_sidecar_path,
             **mer_params,
         )
     )
@@ -155,6 +162,7 @@ def write_prediction_samples(
         prev_r=tensors["prev_r"],
         qmer_tokens=tensors["qmer_tokens"],
         rmer_tokens=tensors["rmer_tokens"],
+        base_ids=tensors["base_ids"],
         lengths=tensors["lengths"],
     )
     logits = mask_invalid_residual_logits(
@@ -235,6 +243,7 @@ def write_quality_probability_log(
     rows_to_write: int,
     device: torch.device,
     mer_params: dict[str, object],
+    base_sidecar_dir: Path | None,
 ) -> int:
     """Write compact predicted quality/probability rows.
 
@@ -263,6 +272,11 @@ def write_quality_probability_log(
                 split=split,
                 batch_reads=batch_reads,
                 max_reads=None,
+                base_sidecar_path=(
+                    base_sidecar_path_for_h5(path, base_sidecar_dir)
+                    if base_sidecar_dir is not None
+                    else None
+                ),
                 **mer_params,
             ):
                 tensors = batch_to_torch(batch, device)
@@ -273,6 +287,7 @@ def write_quality_probability_log(
                     prev_r=tensors["prev_r"],
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
+                    base_ids=tensors["base_ids"],
                     lengths=tensors["lengths"],
                 )
                 logits = mask_invalid_residual_logits(
@@ -319,13 +334,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--split", choices=["test", "train", "all"], default="test")
     parser.add_argument("--train-fraction", type=float, default=0.8)
-    parser.add_argument("--batch-reads", type=int, default=128)
+    parser.add_argument("--batch-reads", type=int, default=64)
     parser.add_argument("--max-reads-per-file", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
+        "--base-sidecar-dir",
+        type=Path,
+        default=None,
+        help="base sidecar directory; defaults to the checkpoint configuration",
+    )
+    parser.add_argument(
         "--output-csv",
         type=Path,
-        default=Path("runs/transformer_residual_qrmer/predict_metrics.csv"),
+        default=Path(
+            "runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/"
+            "predict_metrics.csv"
+        ),
     )
     parser.add_argument(
         "--sample-predictions",
@@ -378,6 +402,17 @@ def main() -> int:
     # checkpoint 里保存了模型结构参数，所以预测时只需要传 best.pt。
     model, config = load_checkpoint(args.checkpoint, device)
     mer_params = mer_params_from_config(config)
+    uses_base_context = bool(config.get("uses_base_context", False))
+    base_sidecar_dir = args.base_sidecar_dir
+    if uses_base_context and base_sidecar_dir is None:
+        base_sidecar_dir = Path(str(config.get("base_sidecar_dir", "base_sidecars")))
+    if uses_base_context:
+        assert base_sidecar_dir is not None
+        for path in files:
+            inspect_base_sidecar(
+                path,
+                base_sidecar_path_for_h5(path, base_sidecar_dir),
+            )
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, float | int | str]] = []
@@ -392,6 +427,11 @@ def main() -> int:
             max_reads=args.max_reads_per_file,
             device=device,
             mer_params=mer_params,
+            base_sidecar_path=(
+                base_sidecar_path_for_h5(path, base_sidecar_dir)
+                if uses_base_context and base_sidecar_dir is not None
+                else None
+            ),
         )
         rows.append(metric)
         print(
@@ -445,6 +485,11 @@ def main() -> int:
             sample_reads=args.sample_reads,
             device=device,
             mer_params=mer_params,
+            base_sidecar_path=(
+                base_sidecar_path_for_h5(files[0], base_sidecar_dir)
+                if uses_base_context and base_sidecar_dir is not None
+                else None
+            ),
         )
 
     quality_log_rows = 0
@@ -459,6 +504,7 @@ def main() -> int:
             rows_to_write=args.quality_prob_log_rows,
             device=device,
             mer_params=mer_params,
+            base_sidecar_dir=base_sidecar_dir if uses_base_context else None,
         )
 
     print(f"wrote {args.output_csv}")

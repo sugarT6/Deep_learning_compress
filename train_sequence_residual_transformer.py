@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover
 
 from sequence_residual_transformer_model import (
     CONTINUOUS_FEATURE_DIM,
+    DEFAULT_BASE_CONV_KERNELS,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
     DEFAULT_QMER_KS,
@@ -28,9 +29,11 @@ from sequence_residual_transformer_model import (
     RESIDUAL_CLASSES,
     ContiguousReadBatchSampler,
     ResidualTransformer,
+    base_sidecar_path_for_h5,
     batch_to_torch,
     discover_h5_files,
     inspect_h5,
+    inspect_base_sidecar,
     iter_read_batches,
     mask_invalid_residual_logits,
     save_json,
@@ -73,6 +76,7 @@ def evaluate_model(
     mer_stride: int,
     qmer_vocab_size: int,
     rmer_vocab_size: int,
+    base_sidecar_dir: Path,
 ) -> dict[str, float]:
     """Evaluate compression metrics on a deterministic read split."""
 
@@ -94,6 +98,7 @@ def evaluate_model(
             split=split,
             batch_reads=batch_reads,
             max_reads=max_reads_per_file,
+            base_sidecar_path=base_sidecar_path_for_h5(path, base_sidecar_dir),
             qmer_ks=qmer_ks,
             rmer_ks=rmer_ks,
             mer_stride=mer_stride,
@@ -109,6 +114,7 @@ def evaluate_model(
                 prev_r=tensors["prev_r"],
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
+                base_ids=tensors["base_ids"],
                 lengths=tensors["lengths"],
             )
             # 只屏蔽 q_hat + residual 超出 [0, 94] 的物理非法类别。
@@ -160,8 +166,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("runs/transformer_residual_4layer_qrmer_234_b128"),
+        default=Path("runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15"),
         help="directory for checkpoints, config, and train log",
+    )
+    parser.add_argument(
+        "--base-sidecar-dir",
+        type=Path,
+        default=Path("base_sidecars"),
+        help="directory produced by prepare_base_sidecars.py",
     )
     parser.add_argument("--train-fraction", type=float, default=0.8)
     parser.add_argument("--epochs", type=int, default=5)
@@ -169,13 +181,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-reads",
         type=int,
-        default=128,
+        default=64,
         help="number of contiguous reads sampled per training batch",
     )
     parser.add_argument(
         "--eval-batch-reads",
         type=int,
-        default=128,
+        default=64,
         help="number of contiguous reads per validation batch",
     )
     parser.add_argument(
@@ -204,6 +216,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rmer-vocab-size", type=int, default=DEFAULT_MER_VOCAB_SIZE)
     parser.add_argument("--qmer-embed-dim", type=int, default=8)
     parser.add_argument("--rmer-embed-dim", type=int, default=8)
+    parser.add_argument("--base-embed-dim", type=int, default=16)
+    parser.add_argument(
+        "--base-conv-kernels",
+        type=parse_int_list,
+        default=DEFAULT_BASE_CONV_KERNELS,
+        help="comma-separated centered odd base Conv1D kernels",
+    )
+    parser.add_argument("--base-conv-channels", type=int, default=16)
+    parser.add_argument("--base-context-dim", type=int, default=32)
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=4)
@@ -247,6 +268,16 @@ def main() -> int:
         raise SystemExit("Q/R-mer vocabulary sizes must be positive")
     if args.qmer_embed_dim <= 0 or args.rmer_embed_dim <= 0:
         raise SystemExit("Q/R-mer embedding dimensions must be positive")
+    if (
+        args.base_embed_dim <= 0
+        or args.base_conv_channels <= 0
+        or args.base_context_dim <= 0
+    ):
+        raise SystemExit("base embedding, convolution, and context dimensions must be positive")
+    if not args.base_conv_kernels or any(
+        kernel <= 0 or kernel % 2 == 0 for kernel in args.base_conv_kernels
+    ):
+        raise SystemExit("--base-conv-kernels must contain positive odd integers")
 
     # 固定随机种子，方便比较不同模型/参数的实验结果。
     torch.manual_seed(args.seed)
@@ -259,15 +290,35 @@ def main() -> int:
     for info in infos:
         if info.alphabet_size != 95:
             raise SystemExit(f"{info.path}: expected alphabet size 95, got {info.alphabet_size}")
+    base_infos = [
+        inspect_base_sidecar(
+            path,
+            base_sidecar_path_for_h5(path, args.base_sidecar_dir),
+        )
+        for path in files
+    ]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     eval_limit = None if args.eval_max_reads_per_file == 0 else args.eval_max_reads_per_file
 
     # 保存完整配置，后续 predict 脚本会从 checkpoint 里恢复模型结构。
     config = {
-        "model_type": "causal_transformer_direct_residual",
+        "model_type": "causal_transformer_direct_residual_base_conv",
         "output_parameterization": "direct_residual_logits",
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
+        "uses_base_context": True,
+        "base_context_is_bidirectional": True,
+        "complete_base_read_available_before_quality": True,
+        "body_length_is_quality_side_information": True,
+        "base_sidecar_dir": str(args.base_sidecar_dir),
+        "base_sidecar_files": {
+            str(path): str(base_sidecar_path_for_h5(path, args.base_sidecar_dir))
+            for path in files
+        },
+        "file_raw_bases": {
+            str(path): base_info.base_count
+            for path, base_info in zip(files, base_infos)
+        },
         "input_files": [str(path) for path in files],
         "file_rows": {str(info.path): info.rows for info in infos},
         "file_reads": {str(info.path): info.read_count for info in infos},
@@ -297,6 +348,10 @@ def main() -> int:
         "rmer_vocab_size": args.rmer_vocab_size,
         "qmer_embed_dim": args.qmer_embed_dim,
         "rmer_embed_dim": args.rmer_embed_dim,
+        "base_embed_dim": args.base_embed_dim,
+        "base_conv_kernels": list(args.base_conv_kernels),
+        "base_conv_channels": args.base_conv_channels,
+        "base_context_dim": args.base_context_dim,
         "d_model": args.d_model,
         "num_heads": args.num_heads,
         "num_layers": args.num_layers,
@@ -310,14 +365,13 @@ def main() -> int:
         "device": str(device),
         "seed": args.seed,
     }
-    save_json(args.output_dir / "config.json", config)
-
     # 训练时随机抽取连续 read block，兼顾随机性和 HDF5 顺序读取效率。
     sampler = ContiguousReadBatchSampler(
         files=files,
         train_fraction=args.train_fraction,
         batch_reads=args.batch_reads,
         seed=args.seed,
+        base_sidecar_dir=args.base_sidecar_dir,
         qmer_ks=args.qmer_ks,
         rmer_ks=args.rmer_ks,
         mer_stride=args.mer_stride,
@@ -336,6 +390,10 @@ def main() -> int:
         rmer_vocab_size=args.rmer_vocab_size,
         qmer_embed_dim=args.qmer_embed_dim,
         rmer_embed_dim=args.rmer_embed_dim,
+        base_embed_dim=args.base_embed_dim,
+        base_conv_kernels=args.base_conv_kernels,
+        base_conv_channels=args.base_conv_channels,
+        base_context_dim=args.base_context_dim,
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
@@ -344,6 +402,10 @@ def main() -> int:
         dropout=args.dropout,
         output_dim=RESIDUAL_CLASSES,
     ).to(device)
+    config["parameter_count"] = sum(parameter.numel() for parameter in model.parameters())
+    save_json(args.output_dir / "config.json", config)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TARGET)
 
@@ -364,6 +426,7 @@ def main() -> int:
                 "val_relative_improvement",
                 "val_total_symbols",
                 "val_zero_true_freq",
+                "gpu_peak_memory_bytes",
                 "elapsed_seconds",
             ],
         )
@@ -399,6 +462,7 @@ def main() -> int:
                     prev_r=tensors["prev_r"],
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
+                    base_ids=tensors["base_ids"],
                     lengths=tensors["lengths"],
                 )
                 # 对每个位置独立 mask 不可能 residual，避免模型给非法质量值分配概率。
@@ -441,6 +505,7 @@ def main() -> int:
                 mer_stride=args.mer_stride,
                 qmer_vocab_size=args.qmer_vocab_size,
                 rmer_vocab_size=args.rmer_vocab_size,
+                base_sidecar_dir=args.base_sidecar_dir,
             )
             elapsed = time.time() - started
             row = {
@@ -453,6 +518,11 @@ def main() -> int:
                 "val_relative_improvement": fmt6(val["relative_improvement"]),
                 "val_total_symbols": int(val["total_symbols"]),
                 "val_zero_true_freq": int(val["zero_true_freq"]),
+                "gpu_peak_memory_bytes": (
+                    int(torch.cuda.max_memory_allocated(device))
+                    if device.type == "cuda"
+                    else 0
+                ),
                 "elapsed_seconds": fmt6(elapsed),
             }
             writer.writerow(row)

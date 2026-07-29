@@ -40,13 +40,15 @@ class MerTokenTest(unittest.TestCase):
 
     def test_training_defaults(self) -> None:
         args = build_parser().parse_args([])
-        self.assertEqual(args.batch_reads, 128)
+        self.assertEqual(args.batch_reads, 64)
+        self.assertEqual(args.eval_batch_reads, 64)
         self.assertEqual(args.qmer_ks, (2, 3, 4))
         self.assertEqual(args.rmer_ks, (2, 3, 4))
+        self.assertEqual(args.base_conv_kernels, (3, 5, 7))
         self.assertEqual(args.num_layers, 4)
         self.assertEqual(
             args.output_dir,
-            Path("runs/transformer_residual_4layer_qrmer_234_b128"),
+            Path("runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15"),
         )
 
     def test_vectorized_tokens_match_scalar_reference(self) -> None:

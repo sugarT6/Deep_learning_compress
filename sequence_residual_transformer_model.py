@@ -6,14 +6,17 @@ This module implements the shared pieces for stage 4:
 * read-level HDF5 discovery and inspection;
 * conversion from H5 quality probabilities P0(q) to residual probabilities
   P0_r(r), where r = q_true - q_hat;
+* aligned full-read base side information from independent HDF5 sidecars;
+* a lightweight bidirectional local base-motif encoder;
 * causal history tokens for previous quality and previous residual;
 * padding/collation for variable-length reads;
 * a lightweight causal Transformer that predicts P(r_i | current H5 features,
   current position, previous decoded quality, previous decoded residual).
 
-The code intentionally does not read FASTQ sequence files. At this stage all
-features are derived from the H5 predictor output and the already decoded
-quality/residual history within each read.
+FASTQ parsing is kept out of the training hot path. A separate preprocessing
+script writes complete base reads to compact HDF5 sidecars. The base stream is
+assumed to have been decoded before quality decoding, so centered convolutions
+may legally use bases on both sides of the current quality position.
 """
 
 from __future__ import annotations
@@ -46,6 +49,16 @@ DEFAULT_QMER_KS = (2, 3, 4)
 DEFAULT_RMER_KS = (2, 3, 4)
 DEFAULT_MER_STRIDE = 1
 DEFAULT_MER_VOCAB_SIZE = 4096
+
+BASE_A_TOKEN = 0
+BASE_C_TOKEN = 1
+BASE_G_TOKEN = 2
+BASE_T_TOKEN = 3
+BASE_N_TOKEN = 4
+BASE_OTHER_TOKEN = 5
+BASE_PAD_TOKEN = 6
+BASE_TOKEN_COUNT = 7
+DEFAULT_BASE_CONV_KERNELS = (3, 5, 7)
 
 # Quality buckets: 0-9, 10-19, 20-24, 25-29, 30-34, 35-39, 40+.
 Q_BUCKET_COUNT = 7
@@ -83,6 +96,16 @@ class H5SequenceInfo:
     mean_read_len: float
 
 
+@dataclass(frozen=True)
+class BaseSidecarInfo:
+    path: Path
+    base_count: int
+    read_count: int
+    min_read_len: int
+    max_read_len: int
+    mean_read_len: float
+
+
 @dataclass
 class SequenceBatch:
     """A padded read-level batch.
@@ -103,6 +126,13 @@ class SequenceBatch:
         Original read lengths before padding.
     qmer_tokens / rmer_tokens:
         Causal Q/R-mer history tokens, shape [batch, max_len, num_windows].
+    base_ids:
+        Complete base reads padded with BASE_PAD_TOKEN, shape
+        [batch, max_raw_base_len]. This may be longer than the body-quality
+        tensors because trailing Q2-run positions remain available as base
+        context.
+    base_lengths:
+        Complete raw base-read lengths before padding.
     baseline_bits:
         Sum of -log2 P0(q_true) over real positions in this batch.
     zero_true_freq:
@@ -118,6 +148,8 @@ class SequenceBatch:
     lengths: np.ndarray
     qmer_tokens: np.ndarray
     rmer_tokens: np.ndarray
+    base_ids: np.ndarray
+    base_lengths: np.ndarray
     baseline_bits: float
     zero_true_freq: int
 
@@ -150,6 +182,67 @@ def discover_h5_files(paths: Iterable[str | Path]) -> list[Path]:
     if not unique:
         raise ValueError("no HDF5 files found")
     return unique
+
+
+def base_sidecar_path_for_h5(h5_path: Path, sidecar_dir: Path) -> Path:
+    """Return the deterministic sidecar path for one quality-model H5."""
+
+    return sidecar_dir / f"{h5_path.name}.bases.h5"
+
+
+def inspect_base_sidecar(h5_path: Path, sidecar_path: Path) -> BaseSidecarInfo:
+    """Validate sidecar structure and its read/body alignment with one H5."""
+
+    h5_info = inspect_h5(h5_path)
+    with h5py.File(h5_path, "r") as quality_handle:
+        body_offsets = np.asarray(quality_handle["/read_offsets"][:], dtype=np.int64)
+    body_lengths = np.diff(body_offsets)
+
+    with h5py.File(sidecar_path, "r") as base_handle:
+        for name in ("/base_ids", "/base_read_offsets", "/body_lengths"):
+            if name not in base_handle:
+                raise ValueError(f"{sidecar_path}: missing required dataset {name}")
+        if base_handle.attrs.get("format") != "fastq_full_base_sidecar_v1":
+            raise ValueError(f"{sidecar_path}: unsupported or missing sidecar format")
+        if base_handle.attrs.get("source_h5_name") != h5_path.name:
+            raise ValueError(f"{sidecar_path}: source H5 name does not match {h5_path.name}")
+
+        base_ids = base_handle["/base_ids"]
+        base_offsets = np.asarray(base_handle["/base_read_offsets"][:], dtype=np.int64)
+        stored_body_lengths = np.asarray(base_handle["/body_lengths"][:], dtype=np.int64)
+
+        if base_ids.ndim != 1:
+            raise ValueError(f"{sidecar_path}: /base_ids must be 1-D")
+        if np.dtype(base_ids.dtype).kind not in ("i", "u"):
+            raise ValueError(f"{sidecar_path}: /base_ids must use an integer dtype")
+        if base_offsets.ndim != 1 or base_offsets.size != h5_info.read_count + 1:
+            raise ValueError(
+                f"{sidecar_path}: /base_read_offsets does not match "
+                f"{h5_info.read_count} H5 reads"
+            )
+        if int(base_offsets[0]) != 0 or int(base_offsets[-1]) != int(base_ids.shape[0]):
+            raise ValueError(f"{sidecar_path}: /base_read_offsets does not match /base_ids")
+        if np.any(np.diff(base_offsets) < 0):
+            raise ValueError(f"{sidecar_path}: /base_read_offsets must be non-decreasing")
+        if stored_body_lengths.shape != body_lengths.shape or not np.array_equal(
+            stored_body_lengths, body_lengths
+        ):
+            raise ValueError(f"{sidecar_path}: /body_lengths does not match H5 /read_offsets")
+
+        base_lengths = np.diff(base_offsets)
+        if np.any(base_lengths < body_lengths):
+            bad_read = int(np.flatnonzero(base_lengths < body_lengths)[0])
+            raise ValueError(
+                f"{sidecar_path}: read {bad_read} has fewer bases than body qualities"
+            )
+        return BaseSidecarInfo(
+            path=sidecar_path,
+            base_count=int(base_ids.shape[0]),
+            read_count=h5_info.read_count,
+            min_read_len=int(base_lengths.min()) if base_lengths.size else 0,
+            max_read_len=int(base_lengths.max()) if base_lengths.size else 0,
+            mean_read_len=float(base_lengths.mean()) if base_lengths.size else 0.0,
+        )
 
 
 def inspect_h5(path: Path) -> H5SequenceInfo:
@@ -330,6 +423,8 @@ def build_sequence_batch(
     freqs: np.ndarray,
     observed: np.ndarray,
     local_offsets: np.ndarray,
+    base_ids: np.ndarray | None = None,
+    base_local_offsets: np.ndarray | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
     mer_stride: int = DEFAULT_MER_STRIDE,
@@ -354,19 +449,43 @@ def build_sequence_batch(
     # 空 read 没有 quality 字符，既没有 loss，也没有可用历史上下文。
     # 因此 batch 内只保留长度 > 0 的 read；freqs/observed 本身不需要改，
     # 因为空 read 对应 0 行数据。
-    raw_read_lengths = np.diff(local_offsets).astype(np.int64)
-    if np.any(raw_read_lengths < 0):
+    original_read_lengths = np.diff(local_offsets).astype(np.int64)
+    if np.any(original_read_lengths < 0):
         raise ValueError("local_offsets must be non-decreasing")
-    nonempty_read_lengths = raw_read_lengths[raw_read_lengths > 0]
+    nonempty_read_indices = np.flatnonzero(original_read_lengths > 0)
+    nonempty_read_lengths = original_read_lengths[nonempty_read_indices]
     if nonempty_read_lengths.size == 0:
         raise ValueError("batch contains no non-empty reads")
-    if nonempty_read_lengths.size != raw_read_lengths.size:
+    if nonempty_read_lengths.size != original_read_lengths.size:
         local_offsets = np.concatenate(
             [
                 np.asarray([0], dtype=np.int64),
                 np.cumsum(nonempty_read_lengths, dtype=np.int64),
             ]
         )
+
+    if (base_ids is None) != (base_local_offsets is None):
+        raise ValueError("base_ids and base_local_offsets must be provided together")
+    selected_base_ranges: list[tuple[int, int]] = []
+    if base_ids is not None and base_local_offsets is not None:
+        if base_ids.ndim != 1:
+            raise ValueError("base_ids must be a 1-D array")
+        if base_local_offsets.ndim != 1 or base_local_offsets.size != original_read_lengths.size + 1:
+            raise ValueError("base_local_offsets must contain one boundary per input read")
+        if int(base_local_offsets[0]) != 0 or int(base_local_offsets[-1]) != int(base_ids.size):
+            raise ValueError("base_local_offsets does not match base_ids")
+        base_read_lengths = np.diff(base_local_offsets).astype(np.int64)
+        if np.any(base_read_lengths < original_read_lengths):
+            bad_read = int(np.flatnonzero(base_read_lengths < original_read_lengths)[0])
+            raise ValueError(f"read {bad_read} has fewer bases than body qualities")
+        if base_ids.size and (
+            np.any(base_ids < 0) or np.any(base_ids >= BASE_PAD_TOKEN)
+        ):
+            raise ValueError(f"stored base ids must be in [0, {BASE_PAD_TOKEN - 1}]")
+        selected_base_ranges = [
+            (int(base_local_offsets[index]), int(base_local_offsets[index + 1]))
+            for index in nonempty_read_indices
+        ]
 
     qmer_ks_t = normalize_mer_ks(qmer_ks)
     rmer_ks_t = normalize_mer_ks(rmer_ks)
@@ -407,6 +526,23 @@ def build_sequence_batch(
     rmer_tokens = np.zeros((batch_size, max_len, len(rmer_ks_t)), dtype=np.int64)
     targets = np.full((batch_size, max_len), PAD_TARGET, dtype=np.int64)
     valid_mask = np.zeros((batch_size, max_len), dtype=bool)
+    if selected_base_ranges:
+        base_lengths = np.asarray(
+            [end - start for start, end in selected_base_ranges],
+            dtype=np.int64,
+        )
+        padded_base_ids = np.full(
+            (batch_size, int(base_lengths.max())),
+            BASE_PAD_TOKEN,
+            dtype=np.int64,
+        )
+        assert base_ids is not None
+        for read_idx, (start, end) in enumerate(selected_base_ranges):
+            padded_base_ids[read_idx, : end - start] = base_ids[start:end]
+    else:
+        # Old no-base checkpoints remain usable without a sidecar.
+        base_lengths = np.zeros(batch_size, dtype=np.int64)
+        padded_base_ids = np.empty((batch_size, 0), dtype=np.int64)
 
     for read_idx, (start, end) in enumerate(zip(local_offsets[:-1], local_offsets[1:])):
         start_i = int(start)
@@ -478,6 +614,8 @@ def build_sequence_batch(
         lengths=read_lengths,
         qmer_tokens=qmer_tokens,
         rmer_tokens=rmer_tokens,
+        base_ids=padded_base_ids,
+        base_lengths=base_lengths,
         baseline_bits=baseline_bits,
         zero_true_freq=zero_true_freq,
     )
@@ -496,6 +634,7 @@ class ContiguousReadBatchSampler:
         train_fraction: float,
         batch_reads: int,
         seed: int,
+        base_sidecar_dir: Path | None = None,
         qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
         rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
         mer_stride: int = DEFAULT_MER_STRIDE,
@@ -512,6 +651,14 @@ class ContiguousReadBatchSampler:
         self.qmer_vocab_size = int(qmer_vocab_size)
         self.rmer_vocab_size = int(rmer_vocab_size)
         self.infos = [inspect_h5(path) for path in files]
+        self.base_sidecars = (
+            [base_sidecar_path_for_h5(path, base_sidecar_dir) for path in files]
+            if base_sidecar_dir is not None
+            else [None] * len(files)
+        )
+        for h5_path, sidecar_path in zip(self.files, self.base_sidecars):
+            if sidecar_path is not None:
+                inspect_base_sidecar(h5_path, sidecar_path)
         self.train_reads = [split_reads(info.read_count, train_fraction)[0] for info in self.infos]
 
         weights = np.asarray(self.train_reads, dtype=np.float64)
@@ -533,6 +680,7 @@ class ContiguousReadBatchSampler:
                         path,
                         read_start,
                         read_start + read_count,
+                        base_sidecar_path=self.base_sidecars[file_index],
                         qmer_ks=self.qmer_ks,
                         rmer_ks=self.rmer_ks,
                         mer_stride=self.mer_stride,
@@ -552,6 +700,7 @@ def read_h5_read_range(
     path: Path,
     read_start: int,
     read_stop: int,
+    base_sidecar_path: Path | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
     mer_stride: int = DEFAULT_MER_STRIDE,
@@ -576,10 +725,30 @@ def read_h5_read_range(
         freqs = np.asarray(handle["/freqs"][row_start:row_stop, :])
         observed = np.asarray(handle["/observed"][row_start:row_stop])
 
+    base_ids = None
+    base_local_offsets = None
+    if base_sidecar_path is not None:
+        with h5py.File(base_sidecar_path, "r") as base_handle:
+            base_offsets = np.asarray(
+                base_handle["/base_read_offsets"][read_start : read_stop + 1],
+                dtype=np.int64,
+            )
+            if base_offsets.size != read_stop - read_start + 1:
+                raise ValueError(
+                    f"{base_sidecar_path}: requested read range is outside "
+                    "/base_read_offsets"
+                )
+            base_start = int(base_offsets[0])
+            base_stop = int(base_offsets[-1])
+            base_local_offsets = base_offsets - base_start
+            base_ids = np.asarray(base_handle["/base_ids"][base_start:base_stop], dtype=np.uint8)
+
     return build_sequence_batch(
         freqs=freqs,
         observed=observed,
         local_offsets=local_offsets,
+        base_ids=base_ids,
+        base_local_offsets=base_local_offsets,
         qmer_ks=qmer_ks,
         rmer_ks=rmer_ks,
         mer_stride=mer_stride,
@@ -594,6 +763,7 @@ def iter_read_batches(
     split: str,
     batch_reads: int,
     max_reads: int | None = None,
+    base_sidecar_path: Path | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
     mer_stride: int = DEFAULT_MER_STRIDE,
@@ -625,6 +795,7 @@ def iter_read_batches(
                 path,
                 cursor,
                 end,
+                base_sidecar_path=base_sidecar_path,
                 qmer_ks=qmer_ks,
                 rmer_ks=rmer_ks,
                 mer_stride=mer_stride,
@@ -637,6 +808,60 @@ def iter_read_batches(
             if "no non-empty reads" not in str(exc):
                 raise
         cursor = end
+
+
+class BaseContextEncoder(nn.Module):
+    """Encode local bidirectional base motifs with parallel centered Conv1D."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        kernels: Iterable[int],
+        channels: int,
+        context_dim: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        kernels_t = tuple(int(kernel) for kernel in kernels)
+        if embed_dim <= 0 or channels <= 0 or context_dim <= 0:
+            raise ValueError("base embedding, channel, and context dimensions must be positive")
+        if not kernels_t or any(kernel <= 0 or kernel % 2 == 0 for kernel in kernels_t):
+            raise ValueError("base convolution kernels must be non-empty positive odd integers")
+
+        self.kernels = kernels_t
+        self.embedding = nn.Embedding(
+            BASE_TOKEN_COUNT,
+            embed_dim,
+            padding_idx=BASE_PAD_TOKEN,
+        )
+        self.convolutions = nn.ModuleList(
+            [
+                nn.Conv1d(
+                    in_channels=embed_dim,
+                    out_channels=channels,
+                    kernel_size=kernel,
+                    padding=kernel // 2,
+                )
+                for kernel in kernels_t
+            ]
+        )
+        self.projection = nn.Sequential(
+            nn.Linear(channels * len(kernels_t), context_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, base_ids: torch.Tensor) -> torch.Tensor:
+        if base_ids.ndim != 2 or base_ids.shape[1] == 0:
+            raise ValueError("base_ids must have shape [batch, nonzero_raw_read_length]")
+        embedded = self.embedding(base_ids).transpose(1, 2)
+        branches = [torch.nn.functional.gelu(conv(embedded)) for conv in self.convolutions]
+        context = self.projection(torch.cat(branches, dim=1).transpose(1, 2))
+        # Projection/Conv biases can make padded positions nonzero. They are
+        # masked explicitly even though body targets never extend past the raw
+        # read, keeping padding behavior deterministic and testable.
+        valid = base_ids.ne(BASE_PAD_TOKEN).unsqueeze(-1)
+        return context * valid.to(dtype=context.dtype)
 
 
 class ResidualTransformer(nn.Module):
@@ -660,6 +885,10 @@ class ResidualTransformer(nn.Module):
         rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         qmer_embed_dim: int = 8,
         rmer_embed_dim: int = 8,
+        base_embed_dim: int = 0,
+        base_conv_kernels: Iterable[int] | None = None,
+        base_conv_channels: int = 0,
+        base_context_dim: int = 0,
         d_model: int = 256,
         num_heads: int = 4,
         num_layers: int = 4,
@@ -683,6 +912,12 @@ class ResidualTransformer(nn.Module):
         self.context_length = int(context_length)
         self.qmer_ks = normalize_mer_ks(qmer_ks)
         self.rmer_ks = normalize_mer_ks(rmer_ks)
+        self.base_conv_kernels = (
+            tuple(int(kernel) for kernel in base_conv_kernels)
+            if base_conv_kernels is not None
+            else tuple()
+        )
+        self.base_context_dim = int(base_context_dim)
         self.q_hat_embedding = nn.Embedding(ALPHABET_SIZE, q_hat_embed_dim)
         self.prev_q_embedding = nn.Embedding(Q_TOKEN_COUNT, prev_q_embed_dim)
         self.prev_r_embedding = nn.Embedding(R_TOKEN_COUNT, prev_r_embed_dim)
@@ -692,6 +927,18 @@ class ResidualTransformer(nn.Module):
         self.rmer_embeddings = nn.ModuleList(
             [nn.Embedding(rmer_vocab_size, rmer_embed_dim) for _ in self.rmer_ks]
         )
+        if self.base_context_dim > 0:
+            self.base_encoder: BaseContextEncoder | None = BaseContextEncoder(
+                embed_dim=base_embed_dim,
+                kernels=self.base_conv_kernels,
+                channels=base_conv_channels,
+                context_dim=self.base_context_dim,
+                dropout=dropout,
+            )
+        else:
+            if self.base_conv_kernels:
+                raise ValueError("base_context_dim must be positive when base kernels are enabled")
+            self.base_encoder = None
 
         combined_dim = (
             continuous_dim
@@ -700,6 +947,7 @@ class ResidualTransformer(nn.Module):
             + prev_r_embed_dim
             + len(self.qmer_ks) * qmer_embed_dim
             + len(self.rmer_ks) * rmer_embed_dim
+            + self.base_context_dim
         )
         self.input_projection = nn.Sequential(
             nn.Linear(combined_dim, d_model),
@@ -757,6 +1005,7 @@ class ResidualTransformer(nn.Module):
         prev_r: torch.Tensor,
         qmer_tokens: torch.Tensor | None = None,
         rmer_tokens: torch.Tensor | None = None,
+        base_ids: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pieces = [
@@ -775,6 +1024,15 @@ class ResidualTransformer(nn.Module):
                 raise ValueError("rmer_tokens are required by this checkpoint")
             for mer_idx, embedding in enumerate(self.rmer_embeddings):
                 pieces.append(embedding(rmer_tokens[:, :, mer_idx]))
+        if self.base_encoder is not None:
+            if base_ids is None:
+                raise ValueError("base_ids are required by this checkpoint")
+            if base_ids.shape[0] != continuous.shape[0]:
+                raise ValueError("base_ids batch size does not match quality features")
+            if base_ids.shape[1] < continuous.shape[1]:
+                raise ValueError("complete base reads are shorter than padded body qualities")
+            base_context = self.base_encoder(base_ids)
+            pieces.append(base_context[:, : continuous.shape[1], :])
         x = self.input_projection(torch.cat(pieces, dim=-1))
         x = x + self._position_encoding(x)
 
@@ -811,6 +1069,8 @@ def batch_to_torch(batch: SequenceBatch, device: torch.device) -> dict[str, torc
         "lengths": torch.from_numpy(batch.lengths).to(device),
         "qmer_tokens": torch.from_numpy(batch.qmer_tokens).to(device),
         "rmer_tokens": torch.from_numpy(batch.rmer_tokens).to(device),
+        "base_ids": torch.from_numpy(batch.base_ids).to(device),
+        "base_lengths": torch.from_numpy(batch.base_lengths).to(device),
     }
 
 
@@ -858,6 +1118,10 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransform
         rmer_vocab_size=int(config.get("rmer_vocab_size", DEFAULT_MER_VOCAB_SIZE)),
         qmer_embed_dim=int(config.get("qmer_embed_dim", 8)),
         rmer_embed_dim=int(config.get("rmer_embed_dim", 8)),
+        base_embed_dim=int(config.get("base_embed_dim", 0)),
+        base_conv_kernels=config.get("base_conv_kernels", []),
+        base_conv_channels=int(config.get("base_conv_channels", 0)),
+        base_context_dim=int(config.get("base_context_dim", 0)),
         d_model=int(config["d_model"]),
         num_heads=int(config["num_heads"]),
         num_layers=int(config["num_layers"]),

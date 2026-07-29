@@ -1,6 +1,7 @@
 # Local FASTQ/HDF5 data must never enter this repository.
 /fq/
 /h5/
+/base_sidecars/
 *.fq
 *.fastq
 *.fq.gz
