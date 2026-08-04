@@ -60,6 +60,13 @@ BASE_PAD_TOKEN = 6
 BASE_TOKEN_COUNT = 7
 DEFAULT_BASE_CONV_KERNELS = (3, 5, 7)
 
+DIRECT_RESIDUAL_LOGITS = "direct_residual_logits"
+LOG_P0_PLUS_DELTA = "log_p0_plus_delta"
+OUTPUT_PARAMETERIZATIONS = (
+    DIRECT_RESIDUAL_LOGITS,
+    LOG_P0_PLUS_DELTA,
+)
+
 # Quality buckets: 0-9, 10-19, 20-24, 25-29, 30-34, 35-39, 40+.
 Q_BUCKET_COUNT = 7
 Q_MER_BOS_BUCKET = Q_BUCKET_COUNT
@@ -865,12 +872,16 @@ class BaseContextEncoder(nn.Module):
 
 
 class ResidualTransformer(nn.Module):
-    """Lightweight causal Transformer that directly predicts residual logits.
+    """Lightweight causal Transformer for residual-distribution logits.
 
     Position ``i`` may attend to itself because its input contains only the
     current H5 predictor features plus history shifted by one position. Future
     tokens are hidden by a causal sliding-window mask. Q/R-mer embeddings add
     multi-scale summaries built exclusively from already decoded history.
+
+    ``direct_residual_logits`` uses the output head as the final logits.
+    ``log_p0_plus_delta`` treats the output head as a correction and adds it to
+    the first 189 continuous features, which contain ``log P0_r``.
     """
 
     def __init__(
@@ -896,6 +907,7 @@ class ResidualTransformer(nn.Module):
         context_length: int = 256,
         dropout: float = 0.1,
         output_dim: int = RESIDUAL_CLASSES,
+        output_parameterization: str = DIRECT_RESIDUAL_LOGITS,
     ) -> None:
         super().__init__()
         if num_layers < 1:
@@ -906,10 +918,26 @@ class ResidualTransformer(nn.Module):
             raise ValueError("feedforward_dim must be positive")
         if context_length <= 0:
             raise ValueError("context_length must be positive")
+        if output_parameterization not in OUTPUT_PARAMETERIZATIONS:
+            raise ValueError(
+                "output_parameterization must be one of "
+                f"{OUTPUT_PARAMETERIZATIONS}, got {output_parameterization!r}"
+            )
+        if output_parameterization == LOG_P0_PLUS_DELTA:
+            if continuous_dim < RESIDUAL_CLASSES:
+                raise ValueError(
+                    "log_p0_plus_delta requires the first 189 continuous features "
+                    "to contain log P0_r"
+                )
+            if output_dim != RESIDUAL_CLASSES:
+                raise ValueError(
+                    "log_p0_plus_delta requires output_dim == RESIDUAL_CLASSES"
+                )
 
         self.continuous_dim = int(continuous_dim)
         self.d_model = int(d_model)
         self.context_length = int(context_length)
+        self.output_parameterization = output_parameterization
         self.qmer_ks = normalize_mer_ks(qmer_ks)
         self.rmer_ks = normalize_mer_ks(rmer_ks)
         self.base_conv_kernels = (
@@ -969,6 +997,12 @@ class ResidualTransformer(nn.Module):
             norm=nn.LayerNorm(d_model),
         )
         self.output_head = nn.Linear(d_model, output_dim)
+        if self.output_parameterization == LOG_P0_PLUS_DELTA:
+            # An untrained delta model should reproduce the H5 prior exactly.
+            # Subsequent optimizer steps learn which residual logits to raise
+            # or lower relative to that prior.
+            nn.init.zeros_(self.output_head.weight)
+            nn.init.zeros_(self.output_head.bias)
 
     @staticmethod
     def _position_encoding(x: torch.Tensor) -> torch.Tensor:
@@ -1053,7 +1087,11 @@ class ResidualTransformer(nn.Module):
                 x,
                 mask=self._attention_mask(x.shape[1], x.device),
             )
-        return self.output_head(out)
+        output_logits = self.output_head(out)
+        if self.output_parameterization == LOG_P0_PLUS_DELTA:
+            log_p0_r = continuous[..., :RESIDUAL_CLASSES]
+            return log_p0_r + output_logits
+        return output_logits
 
 
 def batch_to_torch(batch: SequenceBatch, device: torch.device) -> dict[str, torch.Tensor]:
@@ -1129,6 +1167,9 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransform
         context_length=int(config["context_length"]),
         dropout=float(config["dropout"]),
         output_dim=int(config["output_dim"]),
+        output_parameterization=str(
+            config.get("output_parameterization", DIRECT_RESIDUAL_LOGITS)
+        ),
     )
     model.load_state_dict(checkpoint["model_state"])
     model.to(device)

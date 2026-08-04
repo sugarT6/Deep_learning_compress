@@ -25,6 +25,9 @@ from sequence_residual_transformer_model import (
     DEFAULT_MER_VOCAB_SIZE,
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
+    DIRECT_RESIDUAL_LOGITS,
+    LOG_P0_PLUS_DELTA,
+    OUTPUT_PARAMETERIZATIONS,
     PAD_TARGET,
     RESIDUAL_CLASSES,
     ContiguousReadBatchSampler,
@@ -236,6 +239,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-layer causal attention window including the current position",
     )
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--output-parameterization",
+        choices=OUTPUT_PARAMETERIZATIONS,
+        default=DIRECT_RESIDUAL_LOGITS,
+        help=(
+            "use the output head directly, or add its learned correction to "
+            "the H5 log P0_r prior"
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -302,9 +314,14 @@ def main() -> int:
     eval_limit = None if args.eval_max_reads_per_file == 0 else args.eval_max_reads_per_file
 
     # 保存完整配置，后续 predict 脚本会从 checkpoint 里恢复模型结构。
+    model_type = (
+        "causal_transformer_log_p0_delta_residual_base_conv"
+        if args.output_parameterization == LOG_P0_PLUS_DELTA
+        else "causal_transformer_direct_residual_base_conv"
+    )
     config = {
-        "model_type": "causal_transformer_direct_residual_base_conv",
-        "output_parameterization": "direct_residual_logits",
+        "model_type": model_type,
+        "output_parameterization": args.output_parameterization,
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
         "uses_base_context": True,
         "base_context_is_bidirectional": True,
@@ -401,6 +418,7 @@ def main() -> int:
         context_length=args.context_length,
         dropout=args.dropout,
         output_dim=RESIDUAL_CLASSES,
+        output_parameterization=args.output_parameterization,
     ).to(device)
     config["parameter_count"] = sum(parameter.numel() for parameter in model.parameters())
     save_json(args.output_dir / "config.json", config)

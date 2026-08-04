@@ -7,7 +7,7 @@ GRU/TCN sequence backbone with a lightweight causal Transformer. The current
 model also uses the already-decoded full DNA read as side information through
 a small local motif branch.
 
-The model directly predicts a 189-class residual distribution:
+The model predicts a 189-class residual distribution:
 
 ```text
 q_hat_i = argmax P0_i(q)
@@ -15,8 +15,18 @@ r_i = q_true_i - q_hat_i
 P_model(r_i | H5 features at i, decoded history before i)
 ```
 
-`log P0_r` is an input feature. It is not added to the output logits; the
-Transformer output head directly produces the final residual logits.
+Two switchable output parameterizations are available:
+
+```text
+direct_residual_logits (default): final_logits = output_head(hidden)
+log_p0_plus_delta:               final_logits = log_P0_r + output_head(hidden)
+```
+
+In `log_p0_plus_delta` mode, the output head learns which H5 residual logits
+to raise or lower. Its weights and bias are initialized to zero, so the
+untrained model starts exactly at the H5 prior (before applying the same
+physical invalid-residual mask used by both modes). The H5 prior remains an
+input feature in both modes.
 
 ## Input features
 
@@ -58,6 +68,7 @@ feature concatenation
 -> sinusoidal positional encoding
 -> 4 causal Transformer encoder layers
 -> Linear(d_model -> 189)
+-> optionally add log P0_r when --output-parameterization=log_p0_plus_delta
 -> physical invalid-residual mask
 -> softmax P(r_i)
 ```
@@ -145,12 +156,32 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_residual_logits \
   --output-dir runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15
 ```
 
 This run uses 64 reads and 2,000 optimizer updates per epoch. Relative to the
 previous 128-read experiment at the same step count, it samples half as many
 reads per epoch but preserves the same number of optimizer updates.
+
+To train the H5-prior correction variant under otherwise identical settings,
+change only the output parameterization and output directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  --epochs 15 \
+  --steps-per-epoch 2000 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization log_p0_plus_delta \
+  --output-dir runs/transformer_residual_4layer_qrmer_234_baseconv357_logp0delta_b64_e15
+```
 
 Small smoke run:
 
@@ -203,9 +234,11 @@ python predict_sequence_residual_transformer.py \
   --quality-prob-log-rows 1000
 ```
 
-The Q/R-mer and base-branch settings are restored from the checkpoint during
-prediction. Old stage-4 checkpoints without a base branch remain loadable and
-do not require sidecars.
+The output parameterization, Q/R-mer settings, and base-branch settings are
+restored from the checkpoint during prediction; no prediction-side switch is
+needed. Old checkpoints without `output_parameterization` default to
+`direct_residual_logits`. Old stage-4 checkpoints without a base branch remain
+loadable and do not require sidecars.
 
 ## Metrics
 
