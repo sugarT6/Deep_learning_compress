@@ -4,8 +4,11 @@ from pathlib import Path
 import numpy as np
 
 from sequence_residual_transformer_model import (
+    DEFAULT_EXACT_Q_LAGS,
+    DEFAULT_EXACT_R_LAGS,
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
+    build_exact_lag_tokens_for_read,
     build_mer_tokens_for_read,
 )
 from train_sequence_residual_transformer import build_parser
@@ -37,6 +40,8 @@ class MerTokenTest(unittest.TestCase):
     def test_default_windows(self) -> None:
         self.assertEqual(DEFAULT_QMER_KS, (2, 3, 4))
         self.assertEqual(DEFAULT_RMER_KS, (2, 3, 4))
+        self.assertEqual(DEFAULT_EXACT_Q_LAGS, (2, 3, 4))
+        self.assertEqual(DEFAULT_EXACT_R_LAGS, (2, 3, 4))
 
     def test_training_defaults(self) -> None:
         args = build_parser().parse_args([])
@@ -44,11 +49,15 @@ class MerTokenTest(unittest.TestCase):
         self.assertEqual(args.eval_batch_reads, 64)
         self.assertEqual(args.qmer_ks, (2, 3, 4))
         self.assertEqual(args.rmer_ks, (2, 3, 4))
+        self.assertEqual(args.exact_q_lags, (2, 3, 4))
+        self.assertEqual(args.exact_r_lags, (2, 3, 4))
         self.assertEqual(args.base_conv_kernels, (3, 5, 7))
         self.assertEqual(args.num_layers, 4)
         self.assertEqual(
             args.output_dir,
-            Path("runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15"),
+            Path(
+                "runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15"
+            ),
         )
 
     def test_vectorized_tokens_match_scalar_reference(self) -> None:
@@ -92,6 +101,31 @@ class MerTokenTest(unittest.TestCase):
             vocab_size=4096,
         )
         self.assertEqual(actual.shape, (3, 0))
+
+    def test_exact_lags_are_causal_and_use_bos_for_missing_history(self) -> None:
+        actual = build_exact_lag_tokens_for_read(
+            np.asarray([10, 20, 30, 40, 50], dtype=np.int64),
+            (2, 3, 4),
+            bos_token=95,
+        )
+        expected = np.asarray(
+            [
+                [95, 95, 95],
+                [95, 95, 95],
+                [10, 95, 95],
+                [20, 10, 95],
+                [30, 20, 10],
+            ],
+            dtype=np.int64,
+        )
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_exact_lags_reject_lag_one_and_duplicates(self) -> None:
+        values = np.asarray([10, 20, 30], dtype=np.int64)
+        with self.assertRaisesRegex(ValueError, "at least 2"):
+            build_exact_lag_tokens_for_read(values, (1,), bos_token=95)
+        with self.assertRaisesRegex(ValueError, "unique"):
+            build_exact_lag_tokens_for_read(values, (2, 2), bos_token=95)
 
     def test_rejects_invalid_parameters(self) -> None:
         buckets = np.asarray([1, 2, 3], dtype=np.int64)

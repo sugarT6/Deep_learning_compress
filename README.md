@@ -42,15 +42,19 @@ normalized read length
 q_hat embedding
 previous decoded quality embedding
 previous decoded residual embedding
+exact decoded quality embeddings for q[i-2], q[i-3], q[i-4]
+exact decoded residual embeddings for r[i-2], r[i-3], r[i-4]
 Q-mer history embeddings for k = 2,3,4
 Residual-mer history embeddings for k = 2,3,4
 bidirectional local base context from complete DNA read
 ```
 
-The first position uses BOS tokens for previous quality and residual. Q/R-mer
-tokens use the same bucket definitions, causal history construction, stride-1
-hashing, and default vocabulary size 4096 as the stage-3 Q/R-mer experiment.
-No token includes the current or a future true quality/residual.
+Missing history at the start of a read uses BOS tokens. Exact lag features
+share the existing quality/residual embedding tables and occupy distinct input
+slots. Q/R-mer tokens use the same bucket definitions, causal history
+construction, stride-1 hashing, and default vocabulary size 4096 as the
+stage-3 Q/R-mer experiment. No token includes the current or a future true
+quality/residual.
 
 The quality decoder is assumed to have the complete DNA read before quality
 decoding starts. Therefore the base branch may use both previous and future
@@ -62,6 +66,7 @@ not included in the reported body-quality bits.
 
 ```text
 feature concatenation
+  (including exact q/r history lags 2,3,4)
   (including three Q-mer and three residual-mer embeddings)
   (including Base Embedding + centered Conv1D kernels 3,5,7 -> 32 dims)
 -> Linear + ReLU + Dropout
@@ -152,12 +157,14 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-batch-reads 64 \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
+  --exact-q-lags 2,3,4 \
+  --exact-r-lags 2,3,4 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
   --output-parameterization direct_residual_logits \
-  --output-dir runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15
+  --output-dir runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15
 ```
 
 This run uses 64 reads and 2,000 optimizer updates per epoch. Relative to the
@@ -175,12 +182,14 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-batch-reads 64 \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
+  --exact-q-lags 2,3,4 \
+  --exact-r-lags 2,3,4 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
   --output-parameterization log_p0_plus_delta \
-  --output-dir runs/transformer_residual_4layer_qrmer_234_baseconv357_logp0delta_b64_e15
+  --output-dir runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_logp0delta_b64_e15
 ```
 
 Small smoke run:
@@ -201,13 +210,15 @@ python train_sequence_residual_transformer.py \
 Training writes:
 
 ```text
-runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/config.json
-runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/train_log.csv
-runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/best.pt
+runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/config.json
+runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/train_log.csv
+runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/best.pt
 ```
 
-The best checkpoint is selected by the lowest validation
-`model_avg_bits_per_quality`.
+The training CSV and terminal show all floating-point values with four decimal
+places. `train_loss` is the epoch mean cross-entropy in nats over valid quality
+symbols; `train_bits_per_quality = train_loss / ln(2)`. The best checkpoint is
+selected by the lowest validation `model_avg_bits_per_quality`.
 
 For a controlled no-mer ablation, pass both `--qmer-ks ''` and `--rmer-ks ''`
 and use a separate output directory.
@@ -216,10 +227,10 @@ and use a separate output directory.
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/best.pt \
+  runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/best.pt \
   --batch-reads 64 \
   --base-sidecar-dir base_sidecars \
-  --output-csv runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/predict_metrics.csv
+  --output-csv runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/predict_metrics.csv
 ```
 
 The default split is the last 20% test reads. Use `--split all` to evaluate the
@@ -227,18 +238,21 @@ whole H5 file. Optional detailed outputs remain compatible with stage 3:
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/best.pt \
+  runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/best.pt \
   --base-sidecar-dir base_sidecars \
-  --sample-predictions runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/samples.csv \
-  --quality-prob-log runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/predict_quality_prob.log \
+  --sample-predictions runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/samples.csv \
+  --quality-prob-log runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/predict_quality_prob.log \
   --quality-prob-log-rows 1000
 ```
 
-The output parameterization, Q/R-mer settings, and base-branch settings are
+The exact-lag, output-parameterization, Q/R-mer, and base-branch settings are
 restored from the checkpoint during prediction; no prediction-side switch is
-needed. Old checkpoints without `output_parameterization` default to
+needed. Old checkpoints without exact-lag fields load with those features
+disabled. Old checkpoints without `output_parameterization` default to
 `direct_residual_logits`. Old stage-4 checkpoints without a base branch remain
-loadable and do not require sidecars.
+loadable and do not require sidecars. Prediction CSVs, optional sample outputs,
+compact probability logs, and terminal floating-point metrics use four decimal
+places.
 
 ## Metrics
 

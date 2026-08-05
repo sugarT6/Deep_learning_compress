@@ -21,6 +21,8 @@ except ImportError:  # pragma: no cover
 from sequence_residual_transformer_model import (
     CONTINUOUS_FEATURE_DIM,
     DEFAULT_BASE_CONV_KERNELS,
+    DEFAULT_EXACT_Q_LAGS,
+    DEFAULT_EXACT_R_LAGS,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
     DEFAULT_QMER_KS,
@@ -49,8 +51,8 @@ def choose_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def fmt6(value: float) -> str:
-    return f"{value:.6f}"
+def fmt4(value: float) -> str:
+    return f"{value:.4f}"
 
 
 def parse_int_list(text: str) -> tuple[int, ...]:
@@ -76,6 +78,8 @@ def evaluate_model(
     device: torch.device,
     qmer_ks: tuple[int, ...],
     rmer_ks: tuple[int, ...],
+    exact_q_lags: tuple[int, ...],
+    exact_r_lags: tuple[int, ...],
     mer_stride: int,
     qmer_vocab_size: int,
     rmer_vocab_size: int,
@@ -104,6 +108,8 @@ def evaluate_model(
             base_sidecar_path=base_sidecar_path_for_h5(path, base_sidecar_dir),
             qmer_ks=qmer_ks,
             rmer_ks=rmer_ks,
+            exact_q_lags=exact_q_lags,
+            exact_r_lags=exact_r_lags,
             mer_stride=mer_stride,
             qmer_vocab_size=qmer_vocab_size,
             rmer_vocab_size=rmer_vocab_size,
@@ -115,6 +121,8 @@ def evaluate_model(
                 q_hat=tensors["q_hat"],
                 prev_q=tensors["prev_q"],
                 prev_r=tensors["prev_r"],
+                exact_q_lags=tensors["exact_q_lags"],
+                exact_r_lags=tensors["exact_r_lags"],
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
                 base_ids=tensors["base_ids"],
@@ -169,7 +177,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15"),
+        default=Path(
+            "runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15"
+        ),
         help="directory for checkpoints, config, and train log",
     )
     parser.add_argument(
@@ -202,6 +212,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q-hat-embed-dim", type=int, default=16)
     parser.add_argument("--prev-q-embed-dim", type=int, default=16)
     parser.add_argument("--prev-r-embed-dim", type=int, default=32)
+    parser.add_argument(
+        "--exact-q-lags",
+        type=parse_int_list,
+        default=DEFAULT_EXACT_Q_LAGS,
+        help="comma-separated exact decoded quality lags; use '' to disable",
+    )
+    parser.add_argument(
+        "--exact-r-lags",
+        type=parse_int_list,
+        default=DEFAULT_EXACT_R_LAGS,
+        help="comma-separated exact decoded residual lags; use '' to disable",
+    )
     parser.add_argument(
         "--qmer-ks",
         type=parse_int_list,
@@ -276,6 +298,12 @@ def main() -> int:
         raise SystemExit("--feedforward-dim and --context-length must be positive")
     if args.mer_stride <= 0:
         raise SystemExit("--mer-stride must be positive")
+    if any(lag < 2 for lag in (*args.exact_q_lags, *args.exact_r_lags)):
+        raise SystemExit("--exact-q-lags and --exact-r-lags must contain values >= 2")
+    if len(set(args.exact_q_lags)) != len(args.exact_q_lags) or len(
+        set(args.exact_r_lags)
+    ) != len(args.exact_r_lags):
+        raise SystemExit("exact history lag lists must not contain duplicates")
     if args.qmer_vocab_size <= 0 or args.rmer_vocab_size <= 0:
         raise SystemExit("Q/R-mer vocabulary sizes must be positive")
     if args.qmer_embed_dim <= 0 or args.rmer_embed_dim <= 0:
@@ -323,6 +351,7 @@ def main() -> int:
         "model_type": model_type,
         "output_parameterization": args.output_parameterization,
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
+        "uses_exact_qr_lags": bool(args.exact_q_lags or args.exact_r_lags),
         "uses_base_context": True,
         "base_context_is_bidirectional": True,
         "complete_base_read_available_before_quality": True,
@@ -358,6 +387,8 @@ def main() -> int:
         "q_hat_embed_dim": args.q_hat_embed_dim,
         "prev_q_embed_dim": args.prev_q_embed_dim,
         "prev_r_embed_dim": args.prev_r_embed_dim,
+        "exact_q_lags": list(args.exact_q_lags),
+        "exact_r_lags": list(args.exact_r_lags),
         "qmer_ks": list(args.qmer_ks),
         "rmer_ks": list(args.rmer_ks),
         "mer_stride": args.mer_stride,
@@ -391,6 +422,8 @@ def main() -> int:
         base_sidecar_dir=args.base_sidecar_dir,
         qmer_ks=args.qmer_ks,
         rmer_ks=args.rmer_ks,
+        exact_q_lags=args.exact_q_lags,
+        exact_r_lags=args.exact_r_lags,
         mer_stride=args.mer_stride,
         qmer_vocab_size=args.qmer_vocab_size,
         rmer_vocab_size=args.rmer_vocab_size,
@@ -401,6 +434,8 @@ def main() -> int:
         q_hat_embed_dim=args.q_hat_embed_dim,
         prev_q_embed_dim=args.prev_q_embed_dim,
         prev_r_embed_dim=args.prev_r_embed_dim,
+        exact_q_lags=args.exact_q_lags,
+        exact_r_lags=args.exact_r_lags,
         qmer_ks=args.qmer_ks,
         rmer_ks=args.rmer_ks,
         qmer_vocab_size=args.qmer_vocab_size,
@@ -436,6 +471,7 @@ def main() -> int:
             log_file,
             fieldnames=[
                 "epoch",
+                "train_loss",
                 "train_bits_per_quality",
                 "train_h5_baseline_bits",
                 "val_model_avg_bits_per_quality",
@@ -478,6 +514,8 @@ def main() -> int:
                     q_hat=tensors["q_hat"],
                     prev_q=tensors["prev_q"],
                     prev_r=tensors["prev_r"],
+                    exact_q_lags=tensors["exact_q_lags"],
+                    exact_r_lags=tensors["exact_r_lags"],
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
@@ -507,6 +545,7 @@ def main() -> int:
                     step_iter.set_postfix(train_bits=f"{train_bits:.4f}")
 
             train_avg_bits = (running_nats / running_symbols) / math.log(2.0)
+            train_loss = running_nats / running_symbols
             train_baseline_bits = running_baseline_bits / running_symbols
 
             # 每个 epoch 后与 H5 baseline 比较 bits，而不是只看分类准确率。
@@ -520,6 +559,8 @@ def main() -> int:
                 device=device,
                 qmer_ks=args.qmer_ks,
                 rmer_ks=args.rmer_ks,
+                exact_q_lags=args.exact_q_lags,
+                exact_r_lags=args.exact_r_lags,
                 mer_stride=args.mer_stride,
                 qmer_vocab_size=args.qmer_vocab_size,
                 rmer_vocab_size=args.rmer_vocab_size,
@@ -528,12 +569,13 @@ def main() -> int:
             elapsed = time.time() - started
             row = {
                 "epoch": epoch,
-                "train_bits_per_quality": fmt6(train_avg_bits),
-                "train_h5_baseline_bits": fmt6(train_baseline_bits),
-                "val_model_avg_bits_per_quality": fmt6(val["model_avg_bits_per_quality"]),
-                "val_h5_baseline_avg_bits_per_quality": fmt6(val["h5_baseline_avg_bits_per_quality"]),
-                "val_delta_bits": fmt6(val["delta_bits"]),
-                "val_relative_improvement": fmt6(val["relative_improvement"]),
+                "train_loss": fmt4(train_loss),
+                "train_bits_per_quality": fmt4(train_avg_bits),
+                "train_h5_baseline_bits": fmt4(train_baseline_bits),
+                "val_model_avg_bits_per_quality": fmt4(val["model_avg_bits_per_quality"]),
+                "val_h5_baseline_avg_bits_per_quality": fmt4(val["h5_baseline_avg_bits_per_quality"]),
+                "val_delta_bits": fmt4(val["delta_bits"]),
+                "val_relative_improvement": fmt4(val["relative_improvement"]),
                 "val_total_symbols": int(val["total_symbols"]),
                 "val_zero_true_freq": int(val["zero_true_freq"]),
                 "gpu_peak_memory_bytes": (
@@ -541,16 +583,17 @@ def main() -> int:
                     if device.type == "cuda"
                     else 0
                 ),
-                "elapsed_seconds": fmt6(elapsed),
+                "elapsed_seconds": fmt4(elapsed),
             }
             writer.writerow(row)
             log_file.flush()
 
             print(
-                "epoch={epoch} train_bits={train_bits:.6f} "
-                "val_bits={val_bits:.6f} h5_bits={h5_bits:.6f} "
-                "delta={delta:.6f} rel_improve={rel:.4%} symbols={symbols}".format(
+                "epoch={epoch} loss={loss:.4f} train_bits={train_bits:.4f} "
+                "val_bits={val_bits:.4f} h5_bits={h5_bits:.4f} "
+                "delta={delta:.4f} rel_improve={rel:.4%} symbols={symbols}".format(
                     epoch=epoch,
+                    loss=train_loss,
                     train_bits=train_avg_bits,
                     val_bits=val["model_avg_bits_per_quality"],
                     h5_bits=val["h5_baseline_avg_bits_per_quality"],

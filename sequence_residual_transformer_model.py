@@ -47,6 +47,8 @@ R_TOKEN_COUNT = RESIDUAL_CLASSES + 1
 
 DEFAULT_QMER_KS = (2, 3, 4)
 DEFAULT_RMER_KS = (2, 3, 4)
+DEFAULT_EXACT_Q_LAGS = (2, 3, 4)
+DEFAULT_EXACT_R_LAGS = (2, 3, 4)
 DEFAULT_MER_STRIDE = 1
 DEFAULT_MER_VOCAB_SIZE = 4096
 
@@ -125,6 +127,9 @@ class SequenceBatch:
         Previous decoded quality token. Position 0 uses Q_BOS_TOKEN.
     prev_r:
         Previous decoded residual-class token. Position 0 uses R_BOS_TOKEN.
+    exact_q_lags / exact_r_lags:
+        Exact decoded history tokens for the configured lags, shape
+        [batch, max_len, num_lags]. Missing read-prefix history uses BOS.
     targets:
         True residual class for the current position, or PAD_TARGET on padding.
     valid_mask:
@@ -150,6 +155,8 @@ class SequenceBatch:
     q_hat: np.ndarray
     prev_q: np.ndarray
     prev_r: np.ndarray
+    exact_q_lags: np.ndarray
+    exact_r_lags: np.ndarray
     targets: np.ndarray
     valid_mask: np.ndarray
     lengths: np.ndarray
@@ -343,6 +350,37 @@ def normalize_mer_ks(values: Iterable[int] | None) -> tuple[int, ...]:
     return tuple(int(value) for value in values if int(value) > 0)
 
 
+def normalize_exact_lags(values: Iterable[int] | None) -> tuple[int, ...]:
+    """Validate exact history lags, which start after the existing lag-1 token."""
+
+    if values is None:
+        return tuple()
+    lags = tuple(int(value) for value in values)
+    if any(lag < 2 for lag in lags):
+        raise ValueError("exact history lags must be at least 2")
+    if len(set(lags)) != len(lags):
+        raise ValueError("exact history lags must be unique")
+    return lags
+
+
+def build_exact_lag_tokens_for_read(
+    values: np.ndarray,
+    lags: tuple[int, ...],
+    bos_token: int,
+) -> np.ndarray:
+    """Build exact causal history tokens for one read."""
+
+    values_i = np.asarray(values, dtype=np.int64)
+    if values_i.ndim != 1:
+        raise ValueError("exact-lag values must be a 1-D array")
+    normalized_lags = normalize_exact_lags(lags)
+    tokens = np.full((values_i.size, len(normalized_lags)), bos_token, dtype=np.int64)
+    for lag_index, lag in enumerate(normalized_lags):
+        if values_i.size > lag:
+            tokens[lag:, lag_index] = values_i[:-lag]
+    return tokens
+
+
 def quality_to_bucket(q: np.ndarray) -> np.ndarray:
     """Map quality ids 0..94 to seven coarse history buckets."""
 
@@ -434,6 +472,8 @@ def build_sequence_batch(
     base_local_offsets: np.ndarray | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
+    exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
+    exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -496,6 +536,8 @@ def build_sequence_batch(
 
     qmer_ks_t = normalize_mer_ks(qmer_ks)
     rmer_ks_t = normalize_mer_ks(rmer_ks)
+    exact_q_lags_t = normalize_exact_lags(exact_q_lags)
+    exact_r_lags_t = normalize_exact_lags(exact_r_lags)
 
     # 1. 从 H5 freqs 得到原始 predictor 概率分布 P0(q)。
     freqs_f, probs, log_probs = _quality_probs(freqs)
@@ -529,6 +571,12 @@ def build_sequence_batch(
     q_hat_tokens = np.zeros((batch_size, max_len), dtype=np.int64)
     prev_q_tokens = np.full((batch_size, max_len), Q_BOS_TOKEN, dtype=np.int64)
     prev_r_tokens = np.full((batch_size, max_len), R_BOS_TOKEN, dtype=np.int64)
+    exact_q_lag_tokens = np.full(
+        (batch_size, max_len, len(exact_q_lags_t)), Q_BOS_TOKEN, dtype=np.int64
+    )
+    exact_r_lag_tokens = np.full(
+        (batch_size, max_len, len(exact_r_lags_t)), R_BOS_TOKEN, dtype=np.int64
+    )
     qmer_tokens = np.zeros((batch_size, max_len, len(qmer_ks_t)), dtype=np.int64)
     rmer_tokens = np.zeros((batch_size, max_len, len(rmer_ks_t)), dtype=np.int64)
     targets = np.full((batch_size, max_len), PAD_TARGET, dtype=np.int64)
@@ -602,6 +650,12 @@ def build_sequence_batch(
         if length > 1:
             prev_q_tokens[read_idx, 1:length] = observed_i[start_i : end_i - 1]
             prev_r_tokens[read_idx, 1:length] = targets_flat[start_i : end_i - 1]
+        exact_q_lag_tokens[read_idx, :length, :] = build_exact_lag_tokens_for_read(
+            observed_i[start_i:end_i], exact_q_lags_t, Q_BOS_TOKEN
+        )
+        exact_r_lag_tokens[read_idx, :length, :] = build_exact_lag_tokens_for_read(
+            targets_flat[start_i:end_i], exact_r_lags_t, R_BOS_TOKEN
+        )
 
     # H5 baseline bits 用于和神经模型 bits 对比：
     #   bits_i = -log2 P0(q_true_i)
@@ -616,6 +670,8 @@ def build_sequence_batch(
         q_hat=q_hat_tokens,
         prev_q=prev_q_tokens,
         prev_r=prev_r_tokens,
+        exact_q_lags=exact_q_lag_tokens,
+        exact_r_lags=exact_r_lag_tokens,
         targets=targets,
         valid_mask=valid_mask,
         lengths=read_lengths,
@@ -644,6 +700,8 @@ class ContiguousReadBatchSampler:
         base_sidecar_dir: Path | None = None,
         qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
         rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
+        exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
+        exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
         mer_stride: int = DEFAULT_MER_STRIDE,
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -654,6 +712,8 @@ class ContiguousReadBatchSampler:
         self.rng = random.Random(seed)
         self.qmer_ks = normalize_mer_ks(qmer_ks)
         self.rmer_ks = normalize_mer_ks(rmer_ks)
+        self.exact_q_lags = normalize_exact_lags(exact_q_lags)
+        self.exact_r_lags = normalize_exact_lags(exact_r_lags)
         self.mer_stride = int(mer_stride)
         self.qmer_vocab_size = int(qmer_vocab_size)
         self.rmer_vocab_size = int(rmer_vocab_size)
@@ -690,6 +750,8 @@ class ContiguousReadBatchSampler:
                         base_sidecar_path=self.base_sidecars[file_index],
                         qmer_ks=self.qmer_ks,
                         rmer_ks=self.rmer_ks,
+                        exact_q_lags=self.exact_q_lags,
+                        exact_r_lags=self.exact_r_lags,
                         mer_stride=self.mer_stride,
                         qmer_vocab_size=self.qmer_vocab_size,
                         rmer_vocab_size=self.rmer_vocab_size,
@@ -710,6 +772,8 @@ def read_h5_read_range(
     base_sidecar_path: Path | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
+    exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
+    exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -758,6 +822,8 @@ def read_h5_read_range(
         base_local_offsets=base_local_offsets,
         qmer_ks=qmer_ks,
         rmer_ks=rmer_ks,
+        exact_q_lags=exact_q_lags,
+        exact_r_lags=exact_r_lags,
         mer_stride=mer_stride,
         qmer_vocab_size=qmer_vocab_size,
         rmer_vocab_size=rmer_vocab_size,
@@ -773,6 +839,8 @@ def iter_read_batches(
     base_sidecar_path: Path | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
+    exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
+    exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -805,6 +873,8 @@ def iter_read_batches(
                 base_sidecar_path=base_sidecar_path,
                 qmer_ks=qmer_ks,
                 rmer_ks=rmer_ks,
+                exact_q_lags=exact_q_lags,
+                exact_r_lags=exact_r_lags,
                 mer_stride=mer_stride,
                 qmer_vocab_size=qmer_vocab_size,
                 rmer_vocab_size=rmer_vocab_size,
@@ -890,6 +960,8 @@ class ResidualTransformer(nn.Module):
         q_hat_embed_dim: int = 16,
         prev_q_embed_dim: int = 16,
         prev_r_embed_dim: int = 32,
+        exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
+        exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
         qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
         rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -938,6 +1010,8 @@ class ResidualTransformer(nn.Module):
         self.d_model = int(d_model)
         self.context_length = int(context_length)
         self.output_parameterization = output_parameterization
+        self.exact_q_lags = normalize_exact_lags(exact_q_lags)
+        self.exact_r_lags = normalize_exact_lags(exact_r_lags)
         self.qmer_ks = normalize_mer_ks(qmer_ks)
         self.rmer_ks = normalize_mer_ks(rmer_ks)
         self.base_conv_kernels = (
@@ -973,6 +1047,8 @@ class ResidualTransformer(nn.Module):
             + q_hat_embed_dim
             + prev_q_embed_dim
             + prev_r_embed_dim
+            + len(self.exact_q_lags) * prev_q_embed_dim
+            + len(self.exact_r_lags) * prev_r_embed_dim
             + len(self.qmer_ks) * qmer_embed_dim
             + len(self.rmer_ks) * rmer_embed_dim
             + self.base_context_dim
@@ -1037,6 +1113,8 @@ class ResidualTransformer(nn.Module):
         q_hat: torch.Tensor,
         prev_q: torch.Tensor,
         prev_r: torch.Tensor,
+        exact_q_lags: torch.Tensor | None = None,
+        exact_r_lags: torch.Tensor | None = None,
         qmer_tokens: torch.Tensor | None = None,
         rmer_tokens: torch.Tensor | None = None,
         base_ids: torch.Tensor | None = None,
@@ -1048,6 +1126,20 @@ class ResidualTransformer(nn.Module):
             self.prev_q_embedding(prev_q),
             self.prev_r_embedding(prev_r),
         ]
+        if self.exact_q_lags:
+            if exact_q_lags is None:
+                raise ValueError("exact_q_lags are required by this checkpoint")
+            if exact_q_lags.shape[-1] != len(self.exact_q_lags):
+                raise ValueError("exact_q_lags width does not match checkpoint configuration")
+            for lag_index in range(len(self.exact_q_lags)):
+                pieces.append(self.prev_q_embedding(exact_q_lags[:, :, lag_index]))
+        if self.exact_r_lags:
+            if exact_r_lags is None:
+                raise ValueError("exact_r_lags are required by this checkpoint")
+            if exact_r_lags.shape[-1] != len(self.exact_r_lags):
+                raise ValueError("exact_r_lags width does not match checkpoint configuration")
+            for lag_index in range(len(self.exact_r_lags)):
+                pieces.append(self.prev_r_embedding(exact_r_lags[:, :, lag_index]))
         if self.qmer_embeddings:
             if qmer_tokens is None:
                 raise ValueError("qmer_tokens are required by this checkpoint")
@@ -1102,6 +1194,8 @@ def batch_to_torch(batch: SequenceBatch, device: torch.device) -> dict[str, torc
         "q_hat": torch.from_numpy(batch.q_hat).to(device),
         "prev_q": torch.from_numpy(batch.prev_q).to(device),
         "prev_r": torch.from_numpy(batch.prev_r).to(device),
+        "exact_q_lags": torch.from_numpy(batch.exact_q_lags).to(device),
+        "exact_r_lags": torch.from_numpy(batch.exact_r_lags).to(device),
         "targets": torch.from_numpy(batch.targets).to(device),
         "valid_mask": torch.from_numpy(batch.valid_mask).to(device),
         "lengths": torch.from_numpy(batch.lengths).to(device),
@@ -1150,6 +1244,8 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransform
         q_hat_embed_dim=int(config["q_hat_embed_dim"]),
         prev_q_embed_dim=int(config["prev_q_embed_dim"]),
         prev_r_embed_dim=int(config["prev_r_embed_dim"]),
+        exact_q_lags=config.get("exact_q_lags", []),
+        exact_r_lags=config.get("exact_r_lags", []),
         qmer_ks=config.get("qmer_ks", []),
         rmer_ks=config.get("rmer_ks", []),
         qmer_vocab_size=int(config.get("qmer_vocab_size", DEFAULT_MER_VOCAB_SIZE)),

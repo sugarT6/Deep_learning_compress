@@ -36,14 +36,16 @@ def choose_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def fmt6(value: float) -> str:
-    return f"{value:.6f}"
+def fmt4(value: float) -> str:
+    return f"{value:.4f}"
 
 
 def mer_params_from_config(config: dict[str, object]) -> dict[str, object]:
     """Restore causal Q/R-mer settings from a checkpoint."""
 
     return {
+        "exact_q_lags": tuple(int(value) for value in config.get("exact_q_lags", [])),
+        "exact_r_lags": tuple(int(value) for value in config.get("exact_r_lags", [])),
         "qmer_ks": tuple(int(value) for value in config.get("qmer_ks", [])),
         "rmer_ks": tuple(int(value) for value in config.get("rmer_ks", [])),
         "mer_stride": int(config.get("mer_stride", DEFAULT_MER_STRIDE)),
@@ -89,6 +91,8 @@ def evaluate_file(
             q_hat=tensors["q_hat"],
             prev_q=tensors["prev_q"],
             prev_r=tensors["prev_r"],
+            exact_q_lags=tensors["exact_q_lags"],
+            exact_r_lags=tensors["exact_r_lags"],
             qmer_tokens=tensors["qmer_tokens"],
             rmer_tokens=tensors["rmer_tokens"],
             base_ids=tensors["base_ids"],
@@ -160,6 +164,8 @@ def write_prediction_samples(
         q_hat=tensors["q_hat"],
         prev_q=tensors["prev_q"],
         prev_r=tensors["prev_r"],
+        exact_q_lags=tensors["exact_q_lags"],
+        exact_r_lags=tensors["exact_r_lags"],
         qmer_tokens=tensors["qmer_tokens"],
         rmer_tokens=tensors["rmer_tokens"],
         base_ids=tensors["base_ids"],
@@ -223,11 +229,11 @@ def write_prediction_samples(
                         "pred_residual": pred_residual,
                         "pred_quality": pred_quality,
                         "pred_quality_char": chr(pred_quality + 33),
-                        "pred_probability": fmt6(pred_prob),
-                        "model_true_prob": fmt6(model_true_prob),
-                        "model_bits": fmt6(-math.log2(max(model_true_prob, 1e-300))),
-                        "h5_true_prob": fmt6(h5_true_prob),
-                        "h5_bits": fmt6(-h5_log_prob / math.log(2.0)),
+                        "pred_probability": fmt4(pred_prob),
+                        "model_true_prob": fmt4(model_true_prob),
+                        "model_bits": fmt4(-math.log2(max(model_true_prob, 1e-300))),
+                        "h5_true_prob": fmt4(h5_true_prob),
+                        "h5_bits": fmt4(-h5_log_prob / math.log(2.0)),
                     }
                 )
 
@@ -285,6 +291,8 @@ def write_quality_probability_log(
                     q_hat=tensors["q_hat"],
                     prev_q=tensors["prev_q"],
                     prev_r=tensors["prev_r"],
+                    exact_q_lags=tensors["exact_q_lags"],
+                    exact_r_lags=tensors["exact_r_lags"],
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
@@ -311,7 +319,7 @@ def write_quality_probability_log(
                         true_quality_char = chr(true_quality_value + 33)
 
                         out.write(
-                            f"{{{quality_value}}}{{{quality_char}}}{{{pred_prob:.6f}}}"
+                            f"{{{quality_value}}}{{{quality_char}}}{{{pred_prob:.4f}}}"
                             f"{{{true_quality_value}}}{{{true_quality_char}}}\n"
                         )
                         rows_written += 1
@@ -347,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-csv",
         type=Path,
         default=Path(
-            "runs/transformer_residual_4layer_qrmer_234_baseconv357_b64_e15/"
+            "runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/"
             "predict_metrics.csv"
         ),
     )
@@ -435,9 +443,9 @@ def main() -> int:
         )
         rows.append(metric)
         print(
-            f"{path.name}: model_bits={metric['model_avg_bits_per_quality']:.6f} "
-            f"h5_bits={metric['h5_baseline_avg_bits_per_quality']:.6f} "
-            f"delta={metric['delta_bits']:.6f} "
+            f"{path.name}: model_bits={metric['model_avg_bits_per_quality']:.4f} "
+            f"h5_bits={metric['h5_baseline_avg_bits_per_quality']:.4f} "
+            f"delta={metric['delta_bits']:.4f} "
             f"rel_improve={metric['relative_improvement']:.4%} "
             f"symbols={metric['total_symbols']}",
             flush=True,
@@ -463,14 +471,14 @@ def main() -> int:
                 {
                     "file": row["file"],
                     "total_symbols": row["total_symbols"],
-                    "model_total_bits": fmt6(float(row["model_total_bits"])),
-                    "model_avg_bits_per_quality": fmt6(float(row["model_avg_bits_per_quality"])),
-                    "h5_baseline_total_bits": fmt6(float(row["h5_baseline_total_bits"])),
-                    "h5_baseline_avg_bits_per_quality": fmt6(
+                    "model_total_bits": fmt4(float(row["model_total_bits"])),
+                    "model_avg_bits_per_quality": fmt4(float(row["model_avg_bits_per_quality"])),
+                    "h5_baseline_total_bits": fmt4(float(row["h5_baseline_total_bits"])),
+                    "h5_baseline_avg_bits_per_quality": fmt4(
                         float(row["h5_baseline_avg_bits_per_quality"])
                     ),
-                    "delta_bits": fmt6(float(row["delta_bits"])),
-                    "relative_improvement": fmt6(float(row["relative_improvement"])),
+                    "delta_bits": fmt4(float(row["delta_bits"])),
+                    "relative_improvement": fmt4(float(row["relative_improvement"])),
                     "zero_true_freq": row["zero_true_freq"],
                 }
             )

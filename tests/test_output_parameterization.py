@@ -15,6 +15,8 @@ from train_sequence_residual_transformer import build_parser
 def make_small_model(output_parameterization: str) -> ResidualTransformer:
     return ResidualTransformer(
         continuous_dim=CONTINUOUS_FEATURE_DIM,
+        exact_q_lags=(),
+        exact_r_lags=(),
         qmer_ks=(),
         rmer_ks=(),
         d_model=16,
