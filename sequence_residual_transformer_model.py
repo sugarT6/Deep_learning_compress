@@ -56,7 +56,9 @@ DEFAULT_MER_STRIDE = 1
 DEFAULT_MER_VOCAB_SIZE = 4096
 
 RUN_LENGTH_BUCKET_COUNT = 9
-DEFAULT_HISTORY_RUN_EMBED_DIM = 8
+# The completed run-length ablation did not improve the aggregate result. Keep
+# checkpoint support in the model, but disable these features for new runs.
+DEFAULT_HISTORY_RUN_EMBED_DIM = 0
 
 BASE_A_TOKEN = 0
 BASE_C_TOKEN = 1
@@ -88,13 +90,19 @@ R_MER_BASE = R_BUCKET_COUNT + 1
 # 质量值 alphabet 固定为 95，对应 Phred+33 后的 quality id: 0..94。
 # residual = q_true - q_hat，因此 residual 范围是 -94..94，共 189 类。
 
-# 连续输入特征包括：
-#   189 维 log P0_r(r)：把 H5 原始质量分布 P0(q) 平移到 residual 空间；
-#   max_prob：原始 H5 predictor 对 q_hat 的置信度；
-#   entropy：P0(q) 的归一化熵，越大越接近均匀分布；
-#   expected_q：P0(q) 下的质量值期望，归一化到 0..1；
-#   rel_pos/read_len_norm：read 内位置和 read 长度信息。
-CONTINUOUS_FEATURE_DIM = RESIDUAL_CLASSES + 5
+FULL_PRIOR = "full_prior"
+QHAT_ONLY = "qhat_only"
+PRIOR_FEATURE_MODES = (QHAT_ONLY, FULL_PRIOR)
+DEFAULT_PRIOR_FEATURE_MODE = QHAT_ONLY
+
+# full_prior 连续输入：189 维 log P0_r、max_prob、entropy、expected_q、
+# rel_pos、read_len_norm。qhat_only 只保留与概率矩阵无关的位置和长度特征；
+# q_hat 仍通过独立 embedding 输入。
+FULL_PRIOR_CONTINUOUS_FEATURE_DIM = RESIDUAL_CLASSES + 5
+QHAT_ONLY_CONTINUOUS_FEATURE_DIM = 2
+# Historical public name retained for old checkpoints/tests that explicitly
+# construct the full-prior architecture.
+CONTINUOUS_FEATURE_DIM = FULL_PRIOR_CONTINUOUS_FEATURE_DIM
 PAD_TARGET = -100
 EPS = 1e-12
 
@@ -160,6 +168,9 @@ class SequenceBatch:
         Sum of -log2 P0(q_true) over real positions in this batch.
     zero_true_freq:
         Number of real positions where H5 assigned zero count to q_true.
+    h5_true_prob:
+        Padded per-position P0(q_true), retained only for reports/debug output;
+        it is not a model input in qhat_only mode.
     """
 
     continuous: np.ndarray
@@ -179,6 +190,7 @@ class SequenceBatch:
     base_lengths: np.ndarray
     baseline_bits: float
     zero_true_freq: int
+    h5_true_prob: np.ndarray
 
     @property
     def total_symbols(self) -> int:
@@ -353,6 +365,19 @@ def _residual_log_probs(probs: np.ndarray, q_hat: np.ndarray) -> np.ndarray:
     gathered = np.take_along_axis(probs, clipped, axis=1)
     gathered = np.where(valid, gathered, EPS)
     return np.log(np.maximum(gathered, EPS)).astype(np.float32, copy=False)
+
+
+def continuous_feature_dim(prior_feature_mode: str) -> int:
+    """Return the continuous input width for a prior-feature mode."""
+
+    if prior_feature_mode == QHAT_ONLY:
+        return QHAT_ONLY_CONTINUOUS_FEATURE_DIM
+    if prior_feature_mode == FULL_PRIOR:
+        return FULL_PRIOR_CONTINUOUS_FEATURE_DIM
+    raise ValueError(
+        f"prior_feature_mode must be one of {PRIOR_FEATURE_MODES}, "
+        f"got {prior_feature_mode!r}"
+    )
 
 
 def normalize_mer_ks(values: Iterable[int] | None) -> tuple[int, ...]:
@@ -539,6 +564,7 @@ def build_sequence_batch(
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+    prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
 ) -> SequenceBatch:
     """Build one padded batch from a contiguous group of reads.
 
@@ -600,20 +626,30 @@ def build_sequence_batch(
     rmer_ks_t = normalize_mer_ks(rmer_ks)
     exact_q_lags_t = normalize_exact_lags(exact_q_lags)
     exact_r_lags_t = normalize_exact_lags(exact_r_lags)
+    continuous_dim = continuous_feature_dim(prior_feature_mode)
 
-    # 1. 从 H5 freqs 得到原始 predictor 概率分布 P0(q)。
-    freqs_f, probs, log_probs = _quality_probs(freqs)
+    # qhat_only 不构造或取 log 完整概率矩阵，只取 argmax q_hat。概率矩阵
+    # 仍在 batch 末尾用于计算独立的 H5 baseline，不进入模型。
+    freqs_f = freqs.astype(np.float32, copy=False)
     observed_i = observed.astype(np.int64, copy=False)
     if np.any(observed_i < 0) or np.any(observed_i >= ALPHABET_SIZE):
         raise ValueError("observed quality id out of [0, 94]")
 
-    # 2. q_hat 是 H5 predictor 的中心预测，即 P0(q) 的 argmax。
+    # q_hat 是 H5 predictor 的中心预测，即 P0(q) 的 argmax。
     #    我们不直接预测 quality，而是预测 q_true - q_hat。
-    q_axis = np.arange(ALPHABET_SIZE, dtype=np.float32)
     q_hat = np.argmax(freqs_f, axis=1).astype(np.int64)
-    max_prob = probs[np.arange(probs.shape[0]), q_hat].astype(np.float32)
-    entropy = (-(probs * log_probs).sum(axis=1) / math.log(ALPHABET_SIZE)).astype(np.float32)
-    expected_q = ((probs * q_axis[None, :]).sum(axis=1) / (ALPHABET_SIZE - 1)).astype(np.float32)
+
+    if prior_feature_mode == FULL_PRIOR:
+        _, probs, log_probs = _quality_probs(freqs_f)
+        q_axis = np.arange(ALPHABET_SIZE, dtype=np.float32)
+        max_prob = probs[np.arange(probs.shape[0]), q_hat].astype(np.float32)
+        entropy = (-(probs * log_probs).sum(axis=1) / math.log(ALPHABET_SIZE)).astype(
+            np.float32
+        )
+        expected_q = (
+            (probs * q_axis[None, :]).sum(axis=1) / (ALPHABET_SIZE - 1)
+        ).astype(np.float32)
+        log_p0_r = _residual_log_probs(probs, q_hat)
 
     # 3. 训练目标：真实 residual 类别。
     residual = observed_i - q_hat
@@ -621,15 +657,14 @@ def build_sequence_batch(
     if np.any(targets_flat < 0) or np.any(targets_flat >= RESIDUAL_CLASSES):
         raise ValueError("residual target out of range")
 
-    # 4. 把 P0(q) 变换到 residual 空间，作为当前位点的强 baseline 特征。
-    log_p0_r = _residual_log_probs(probs, q_hat)
     read_lengths = np.diff(local_offsets).astype(np.int64)
     batch_size = int(read_lengths.size)
     max_len = int(read_lengths.max())
 
     # 5. 不同 read 长度不同，需要 padding 到 batch 内最长 read。
     #    padding 位置的 target 使用 PAD_TARGET，loss 会 ignore。
-    continuous = np.zeros((batch_size, max_len, CONTINUOUS_FEATURE_DIM), dtype=np.float32)
+    continuous = np.zeros((batch_size, max_len, continuous_dim), dtype=np.float32)
+    h5_true_prob = np.zeros((batch_size, max_len), dtype=np.float32)
     q_hat_tokens = np.zeros((batch_size, max_len), dtype=np.int64)
     prev_q_tokens = np.full((batch_size, max_len), Q_BOS_TOKEN, dtype=np.int64)
     prev_r_tokens = np.full((batch_size, max_len), R_BOS_TOKEN, dtype=np.int64)
@@ -673,12 +708,16 @@ def build_sequence_batch(
         rel_pos = np.arange(length, dtype=np.float32) / max(length - 1, 1)
         read_len_norm = np.full(length, min(length, 10_000) / 10_000.0, dtype=np.float32)
 
-        continuous[read_idx, :length, :RESIDUAL_CLASSES] = log_p0_r[start_i:end_i]
-        continuous[read_idx, :length, RESIDUAL_CLASSES] = max_prob[start_i:end_i]
-        continuous[read_idx, :length, RESIDUAL_CLASSES + 1] = entropy[start_i:end_i]
-        continuous[read_idx, :length, RESIDUAL_CLASSES + 2] = expected_q[start_i:end_i]
-        continuous[read_idx, :length, RESIDUAL_CLASSES + 3] = rel_pos
-        continuous[read_idx, :length, RESIDUAL_CLASSES + 4] = read_len_norm
+        if prior_feature_mode == FULL_PRIOR:
+            continuous[read_idx, :length, :RESIDUAL_CLASSES] = log_p0_r[start_i:end_i]
+            continuous[read_idx, :length, RESIDUAL_CLASSES] = max_prob[start_i:end_i]
+            continuous[read_idx, :length, RESIDUAL_CLASSES + 1] = entropy[start_i:end_i]
+            continuous[read_idx, :length, RESIDUAL_CLASSES + 2] = expected_q[start_i:end_i]
+            continuous[read_idx, :length, RESIDUAL_CLASSES + 3] = rel_pos
+            continuous[read_idx, :length, RESIDUAL_CLASSES + 4] = read_len_norm
+        else:
+            continuous[read_idx, :length, 0] = rel_pos
+            continuous[read_idx, :length, 1] = read_len_norm
 
         q_hat_tokens[read_idx, :length] = q_hat[start_i:end_i]
         targets[read_idx, :length] = targets_flat[start_i:end_i]
@@ -734,6 +773,11 @@ def build_sequence_batch(
     baseline_bits = float((-np.log2(np.maximum(true_prob, EPS))).sum())
     zero_true_freq = int(np.count_nonzero(true_freq <= 0))
 
+    for read_idx, (start, end) in enumerate(zip(local_offsets[:-1], local_offsets[1:])):
+        start_i = int(start)
+        end_i = int(end)
+        h5_true_prob[read_idx, : end_i - start_i] = true_prob[start_i:end_i]
+
     return SequenceBatch(
         continuous=continuous,
         q_hat=q_hat_tokens,
@@ -752,6 +796,7 @@ def build_sequence_batch(
         base_lengths=base_lengths,
         baseline_bits=baseline_bits,
         zero_true_freq=zero_true_freq,
+        h5_true_prob=h5_true_prob,
     )
 
 
@@ -776,6 +821,7 @@ class ContiguousReadBatchSampler:
         mer_stride: int = DEFAULT_MER_STRIDE,
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+        prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
     ) -> None:
         self.files = files
         self.train_fraction = train_fraction
@@ -788,6 +834,8 @@ class ContiguousReadBatchSampler:
         self.mer_stride = int(mer_stride)
         self.qmer_vocab_size = int(qmer_vocab_size)
         self.rmer_vocab_size = int(rmer_vocab_size)
+        self.prior_feature_mode = prior_feature_mode
+        continuous_feature_dim(self.prior_feature_mode)
         self.infos = [inspect_h5(path) for path in files]
         self.base_sidecars = (
             [base_sidecar_path_for_h5(path, base_sidecar_dir) for path in files]
@@ -826,6 +874,7 @@ class ContiguousReadBatchSampler:
                         mer_stride=self.mer_stride,
                         qmer_vocab_size=self.qmer_vocab_size,
                         rmer_vocab_size=self.rmer_vocab_size,
+                        prior_feature_mode=self.prior_feature_mode,
                     ),
                     path,
                 )
@@ -848,6 +897,7 @@ def read_h5_read_range(
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+    prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
 ) -> SequenceBatch:
     """Load a half-open read range [read_start, read_stop) from one H5 file."""
 
@@ -898,6 +948,7 @@ def read_h5_read_range(
         mer_stride=mer_stride,
         qmer_vocab_size=qmer_vocab_size,
         rmer_vocab_size=rmer_vocab_size,
+        prior_feature_mode=prior_feature_mode,
     )
 
 
@@ -915,6 +966,7 @@ def iter_read_batches(
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
+    prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
 ) -> Iterator[SequenceBatch]:
     """Iterate deterministic read batches for train/test/all evaluation."""
 
@@ -949,6 +1001,7 @@ def iter_read_batches(
                 mer_stride=mer_stride,
                 qmer_vocab_size=qmer_vocab_size,
                 rmer_vocab_size=rmer_vocab_size,
+                prior_feature_mode=prior_feature_mode,
             )
         except ValueError as exc:
             # 顺序评估时，如果某个 batch 恰好全是空 read，就直接跳过。

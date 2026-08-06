@@ -15,7 +15,7 @@ from sequence_residual_transformer_model import (
     BASE_N_TOKEN,
     BASE_PAD_TOKEN,
     BASE_T_TOKEN,
-    CONTINUOUS_FEATURE_DIM,
+    QHAT_ONLY_CONTINUOUS_FEATURE_DIM,
     RESIDUAL_CLASSES,
     ResidualTransformer,
     base_sidecar_path_for_h5,
@@ -110,6 +110,7 @@ class BaseFeatureTest(unittest.TestCase):
         self.assertEqual(int(batch.base_ids[1, 4]), BASE_T_TOKEN)
         self.assertEqual(batch.exact_q_lags.shape, (2, 3, 0))
         self.assertEqual(batch.exact_r_lags.shape, (2, 3, 0))
+        self.assertEqual(batch.continuous.shape[-1], QHAT_ONLY_CONTINUOUS_FEATURE_DIM)
         np.testing.assert_array_equal(batch.zero_residual_run[0], np.asarray([0, 1, 2]))
         np.testing.assert_array_equal(batch.same_quality_run[0], np.asarray([0, 1, 1]))
 
@@ -122,7 +123,7 @@ class BaseFeatureTest(unittest.TestCase):
         )
         tensors = batch_to_torch(batch, torch.device("cpu"))
         model = ResidualTransformer(
-            continuous_dim=CONTINUOUS_FEATURE_DIM,
+            continuous_dim=QHAT_ONLY_CONTINUOUS_FEATURE_DIM,
             qmer_ks=(2,),
             rmer_ks=(2,),
             base_embed_dim=4,

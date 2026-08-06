@@ -7,55 +7,52 @@ GRU/TCN sequence backbone with a lightweight causal Transformer. The current
 model also uses the already-decoded full DNA read as side information through
 a small local motif branch.
 
-The model predicts a 189-class residual distribution:
+The model predicts a 189-class residual distribution. The current default is
+the `qhat_only` ablation: the H5 matrix defines `q_hat` and the residual target,
+but the full probability matrix is not a model feature.
 
 ```text
 q_hat_i = argmax P0_i(q)
 r_i = q_true_i - q_hat_i
-P_model(r_i | H5 features at i, decoded history before i)
+P_model(r_i | q_hat_i, position, bases, decoded history before i)
 ```
 
-Two switchable output parameterizations are available:
+Two prior-feature modes are available:
 
 ```text
-direct_residual_logits (default): final_logits = output_head(hidden)
-log_p0_plus_delta:               final_logits = log_P0_r + output_head(hidden)
+qhat_only (default): use the matrix only for q_hat, residual target, and baseline
+full_prior:          additionally input log P0_r and probability summaries
 ```
 
-In `log_p0_plus_delta` mode, the output head learns which H5 residual logits
-to raise or lower. Its weights and bias are initialized to zero, so the
-untrained model starts exactly at the H5 prior (before applying the same
-physical invalid-residual mask used by both modes). The H5 prior remains an
-input feature in both modes.
+`full_prior` reproduces the previous input. It normalizes H5 counts into
+`P0(q)`, clamps probabilities to `1e-12`, and applies the natural logarithm
+before mapping them into the 189 residual classes. `log_p0_plus_delta` remains
+available only with `full_prior`; direct residual logits are the default.
 
 ## Input features
 
-Each position uses exactly these features:
+The current `qhat_only` experiment uses:
 
 ```text
-189-dimensional log P0_r(r)
-H5 max probability
-normalized H5 entropy
-normalized H5 expected quality
 relative position in the read
 normalized read length
 q_hat embedding
 previous decoded quality embedding
 previous decoded residual embedding
-causal consecutive residual==0 run-length embedding
-causal consecutive same-quality run-length embedding
 Q-mer history embeddings for k = 2,3,4
 Residual-mer history embeddings for k = 2,3,4
 bidirectional local base context from complete DNA read
 ```
 
-Missing history at the start of a read uses BOS tokens. Both run lengths are
-computed only from positions before the current target and use buckets
-`0,1,2,3,4,5-7,8-15,16-31,32+`. Q/R-mer tokens use the same bucket definitions,
-causal history construction, stride-1 hashing, and default vocabulary size
-4096 as the stage-3 Q/R-mer experiment. No token includes the current or a
-future true quality/residual. The completed exact-lag ablation is disabled in
-current training.
+`full_prior` adds 189-dimensional `log P0_r(r)`, H5 max probability,
+normalized H5 entropy, and normalized H5 expected quality. The completed
+exact-lag and run-length ablations are disabled for current training, while
+their code remains for historical checkpoint compatibility.
+
+Missing history at the start of a read uses BOS tokens. Q/R-mer tokens use the
+same bucket definitions, causal history construction, stride-1 hashing, and
+default vocabulary size 4096 as the stage-3 Q/R-mer experiment. No token
+includes the current or a future true quality/residual.
 
 The quality decoder is assumed to have the complete DNA read before quality
 decoding starts. Therefore the base branch may use both previous and future
@@ -67,14 +64,13 @@ not included in the reported body-quality bits.
 
 ```text
 feature concatenation
-  (including residual-zero and same-quality run-length embeddings)
   (including three Q-mer and three residual-mer embeddings)
   (including Base Embedding + centered Conv1D kernels 3,5,7 -> 32 dims)
 -> Linear + ReLU + Dropout
 -> sinusoidal positional encoding
 -> 4 causal Transformer encoder layers
 -> Linear(d_model -> 189)
--> optionally add log P0_r when --output-parameterization=log_p0_plus_delta
+-> optionally add log P0_r in full_prior + log_p0_plus_delta mode
 -> physical invalid-residual mask
 -> softmax P(r_i)
 ```
@@ -158,21 +154,22 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-batch-reads 64 \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
-  --history-run-embed-dim 8 \
+  --prior-feature-mode qhat_only \
+  --history-run-embed-dim 0 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
   --output-parameterization direct_residual_logits \
-  --output-dir runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15
+  --output-dir runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15
 ```
 
 This run uses 64 reads and 2,000 optimizer updates per epoch. Relative to the
 previous 128-read experiment at the same step count, it samples half as many
 reads per epoch but preserves the same number of optimizer updates.
 
-To train the H5-prior correction variant under otherwise identical settings,
-change only the output parameterization and output directory:
+If `qhat_only` is worse, restore the previous full-prior direct-logit input by
+changing only the prior mode and output directory:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
@@ -182,13 +179,14 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-batch-reads 64 \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
-  --history-run-embed-dim 8 \
+  --prior-feature-mode full_prior \
+  --history-run-embed-dim 0 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
-  --output-parameterization log_p0_plus_delta \
-  --output-dir runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_logp0delta_b64_e15
+  --output-parameterization direct_residual_logits \
+  --output-dir runs/transformer_residual_4layer_fullprior_qrmer234_baseconv357_b64_e15
 ```
 
 Small smoke run:
@@ -209,9 +207,9 @@ python train_sequence_residual_transformer.py \
 Training writes:
 
 ```text
-runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/config.json
-runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/train_log.csv
-runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/best.pt
+runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/config.json
+runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/train_log.csv
+runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt
 ```
 
 The training CSV and terminal show all floating-point values with four decimal
@@ -226,10 +224,10 @@ and use a separate output directory.
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/best.pt \
+  runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt \
   --batch-reads 64 \
   --base-sidecar-dir base_sidecars \
-  --output-csv runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/predict_metrics.csv
+  --output-csv runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/predict_metrics.csv
 ```
 
 The default split is the last 20% test reads. Use `--split all` to evaluate the
@@ -237,15 +235,15 @@ whole H5 file. Optional detailed outputs remain compatible with stage 3:
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/best.pt \
+  runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt \
   --base-sidecar-dir base_sidecars \
-  --sample-predictions runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/samples.csv \
-  --quality-prob-log runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/predict_quality_prob.log \
+  --sample-predictions runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/samples.csv \
+  --quality-prob-log runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/predict_quality_prob.log \
   --quality-prob-log-rows 1000
 ```
 
-The run-length, historical exact-lag, output-parameterization, Q/R-mer, and
-base-branch settings are restored from the checkpoint during prediction; no
+The prior-feature, run-length, historical exact-lag, output-parameterization,
+Q/R-mer, and base-branch settings are restored from the checkpoint; no
 prediction-side switch is needed. Exact-lag support remains only for loading
 the completed ablation checkpoint and is disabled in current training. Old
 checkpoints without run-length fields load with those features disabled. Old

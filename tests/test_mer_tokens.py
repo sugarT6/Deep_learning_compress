@@ -7,6 +7,7 @@ from sequence_residual_transformer_model import (
     DEFAULT_EXACT_Q_LAGS,
     DEFAULT_EXACT_R_LAGS,
     DEFAULT_HISTORY_RUN_EMBED_DIM,
+    DEFAULT_PRIOR_FEATURE_MODE,
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
     build_exact_lag_tokens_for_read,
@@ -53,12 +54,14 @@ class MerTokenTest(unittest.TestCase):
         self.assertEqual(args.qmer_ks, (2, 3, 4))
         self.assertEqual(args.rmer_ks, (2, 3, 4))
         self.assertEqual(args.history_run_embed_dim, DEFAULT_HISTORY_RUN_EMBED_DIM)
+        self.assertEqual(args.history_run_embed_dim, 0)
+        self.assertEqual(args.prior_feature_mode, DEFAULT_PRIOR_FEATURE_MODE)
         self.assertEqual(args.base_conv_kernels, (3, 5, 7))
         self.assertEqual(args.num_layers, 4)
         self.assertEqual(
             args.output_dir,
             Path(
-                "runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_"
+                "runs/transformer_residual_4layer_qhatonly_qrmer234_"
                 "baseconv357_b64_e15"
             ),
         )

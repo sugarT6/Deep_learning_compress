@@ -17,7 +17,10 @@ from sequence_residual_transformer_model import (
     ALPHABET_SIZE,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
+    FULL_PRIOR,
+    FULL_PRIOR_CONTINUOUS_FEATURE_DIM,
     PAD_TARGET,
+    QHAT_ONLY,
     RESIDUAL_CLASSES,
     RESIDUAL_MIN,
     base_sidecar_path_for_h5,
@@ -44,7 +47,18 @@ def fmt4(value: float) -> str:
 def mer_params_from_config(config: dict[str, object]) -> dict[str, object]:
     """Restore causal Q/R-mer settings from a checkpoint."""
 
+    # Checkpoints created before prior_feature_mode existed all used the
+    # 194-dimensional full-prior input. Infer that mode to keep them loadable.
+    prior_feature_mode = config.get("prior_feature_mode")
+    if prior_feature_mode is None:
+        prior_feature_mode = (
+            FULL_PRIOR
+            if int(config["continuous_dim"]) == FULL_PRIOR_CONTINUOUS_FEATURE_DIM
+            else QHAT_ONLY
+        )
+
     return {
+        "prior_feature_mode": str(prior_feature_mode),
         "exact_q_lags": tuple(int(value) for value in config.get("exact_q_lags", [])),
         "exact_r_lags": tuple(int(value) for value in config.get("exact_r_lags", [])),
         "qmer_ks": tuple(int(value) for value in config.get("qmer_ks", [])),
@@ -225,10 +239,10 @@ def write_prediction_samples(
                 pred_prob = float(probs[read_idx, pos, pred_class])
                 model_true_prob = float(probs[read_idx, pos, target])
 
-                # continuous 的前 189 维就是 log P0_r(r)，target 位置对应
-                # H5 对真实质量值 q_true 的原始概率。
-                h5_log_prob = float(first_batch.continuous[read_idx, pos, target])
-                h5_true_prob = math.exp(h5_log_prob)
+                # H5 true probability is report-only metadata. In qhat_only
+                # mode it is deliberately not present in model inputs.
+                h5_true_prob = float(first_batch.h5_true_prob[read_idx, pos])
+                h5_log_prob = math.log(max(h5_true_prob, 1e-12))
 
                 writer.writerow(
                     {
@@ -369,7 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-csv",
         type=Path,
         default=Path(
-            "runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_"
+            "runs/transformer_residual_4layer_qhatonly_qrmer234_"
             "baseconv357_b64_e15/"
             "predict_metrics.csv"
         ),

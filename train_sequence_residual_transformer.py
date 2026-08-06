@@ -19,22 +19,25 @@ except ImportError:  # pragma: no cover
     tqdm = None
 
 from sequence_residual_transformer_model import (
-    CONTINUOUS_FEATURE_DIM,
     DEFAULT_BASE_CONV_KERNELS,
     DEFAULT_HISTORY_RUN_EMBED_DIM,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
+    DEFAULT_PRIOR_FEATURE_MODE,
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
     DIRECT_RESIDUAL_LOGITS,
+    FULL_PRIOR,
     LOG_P0_PLUS_DELTA,
     OUTPUT_PARAMETERIZATIONS,
     PAD_TARGET,
+    PRIOR_FEATURE_MODES,
     RESIDUAL_CLASSES,
     ContiguousReadBatchSampler,
     ResidualTransformer,
     base_sidecar_path_for_h5,
     batch_to_torch,
+    continuous_feature_dim,
     discover_h5_files,
     inspect_h5,
     inspect_base_sidecar,
@@ -81,6 +84,7 @@ def evaluate_model(
     qmer_vocab_size: int,
     rmer_vocab_size: int,
     base_sidecar_dir: Path,
+    prior_feature_mode: str,
 ) -> dict[str, float]:
     """Evaluate compression metrics on a deterministic read split."""
 
@@ -108,6 +112,7 @@ def evaluate_model(
             mer_stride=mer_stride,
             qmer_vocab_size=qmer_vocab_size,
             rmer_vocab_size=rmer_vocab_size,
+            prior_feature_mode=prior_feature_mode,
         ):
             tensors = batch_to_torch(batch, device)
             # 模型输出 [batch, seq_len, 189]，每一维对应一个 residual 类别。
@@ -173,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=Path(
-            "runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_"
+            "runs/transformer_residual_4layer_qhatonly_qrmer234_"
             "baseconv357_b64_e15"
         ),
         help="directory for checkpoints, config, and train log",
@@ -185,6 +190,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory produced by prepare_base_sidecars.py",
     )
     parser.add_argument("--train-fraction", type=float, default=0.8)
+    parser.add_argument(
+        "--prior-feature-mode",
+        choices=PRIOR_FEATURE_MODES,
+        default=DEFAULT_PRIOR_FEATURE_MODE,
+        help=(
+            "qhat_only uses the H5 matrix only to derive q_hat/residual; "
+            "full_prior also feeds log P0_r and probability summaries to the model"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument(
@@ -288,8 +302,13 @@ def main() -> int:
         raise SystemExit("--feedforward-dim and --context-length must be positive")
     if args.mer_stride <= 0:
         raise SystemExit("--mer-stride must be positive")
-    if args.history_run_embed_dim <= 0:
-        raise SystemExit("--history-run-embed-dim must be positive")
+    if args.history_run_embed_dim < 0:
+        raise SystemExit("--history-run-embed-dim must be non-negative")
+    if (
+        args.prior_feature_mode != FULL_PRIOR
+        and args.output_parameterization == LOG_P0_PLUS_DELTA
+    ):
+        raise SystemExit("--output-parameterization log_p0_plus_delta requires full_prior")
     if args.qmer_vocab_size <= 0 or args.rmer_vocab_size <= 0:
         raise SystemExit("Q/R-mer vocabulary sizes must be positive")
     if args.qmer_embed_dim <= 0 or args.rmer_embed_dim <= 0:
@@ -326,18 +345,20 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     eval_limit = None if args.eval_max_reads_per_file == 0 else args.eval_max_reads_per_file
+    selected_continuous_dim = continuous_feature_dim(args.prior_feature_mode)
 
     # 保存完整配置，后续 predict 脚本会从 checkpoint 里恢复模型结构。
     model_type = (
         "causal_transformer_log_p0_delta_residual_base_conv"
         if args.output_parameterization == LOG_P0_PLUS_DELTA
-        else "causal_transformer_direct_residual_base_conv"
+        else f"causal_transformer_{args.prior_feature_mode}_direct_residual_base_conv"
     )
     config = {
         "model_type": model_type,
+        "prior_feature_mode": args.prior_feature_mode,
         "output_parameterization": args.output_parameterization,
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
-        "uses_history_runs": True,
+        "uses_history_runs": args.history_run_embed_dim > 0,
         "uses_base_context": True,
         "base_context_is_bidirectional": True,
         "complete_base_read_available_before_quality": True,
@@ -369,7 +390,7 @@ def main() -> int:
         "batch_reads": args.batch_reads,
         "eval_batch_reads": args.eval_batch_reads,
         "eval_max_reads_per_file": args.eval_max_reads_per_file,
-        "continuous_dim": CONTINUOUS_FEATURE_DIM,
+        "continuous_dim": selected_continuous_dim,
         "q_hat_embed_dim": args.q_hat_embed_dim,
         "prev_q_embed_dim": args.prev_q_embed_dim,
         "prev_r_embed_dim": args.prev_r_embed_dim,
@@ -410,10 +431,11 @@ def main() -> int:
         mer_stride=args.mer_stride,
         qmer_vocab_size=args.qmer_vocab_size,
         rmer_vocab_size=args.rmer_vocab_size,
+        prior_feature_mode=args.prior_feature_mode,
     )
     # Transformer 输入与阶段 3 Q/R-mer 版本使用相同的 causal features。
     model = ResidualTransformer(
-        continuous_dim=CONTINUOUS_FEATURE_DIM,
+        continuous_dim=selected_continuous_dim,
         q_hat_embed_dim=args.q_hat_embed_dim,
         prev_q_embed_dim=args.prev_q_embed_dim,
         prev_r_embed_dim=args.prev_r_embed_dim,
@@ -545,6 +567,7 @@ def main() -> int:
                 qmer_vocab_size=args.qmer_vocab_size,
                 rmer_vocab_size=args.rmer_vocab_size,
                 base_sidecar_dir=args.base_sidecar_dir,
+                prior_feature_mode=args.prior_feature_mode,
             )
             elapsed = time.time() - started
             row = {
