@@ -21,8 +21,7 @@ except ImportError:  # pragma: no cover
 from sequence_residual_transformer_model import (
     CONTINUOUS_FEATURE_DIM,
     DEFAULT_BASE_CONV_KERNELS,
-    DEFAULT_EXACT_Q_LAGS,
-    DEFAULT_EXACT_R_LAGS,
+    DEFAULT_HISTORY_RUN_EMBED_DIM,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
     DEFAULT_QMER_KS,
@@ -78,8 +77,6 @@ def evaluate_model(
     device: torch.device,
     qmer_ks: tuple[int, ...],
     rmer_ks: tuple[int, ...],
-    exact_q_lags: tuple[int, ...],
-    exact_r_lags: tuple[int, ...],
     mer_stride: int,
     qmer_vocab_size: int,
     rmer_vocab_size: int,
@@ -108,8 +105,6 @@ def evaluate_model(
             base_sidecar_path=base_sidecar_path_for_h5(path, base_sidecar_dir),
             qmer_ks=qmer_ks,
             rmer_ks=rmer_ks,
-            exact_q_lags=exact_q_lags,
-            exact_r_lags=exact_r_lags,
             mer_stride=mer_stride,
             qmer_vocab_size=qmer_vocab_size,
             rmer_vocab_size=rmer_vocab_size,
@@ -121,8 +116,8 @@ def evaluate_model(
                 q_hat=tensors["q_hat"],
                 prev_q=tensors["prev_q"],
                 prev_r=tensors["prev_r"],
-                exact_q_lags=tensors["exact_q_lags"],
-                exact_r_lags=tensors["exact_r_lags"],
+                zero_residual_run=tensors["zero_residual_run"],
+                same_quality_run=tensors["same_quality_run"],
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
                 base_ids=tensors["base_ids"],
@@ -178,7 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=Path(
-            "runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15"
+            "runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_"
+            "baseconv357_b64_e15"
         ),
         help="directory for checkpoints, config, and train log",
     )
@@ -213,16 +209,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prev-q-embed-dim", type=int, default=16)
     parser.add_argument("--prev-r-embed-dim", type=int, default=32)
     parser.add_argument(
-        "--exact-q-lags",
-        type=parse_int_list,
-        default=DEFAULT_EXACT_Q_LAGS,
-        help="comma-separated exact decoded quality lags; use '' to disable",
-    )
-    parser.add_argument(
-        "--exact-r-lags",
-        type=parse_int_list,
-        default=DEFAULT_EXACT_R_LAGS,
-        help="comma-separated exact decoded residual lags; use '' to disable",
+        "--history-run-embed-dim",
+        type=int,
+        default=DEFAULT_HISTORY_RUN_EMBED_DIM,
+        help="embedding dimension for causal residual-zero and same-quality run buckets",
     )
     parser.add_argument(
         "--qmer-ks",
@@ -298,12 +288,8 @@ def main() -> int:
         raise SystemExit("--feedforward-dim and --context-length must be positive")
     if args.mer_stride <= 0:
         raise SystemExit("--mer-stride must be positive")
-    if any(lag < 2 for lag in (*args.exact_q_lags, *args.exact_r_lags)):
-        raise SystemExit("--exact-q-lags and --exact-r-lags must contain values >= 2")
-    if len(set(args.exact_q_lags)) != len(args.exact_q_lags) or len(
-        set(args.exact_r_lags)
-    ) != len(args.exact_r_lags):
-        raise SystemExit("exact history lag lists must not contain duplicates")
+    if args.history_run_embed_dim <= 0:
+        raise SystemExit("--history-run-embed-dim must be positive")
     if args.qmer_vocab_size <= 0 or args.rmer_vocab_size <= 0:
         raise SystemExit("Q/R-mer vocabulary sizes must be positive")
     if args.qmer_embed_dim <= 0 or args.rmer_embed_dim <= 0:
@@ -351,7 +337,7 @@ def main() -> int:
         "model_type": model_type,
         "output_parameterization": args.output_parameterization,
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
-        "uses_exact_qr_lags": bool(args.exact_q_lags or args.exact_r_lags),
+        "uses_history_runs": True,
         "uses_base_context": True,
         "base_context_is_bidirectional": True,
         "complete_base_read_available_before_quality": True,
@@ -387,8 +373,7 @@ def main() -> int:
         "q_hat_embed_dim": args.q_hat_embed_dim,
         "prev_q_embed_dim": args.prev_q_embed_dim,
         "prev_r_embed_dim": args.prev_r_embed_dim,
-        "exact_q_lags": list(args.exact_q_lags),
-        "exact_r_lags": list(args.exact_r_lags),
+        "history_run_embed_dim": args.history_run_embed_dim,
         "qmer_ks": list(args.qmer_ks),
         "rmer_ks": list(args.rmer_ks),
         "mer_stride": args.mer_stride,
@@ -422,8 +407,6 @@ def main() -> int:
         base_sidecar_dir=args.base_sidecar_dir,
         qmer_ks=args.qmer_ks,
         rmer_ks=args.rmer_ks,
-        exact_q_lags=args.exact_q_lags,
-        exact_r_lags=args.exact_r_lags,
         mer_stride=args.mer_stride,
         qmer_vocab_size=args.qmer_vocab_size,
         rmer_vocab_size=args.rmer_vocab_size,
@@ -434,8 +417,7 @@ def main() -> int:
         q_hat_embed_dim=args.q_hat_embed_dim,
         prev_q_embed_dim=args.prev_q_embed_dim,
         prev_r_embed_dim=args.prev_r_embed_dim,
-        exact_q_lags=args.exact_q_lags,
-        exact_r_lags=args.exact_r_lags,
+        history_run_embed_dim=args.history_run_embed_dim,
         qmer_ks=args.qmer_ks,
         rmer_ks=args.rmer_ks,
         qmer_vocab_size=args.qmer_vocab_size,
@@ -514,8 +496,8 @@ def main() -> int:
                     q_hat=tensors["q_hat"],
                     prev_q=tensors["prev_q"],
                     prev_r=tensors["prev_r"],
-                    exact_q_lags=tensors["exact_q_lags"],
-                    exact_r_lags=tensors["exact_r_lags"],
+                    zero_residual_run=tensors["zero_residual_run"],
+                    same_quality_run=tensors["same_quality_run"],
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
@@ -559,8 +541,6 @@ def main() -> int:
                 device=device,
                 qmer_ks=args.qmer_ks,
                 rmer_ks=args.rmer_ks,
-                exact_q_lags=args.exact_q_lags,
-                exact_r_lags=args.exact_r_lags,
                 mer_stride=args.mer_stride,
                 qmer_vocab_size=args.qmer_vocab_size,
                 rmer_vocab_size=args.rmer_vocab_size,

@@ -16,9 +16,6 @@ from sequence_residual_transformer_model import (
     BASE_PAD_TOKEN,
     BASE_T_TOKEN,
     CONTINUOUS_FEATURE_DIM,
-    Q_BOS_TOKEN,
-    R_BOS_TOKEN,
-    RESIDUAL_MIN,
     RESIDUAL_CLASSES,
     ResidualTransformer,
     base_sidecar_path_for_h5,
@@ -111,20 +108,10 @@ class BaseFeatureTest(unittest.TestCase):
         self.assertEqual(int(batch.base_ids[0, 3]), BASE_T_TOKEN)
         self.assertEqual(int(batch.base_ids[0, 4]), BASE_PAD_TOKEN)
         self.assertEqual(int(batch.base_ids[1, 4]), BASE_T_TOKEN)
-        self.assertEqual(batch.exact_q_lags.shape, (2, 3, 3))
-        self.assertEqual(batch.exact_r_lags.shape, (2, 3, 3))
-        np.testing.assert_array_equal(
-            batch.exact_q_lags[0],
-            np.asarray(
-                [
-                    [Q_BOS_TOKEN, Q_BOS_TOKEN, Q_BOS_TOKEN],
-                    [Q_BOS_TOKEN, Q_BOS_TOKEN, Q_BOS_TOKEN],
-                    [32, Q_BOS_TOKEN, Q_BOS_TOKEN],
-                ]
-            ),
-        )
-        self.assertEqual(int(batch.exact_r_lags[0, 2, 0]), -RESIDUAL_MIN)
-        self.assertEqual(int(batch.exact_r_lags[0, 2, 1]), R_BOS_TOKEN)
+        self.assertEqual(batch.exact_q_lags.shape, (2, 3, 0))
+        self.assertEqual(batch.exact_r_lags.shape, (2, 3, 0))
+        np.testing.assert_array_equal(batch.zero_residual_run[0], np.asarray([0, 1, 2]))
+        np.testing.assert_array_equal(batch.same_quality_run[0], np.asarray([0, 1, 1]))
 
     def test_base_conv_model_forward_and_checkpoint_shapes(self) -> None:
         batch = read_h5_read_range(
@@ -156,6 +143,8 @@ class BaseFeatureTest(unittest.TestCase):
             prev_r=tensors["prev_r"],
             exact_q_lags=tensors["exact_q_lags"],
             exact_r_lags=tensors["exact_r_lags"],
+            zero_residual_run=tensors["zero_residual_run"],
+            same_quality_run=tensors["same_quality_run"],
             qmer_tokens=tensors["qmer_tokens"],
             rmer_tokens=tensors["rmer_tokens"],
             base_ids=tensors["base_ids"],
@@ -171,6 +160,8 @@ class BaseFeatureTest(unittest.TestCase):
                 prev_r=tensors["prev_r"],
                 exact_q_lags=tensors["exact_q_lags"],
                 exact_r_lags=tensors["exact_r_lags"],
+                zero_residual_run=tensors["zero_residual_run"],
+                same_quality_run=tensors["same_quality_run"],
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
                 lengths=tensors["lengths"],

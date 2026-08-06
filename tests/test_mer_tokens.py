@@ -6,10 +6,13 @@ import numpy as np
 from sequence_residual_transformer_model import (
     DEFAULT_EXACT_Q_LAGS,
     DEFAULT_EXACT_R_LAGS,
+    DEFAULT_HISTORY_RUN_EMBED_DIM,
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
     build_exact_lag_tokens_for_read,
+    build_causal_run_length_tokens,
     build_mer_tokens_for_read,
+    run_length_to_bucket,
 )
 from train_sequence_residual_transformer import build_parser
 
@@ -40,8 +43,8 @@ class MerTokenTest(unittest.TestCase):
     def test_default_windows(self) -> None:
         self.assertEqual(DEFAULT_QMER_KS, (2, 3, 4))
         self.assertEqual(DEFAULT_RMER_KS, (2, 3, 4))
-        self.assertEqual(DEFAULT_EXACT_Q_LAGS, (2, 3, 4))
-        self.assertEqual(DEFAULT_EXACT_R_LAGS, (2, 3, 4))
+        self.assertEqual(DEFAULT_EXACT_Q_LAGS, ())
+        self.assertEqual(DEFAULT_EXACT_R_LAGS, ())
 
     def test_training_defaults(self) -> None:
         args = build_parser().parse_args([])
@@ -49,14 +52,14 @@ class MerTokenTest(unittest.TestCase):
         self.assertEqual(args.eval_batch_reads, 64)
         self.assertEqual(args.qmer_ks, (2, 3, 4))
         self.assertEqual(args.rmer_ks, (2, 3, 4))
-        self.assertEqual(args.exact_q_lags, (2, 3, 4))
-        self.assertEqual(args.exact_r_lags, (2, 3, 4))
+        self.assertEqual(args.history_run_embed_dim, DEFAULT_HISTORY_RUN_EMBED_DIM)
         self.assertEqual(args.base_conv_kernels, (3, 5, 7))
         self.assertEqual(args.num_layers, 4)
         self.assertEqual(
             args.output_dir,
             Path(
-                "runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15"
+                "runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_"
+                "baseconv357_b64_e15"
             ),
         )
 
@@ -126,6 +129,19 @@ class MerTokenTest(unittest.TestCase):
             build_exact_lag_tokens_for_read(values, (1,), bos_token=95)
         with self.assertRaisesRegex(ValueError, "unique"):
             build_exact_lag_tokens_for_read(values, (2, 2), bos_token=95)
+
+    def test_run_length_bucket_boundaries(self) -> None:
+        lengths = np.asarray([0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 99])
+        expected = np.asarray([0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8, 8])
+        np.testing.assert_array_equal(run_length_to_bucket(lengths), expected)
+
+    def test_run_lengths_use_only_positions_before_current_target(self) -> None:
+        zero_run, same_q_run = build_causal_run_length_tokens(
+            qualities=np.asarray([10, 10, 20, 20, 20, 30]),
+            residuals=np.asarray([0, 0, -1, 0, 0, 0]),
+        )
+        np.testing.assert_array_equal(zero_run, np.asarray([0, 1, 2, 0, 1, 2]))
+        np.testing.assert_array_equal(same_q_run, np.asarray([0, 1, 2, 1, 2, 3]))
 
     def test_rejects_invalid_parameters(self) -> None:
         buckets = np.asarray([1, 2, 3], dtype=np.int64)

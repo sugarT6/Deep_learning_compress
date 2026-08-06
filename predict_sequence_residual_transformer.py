@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,9 @@ def evaluate_file(
     zero_true_freq = 0
 
     model.eval()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
     for batch in iter_read_batches(
         path=path,
         train_fraction=train_fraction,
@@ -93,6 +97,8 @@ def evaluate_file(
             prev_r=tensors["prev_r"],
             exact_q_lags=tensors["exact_q_lags"],
             exact_r_lags=tensors["exact_r_lags"],
+            zero_residual_run=tensors["zero_residual_run"],
+            same_quality_run=tensors["same_quality_run"],
             qmer_tokens=tensors["qmer_tokens"],
             rmer_tokens=tensors["rmer_tokens"],
             base_ids=tensors["base_ids"],
@@ -113,6 +119,9 @@ def evaluate_file(
 
     if total_symbols == 0:
         raise ValueError(f"{path}: evaluation split produced zero symbols")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed_seconds = time.perf_counter() - started
 
     # total_nats 转成 bit 后，再除以 symbol 数得到 avg_bits_per_quality。
     model_total_bits = total_nats / math.log(2.0)
@@ -128,6 +137,7 @@ def evaluate_file(
         "delta_bits": model_avg_bits - h5_avg_bits,
         "relative_improvement": (h5_avg_bits - model_avg_bits) / h5_avg_bits,
         "zero_true_freq": zero_true_freq,
+        "elapsed_seconds": elapsed_seconds,
     }
 
 
@@ -166,6 +176,8 @@ def write_prediction_samples(
         prev_r=tensors["prev_r"],
         exact_q_lags=tensors["exact_q_lags"],
         exact_r_lags=tensors["exact_r_lags"],
+        zero_residual_run=tensors["zero_residual_run"],
+        same_quality_run=tensors["same_quality_run"],
         qmer_tokens=tensors["qmer_tokens"],
         rmer_tokens=tensors["rmer_tokens"],
         base_ids=tensors["base_ids"],
@@ -293,6 +305,8 @@ def write_quality_probability_log(
                     prev_r=tensors["prev_r"],
                     exact_q_lags=tensors["exact_q_lags"],
                     exact_r_lags=tensors["exact_r_lags"],
+                    zero_residual_run=tensors["zero_residual_run"],
+                    same_quality_run=tensors["same_quality_run"],
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
@@ -355,7 +369,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-csv",
         type=Path,
         default=Path(
-            "runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/"
+            "runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_"
+            "baseconv357_b64_e15/"
             "predict_metrics.csv"
         ),
     )
@@ -447,7 +462,8 @@ def main() -> int:
             f"h5_bits={metric['h5_baseline_avg_bits_per_quality']:.4f} "
             f"delta={metric['delta_bits']:.4f} "
             f"rel_improve={metric['relative_improvement']:.4%} "
-            f"symbols={metric['total_symbols']}",
+            f"symbols={metric['total_symbols']} "
+            f"elapsed={metric['elapsed_seconds']:.4f}s",
             flush=True,
         )
 
@@ -463,6 +479,7 @@ def main() -> int:
             "delta_bits",
             "relative_improvement",
             "zero_true_freq",
+            "elapsed_seconds",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -480,6 +497,7 @@ def main() -> int:
                     "delta_bits": fmt4(float(row["delta_bits"])),
                     "relative_improvement": fmt4(float(row["relative_improvement"])),
                     "zero_true_freq": row["zero_true_freq"],
+                    "elapsed_seconds": fmt4(float(row["elapsed_seconds"])),
                 }
             )
 
@@ -515,6 +533,8 @@ def main() -> int:
             base_sidecar_dir=base_sidecar_dir if uses_base_context else None,
         )
 
+    total_elapsed_seconds = sum(float(row["elapsed_seconds"]) for row in rows)
+    print(f"total_elapsed={total_elapsed_seconds:.4f}s")
     print(f"wrote {args.output_csv}")
     if args.sample_predictions is not None:
         print(f"wrote {args.sample_predictions}")

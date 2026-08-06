@@ -42,19 +42,20 @@ normalized read length
 q_hat embedding
 previous decoded quality embedding
 previous decoded residual embedding
-exact decoded quality embeddings for q[i-2], q[i-3], q[i-4]
-exact decoded residual embeddings for r[i-2], r[i-3], r[i-4]
+causal consecutive residual==0 run-length embedding
+causal consecutive same-quality run-length embedding
 Q-mer history embeddings for k = 2,3,4
 Residual-mer history embeddings for k = 2,3,4
 bidirectional local base context from complete DNA read
 ```
 
-Missing history at the start of a read uses BOS tokens. Exact lag features
-share the existing quality/residual embedding tables and occupy distinct input
-slots. Q/R-mer tokens use the same bucket definitions, causal history
-construction, stride-1 hashing, and default vocabulary size 4096 as the
-stage-3 Q/R-mer experiment. No token includes the current or a future true
-quality/residual.
+Missing history at the start of a read uses BOS tokens. Both run lengths are
+computed only from positions before the current target and use buckets
+`0,1,2,3,4,5-7,8-15,16-31,32+`. Q/R-mer tokens use the same bucket definitions,
+causal history construction, stride-1 hashing, and default vocabulary size
+4096 as the stage-3 Q/R-mer experiment. No token includes the current or a
+future true quality/residual. The completed exact-lag ablation is disabled in
+current training.
 
 The quality decoder is assumed to have the complete DNA read before quality
 decoding starts. Therefore the base branch may use both previous and future
@@ -66,7 +67,7 @@ not included in the reported body-quality bits.
 
 ```text
 feature concatenation
-  (including exact q/r history lags 2,3,4)
+  (including residual-zero and same-quality run-length embeddings)
   (including three Q-mer and three residual-mer embeddings)
   (including Base Embedding + centered Conv1D kernels 3,5,7 -> 32 dims)
 -> Linear + ReLU + Dropout
@@ -157,14 +158,13 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-batch-reads 64 \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
-  --exact-q-lags 2,3,4 \
-  --exact-r-lags 2,3,4 \
+  --history-run-embed-dim 8 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
   --output-parameterization direct_residual_logits \
-  --output-dir runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15
+  --output-dir runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15
 ```
 
 This run uses 64 reads and 2,000 optimizer updates per epoch. Relative to the
@@ -182,14 +182,13 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-batch-reads 64 \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
-  --exact-q-lags 2,3,4 \
-  --exact-r-lags 2,3,4 \
+  --history-run-embed-dim 8 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
   --output-parameterization log_p0_plus_delta \
-  --output-dir runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_logp0delta_b64_e15
+  --output-dir runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_logp0delta_b64_e15
 ```
 
 Small smoke run:
@@ -210,9 +209,9 @@ python train_sequence_residual_transformer.py \
 Training writes:
 
 ```text
-runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/config.json
-runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/train_log.csv
-runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/best.pt
+runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/config.json
+runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/train_log.csv
+runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/best.pt
 ```
 
 The training CSV and terminal show all floating-point values with four decimal
@@ -227,10 +226,10 @@ and use a separate output directory.
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/best.pt \
+  runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/best.pt \
   --batch-reads 64 \
   --base-sidecar-dir base_sidecars \
-  --output-csv runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/predict_metrics.csv
+  --output-csv runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/predict_metrics.csv
 ```
 
 The default split is the last 20% test reads. Use `--split all` to evaluate the
@@ -238,21 +237,24 @@ whole H5 file. Optional detailed outputs remain compatible with stage 3:
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/best.pt \
+  runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/best.pt \
   --base-sidecar-dir base_sidecars \
-  --sample-predictions runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/samples.csv \
-  --quality-prob-log runs/transformer_residual_4layer_exactqr234_qrmer234_baseconv357_b64_e15/predict_quality_prob.log \
+  --sample-predictions runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/samples.csv \
+  --quality-prob-log runs/transformer_residual_4layer_rzero_sameqrun_qrmer234_baseconv357_b64_e15/predict_quality_prob.log \
   --quality-prob-log-rows 1000
 ```
 
-The exact-lag, output-parameterization, Q/R-mer, and base-branch settings are
-restored from the checkpoint during prediction; no prediction-side switch is
-needed. Old checkpoints without exact-lag fields load with those features
-disabled. Old checkpoints without `output_parameterization` default to
+The run-length, historical exact-lag, output-parameterization, Q/R-mer, and
+base-branch settings are restored from the checkpoint during prediction; no
+prediction-side switch is needed. Exact-lag support remains only for loading
+the completed ablation checkpoint and is disabled in current training. Old
+checkpoints without run-length fields load with those features disabled. Old
+checkpoints without `output_parameterization` default to
 `direct_residual_logits`. Old stage-4 checkpoints without a base branch remain
 loadable and do not require sidecars. Prediction CSVs, optional sample outputs,
 compact probability logs, and terminal floating-point metrics use four decimal
-places.
+places. `predict_metrics.csv` records `elapsed_seconds` for each input file;
+the terminal also prints each file's time and their summed total.
 
 ## Metrics
 

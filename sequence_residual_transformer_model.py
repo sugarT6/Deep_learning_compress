@@ -9,6 +9,7 @@ This module implements the shared pieces for stage 4:
 * aligned full-read base side information from independent HDF5 sidecars;
 * a lightweight bidirectional local base-motif encoder;
 * causal history tokens for previous quality and previous residual;
+* causal residual-zero and same-quality run-length summaries;
 * padding/collation for variable-length reads;
 * a lightweight causal Transformer that predicts P(r_i | current H5 features,
   current position, previous decoded quality, previous decoded residual).
@@ -47,10 +48,15 @@ R_TOKEN_COUNT = RESIDUAL_CLASSES + 1
 
 DEFAULT_QMER_KS = (2, 3, 4)
 DEFAULT_RMER_KS = (2, 3, 4)
-DEFAULT_EXACT_Q_LAGS = (2, 3, 4)
-DEFAULT_EXACT_R_LAGS = (2, 3, 4)
+# Retained only so checkpoints from the completed exact-lag ablation remain
+# loadable. Current training does not enable exact lags.
+DEFAULT_EXACT_Q_LAGS: tuple[int, ...] = ()
+DEFAULT_EXACT_R_LAGS: tuple[int, ...] = ()
 DEFAULT_MER_STRIDE = 1
 DEFAULT_MER_VOCAB_SIZE = 4096
+
+RUN_LENGTH_BUCKET_COUNT = 9
+DEFAULT_HISTORY_RUN_EMBED_DIM = 8
 
 BASE_A_TOKEN = 0
 BASE_C_TOKEN = 1
@@ -130,6 +136,11 @@ class SequenceBatch:
     exact_q_lags / exact_r_lags:
         Exact decoded history tokens for the configured lags, shape
         [batch, max_len, num_lags]. Missing read-prefix history uses BOS.
+        These fields are empty in the current no-exact-lag experiment and are
+        retained for historical checkpoint compatibility.
+    zero_residual_run / same_quality_run:
+        Bucketed causal run lengths computed only from positions before the
+        current target, shape [batch, max_len].
     targets:
         True residual class for the current position, or PAD_TARGET on padding.
     valid_mask:
@@ -157,6 +168,8 @@ class SequenceBatch:
     prev_r: np.ndarray
     exact_q_lags: np.ndarray
     exact_r_lags: np.ndarray
+    zero_residual_run: np.ndarray
+    same_quality_run: np.ndarray
     targets: np.ndarray
     valid_mask: np.ndarray
     lengths: np.ndarray
@@ -381,6 +394,55 @@ def build_exact_lag_tokens_for_read(
     return tokens
 
 
+def run_length_to_bucket(lengths: np.ndarray) -> np.ndarray:
+    """Map causal run lengths to 0,1,2,3,4,5-7,8-15,16-31,32+ buckets."""
+
+    lengths_i = np.asarray(lengths, dtype=np.int64)
+    if np.any(lengths_i < 0):
+        raise ValueError("run lengths must be non-negative")
+    boundaries = np.asarray([1, 2, 3, 4, 5, 8, 16, 32], dtype=np.int64)
+    return np.digitize(lengths_i, boundaries, right=False).astype(np.int64, copy=False)
+
+
+def build_causal_run_length_tokens(
+    qualities: np.ndarray,
+    residuals: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build prior-zero-residual and prior-same-quality run tokens for one read."""
+
+    qualities_i = np.asarray(qualities, dtype=np.int64)
+    residuals_i = np.asarray(residuals, dtype=np.int64)
+    if qualities_i.ndim != 1 or residuals_i.ndim != 1:
+        raise ValueError("quality and residual runs must be built from 1-D arrays")
+    if qualities_i.size != residuals_i.size:
+        raise ValueError("quality and residual arrays must have the same length")
+    length = int(qualities_i.size)
+    if length == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty.copy()
+
+    positions = np.arange(length, dtype=np.int64)
+
+    # Consecutive residual==0 length ending at each observed position.
+    last_nonzero = np.maximum.accumulate(np.where(residuals_i != 0, positions, -1))
+    zero_run_ending_here = positions - last_nonzero
+    zero_run_before = np.zeros(length, dtype=np.int64)
+    zero_run_before[1:] = zero_run_ending_here[:-1]
+
+    # Consecutive equal-quality length ending at each observed position.
+    quality_changed = np.ones(length, dtype=bool)
+    quality_changed[1:] = qualities_i[1:] != qualities_i[:-1]
+    run_start = np.maximum.accumulate(np.where(quality_changed, positions, 0))
+    same_quality_ending_here = positions - run_start + 1
+    same_quality_before = np.zeros(length, dtype=np.int64)
+    same_quality_before[1:] = same_quality_ending_here[:-1]
+
+    return (
+        run_length_to_bucket(zero_run_before),
+        run_length_to_bucket(same_quality_before),
+    )
+
+
 def quality_to_bucket(q: np.ndarray) -> np.ndarray:
     """Map quality ids 0..94 to seven coarse history buckets."""
 
@@ -577,6 +639,8 @@ def build_sequence_batch(
     exact_r_lag_tokens = np.full(
         (batch_size, max_len, len(exact_r_lags_t)), R_BOS_TOKEN, dtype=np.int64
     )
+    zero_residual_run_tokens = np.zeros((batch_size, max_len), dtype=np.int64)
+    same_quality_run_tokens = np.zeros((batch_size, max_len), dtype=np.int64)
     qmer_tokens = np.zeros((batch_size, max_len, len(qmer_ks_t)), dtype=np.int64)
     rmer_tokens = np.zeros((batch_size, max_len, len(rmer_ks_t)), dtype=np.int64)
     targets = np.full((batch_size, max_len), PAD_TARGET, dtype=np.int64)
@@ -656,6 +720,11 @@ def build_sequence_batch(
         exact_r_lag_tokens[read_idx, :length, :] = build_exact_lag_tokens_for_read(
             targets_flat[start_i:end_i], exact_r_lags_t, R_BOS_TOKEN
         )
+        zero_run, same_q_run = build_causal_run_length_tokens(
+            observed_i[start_i:end_i], residual[start_i:end_i]
+        )
+        zero_residual_run_tokens[read_idx, :length] = zero_run
+        same_quality_run_tokens[read_idx, :length] = same_q_run
 
     # H5 baseline bits 用于和神经模型 bits 对比：
     #   bits_i = -log2 P0(q_true_i)
@@ -672,6 +741,8 @@ def build_sequence_batch(
         prev_r=prev_r_tokens,
         exact_q_lags=exact_q_lag_tokens,
         exact_r_lags=exact_r_lag_tokens,
+        zero_residual_run=zero_residual_run_tokens,
+        same_quality_run=same_quality_run_tokens,
         targets=targets,
         valid_mask=valid_mask,
         lengths=read_lengths,
@@ -947,7 +1018,8 @@ class ResidualTransformer(nn.Module):
     Position ``i`` may attend to itself because its input contains only the
     current H5 predictor features plus history shifted by one position. Future
     tokens are hidden by a causal sliding-window mask. Q/R-mer embeddings add
-    multi-scale summaries built exclusively from already decoded history.
+    multi-scale summaries built exclusively from already decoded history, and
+    run-length embeddings summarize decoded residual-zero/quality streaks.
 
     ``direct_residual_logits`` uses the output head as the final logits.
     ``log_p0_plus_delta`` treats the output head as a correction and adds it to
@@ -962,6 +1034,7 @@ class ResidualTransformer(nn.Module):
         prev_r_embed_dim: int = 32,
         exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
         exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
+        history_run_embed_dim: int = DEFAULT_HISTORY_RUN_EMBED_DIM,
         qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
         rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -988,6 +1061,8 @@ class ResidualTransformer(nn.Module):
             raise ValueError("d_model must be positive and divisible by num_heads")
         if feedforward_dim <= 0:
             raise ValueError("feedforward_dim must be positive")
+        if history_run_embed_dim < 0:
+            raise ValueError("history_run_embed_dim must be non-negative")
         if context_length <= 0:
             raise ValueError("context_length must be positive")
         if output_parameterization not in OUTPUT_PARAMETERIZATIONS:
@@ -1012,6 +1087,7 @@ class ResidualTransformer(nn.Module):
         self.output_parameterization = output_parameterization
         self.exact_q_lags = normalize_exact_lags(exact_q_lags)
         self.exact_r_lags = normalize_exact_lags(exact_r_lags)
+        self.history_run_embed_dim = int(history_run_embed_dim)
         self.qmer_ks = normalize_mer_ks(qmer_ks)
         self.rmer_ks = normalize_mer_ks(rmer_ks)
         self.base_conv_kernels = (
@@ -1023,6 +1099,16 @@ class ResidualTransformer(nn.Module):
         self.q_hat_embedding = nn.Embedding(ALPHABET_SIZE, q_hat_embed_dim)
         self.prev_q_embedding = nn.Embedding(Q_TOKEN_COUNT, prev_q_embed_dim)
         self.prev_r_embedding = nn.Embedding(R_TOKEN_COUNT, prev_r_embed_dim)
+        if self.history_run_embed_dim > 0:
+            self.zero_residual_run_embedding: nn.Embedding | None = nn.Embedding(
+                RUN_LENGTH_BUCKET_COUNT, self.history_run_embed_dim
+            )
+            self.same_quality_run_embedding: nn.Embedding | None = nn.Embedding(
+                RUN_LENGTH_BUCKET_COUNT, self.history_run_embed_dim
+            )
+        else:
+            self.zero_residual_run_embedding = None
+            self.same_quality_run_embedding = None
         self.qmer_embeddings = nn.ModuleList(
             [nn.Embedding(qmer_vocab_size, qmer_embed_dim) for _ in self.qmer_ks]
         )
@@ -1049,6 +1135,7 @@ class ResidualTransformer(nn.Module):
             + prev_r_embed_dim
             + len(self.exact_q_lags) * prev_q_embed_dim
             + len(self.exact_r_lags) * prev_r_embed_dim
+            + 2 * self.history_run_embed_dim
             + len(self.qmer_ks) * qmer_embed_dim
             + len(self.rmer_ks) * rmer_embed_dim
             + self.base_context_dim
@@ -1115,6 +1202,8 @@ class ResidualTransformer(nn.Module):
         prev_r: torch.Tensor,
         exact_q_lags: torch.Tensor | None = None,
         exact_r_lags: torch.Tensor | None = None,
+        zero_residual_run: torch.Tensor | None = None,
+        same_quality_run: torch.Tensor | None = None,
         qmer_tokens: torch.Tensor | None = None,
         rmer_tokens: torch.Tensor | None = None,
         base_ids: torch.Tensor | None = None,
@@ -1140,6 +1229,12 @@ class ResidualTransformer(nn.Module):
                 raise ValueError("exact_r_lags width does not match checkpoint configuration")
             for lag_index in range(len(self.exact_r_lags)):
                 pieces.append(self.prev_r_embedding(exact_r_lags[:, :, lag_index]))
+        if self.zero_residual_run_embedding is not None:
+            if zero_residual_run is None or same_quality_run is None:
+                raise ValueError("causal run-length tokens are required by this checkpoint")
+            assert self.same_quality_run_embedding is not None
+            pieces.append(self.zero_residual_run_embedding(zero_residual_run))
+            pieces.append(self.same_quality_run_embedding(same_quality_run))
         if self.qmer_embeddings:
             if qmer_tokens is None:
                 raise ValueError("qmer_tokens are required by this checkpoint")
@@ -1196,6 +1291,8 @@ def batch_to_torch(batch: SequenceBatch, device: torch.device) -> dict[str, torc
         "prev_r": torch.from_numpy(batch.prev_r).to(device),
         "exact_q_lags": torch.from_numpy(batch.exact_q_lags).to(device),
         "exact_r_lags": torch.from_numpy(batch.exact_r_lags).to(device),
+        "zero_residual_run": torch.from_numpy(batch.zero_residual_run).to(device),
+        "same_quality_run": torch.from_numpy(batch.same_quality_run).to(device),
         "targets": torch.from_numpy(batch.targets).to(device),
         "valid_mask": torch.from_numpy(batch.valid_mask).to(device),
         "lengths": torch.from_numpy(batch.lengths).to(device),
@@ -1246,6 +1343,7 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransform
         prev_r_embed_dim=int(config["prev_r_embed_dim"]),
         exact_q_lags=config.get("exact_q_lags", []),
         exact_r_lags=config.get("exact_r_lags", []),
+        history_run_embed_dim=int(config.get("history_run_embed_dim", 0)),
         qmer_ks=config.get("qmer_ks", []),
         rmer_ks=config.get("rmer_ks", []),
         qmer_vocab_size=int(config.get("qmer_vocab_size", DEFAULT_MER_VOCAB_SIZE)),

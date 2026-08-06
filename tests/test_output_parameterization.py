@@ -17,6 +17,7 @@ def make_small_model(output_parameterization: str) -> ResidualTransformer:
         continuous_dim=CONTINUOUS_FEATURE_DIM,
         exact_q_lags=(),
         exact_r_lags=(),
+        history_run_embed_dim=0,
         qmer_ks=(),
         rmer_ks=(),
         d_model=16,
