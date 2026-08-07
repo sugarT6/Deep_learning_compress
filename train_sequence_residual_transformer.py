@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the stage-4 causal Transformer residual model on SRR*.h5 files."""
+"""Train the q-hat-conditioned quality/residual Transformer on SRR*.h5 files."""
 
 from __future__ import annotations
 
@@ -24,15 +24,18 @@ from sequence_residual_transformer_model import (
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
     DEFAULT_PRIOR_FEATURE_MODE,
+    DEFAULT_PREDICTION_TARGET,
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
-    DIRECT_RESIDUAL_LOGITS,
+    DIRECT_LOGITS,
     FULL_PRIOR,
     LOG_P0_PLUS_DELTA,
     OUTPUT_PARAMETERIZATIONS,
     PAD_TARGET,
+    PREDICTION_TARGETS,
     PRIOR_FEATURE_MODES,
-    RESIDUAL_CLASSES,
+    QUALITY_TARGET,
+    RESIDUAL_TARGET,
     ContiguousReadBatchSampler,
     ResidualTransformer,
     base_sidecar_path_for_h5,
@@ -43,6 +46,7 @@ from sequence_residual_transformer_model import (
     inspect_base_sidecar,
     iter_read_batches,
     mask_invalid_residual_logits,
+    prediction_output_dim,
     save_json,
 )
 
@@ -85,6 +89,8 @@ def evaluate_model(
     rmer_vocab_size: int,
     base_sidecar_dir: Path,
     prior_feature_mode: str,
+    prediction_target: str,
+    history_run_features: bool,
 ) -> dict[str, float]:
     """Evaluate compression metrics on a deterministic read split."""
 
@@ -113,9 +119,12 @@ def evaluate_model(
             qmer_vocab_size=qmer_vocab_size,
             rmer_vocab_size=rmer_vocab_size,
             prior_feature_mode=prior_feature_mode,
+            prediction_target=prediction_target,
+            history_run_features=history_run_features,
         ):
             tensors = batch_to_torch(batch, device)
-            # 模型输出 [batch, seq_len, 189]，每一维对应一个 residual 类别。
+            # 模型输出当前实验的 95 个 quality 类别；旧 residual checkpoint
+            # 仍可通过 prediction_target=residual 使用 189 类。
             logits = model(
                 continuous=tensors["continuous"],
                 q_hat=tensors["q_hat"],
@@ -128,12 +137,12 @@ def evaluate_model(
                 base_ids=tensors["base_ids"],
                 lengths=tensors["lengths"],
             )
-            # 只屏蔽 q_hat + residual 超出 [0, 94] 的物理非法类别。
-            logits = mask_invalid_residual_logits(
-                logits=logits,
-                q_hat=tensors["q_hat"],
-                valid_mask=tensors["valid_mask"],
-            )
+            if prediction_target == RESIDUAL_TARGET:
+                logits = mask_invalid_residual_logits(
+                    logits=logits,
+                    q_hat=tensors["q_hat"],
+                    valid_mask=tensors["valid_mask"],
+                )
             loss = criterion(logits.reshape(-1, logits.shape[-1]), tensors["targets"].reshape(-1))
 
             # batch.baseline_bits 是同一批位置在原始 H5 P0(q_true) 下的 bit 数。
@@ -164,7 +173,7 @@ def evaluate_model(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a causal read-level Transformer that predicts residual distributions "
+            "Train a causal read-level Transformer that predicts quality distributions "
             "from H5 predictor features and decoded quality/residual history."
         )
     )
@@ -178,7 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=Path(
-            "runs/transformer_residual_4layer_qhatonly_qrmer234_"
+            "runs/transformer_quality_4layer_qhatonly_qrmer234_"
             "baseconv357_b64_e15"
         ),
         help="directory for checkpoints, config, and train log",
@@ -190,6 +199,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory produced by prepare_base_sidecars.py",
     )
     parser.add_argument("--train-fraction", type=float, default=0.8)
+    parser.add_argument(
+        "--prediction-target",
+        choices=PREDICTION_TARGETS,
+        default=DEFAULT_PREDICTION_TARGET,
+        help="predict the 95-class quality id (default) or historical 189-class residual",
+    )
     parser.add_argument(
         "--prior-feature-mode",
         choices=PRIOR_FEATURE_MODES,
@@ -268,7 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-parameterization",
         choices=OUTPUT_PARAMETERIZATIONS,
-        default=DIRECT_RESIDUAL_LOGITS,
+        default=DIRECT_LOGITS,
         help=(
             "use the output head directly, or add its learned correction to "
             "the H5 log P0_r prior"
@@ -304,11 +319,14 @@ def main() -> int:
         raise SystemExit("--mer-stride must be positive")
     if args.history_run_embed_dim < 0:
         raise SystemExit("--history-run-embed-dim must be non-negative")
-    if (
+    if args.output_parameterization == LOG_P0_PLUS_DELTA and (
         args.prior_feature_mode != FULL_PRIOR
-        and args.output_parameterization == LOG_P0_PLUS_DELTA
+        or args.prediction_target != RESIDUAL_TARGET
     ):
-        raise SystemExit("--output-parameterization log_p0_plus_delta requires full_prior")
+        raise SystemExit(
+            "--output-parameterization log_p0_plus_delta requires "
+            "full_prior and residual target"
+        )
     if args.qmer_vocab_size <= 0 or args.rmer_vocab_size <= 0:
         raise SystemExit("Q/R-mer vocabulary sizes must be positive")
     if args.qmer_embed_dim <= 0 or args.rmer_embed_dim <= 0:
@@ -346,19 +364,29 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     eval_limit = None if args.eval_max_reads_per_file == 0 else args.eval_max_reads_per_file
     selected_continuous_dim = continuous_feature_dim(args.prior_feature_mode)
+    selected_output_dim = prediction_output_dim(args.prediction_target)
 
     # 保存完整配置，后续 predict 脚本会从 checkpoint 里恢复模型结构。
-    model_type = (
-        "causal_transformer_log_p0_delta_residual_base_conv"
-        if args.output_parameterization == LOG_P0_PLUS_DELTA
-        else f"causal_transformer_{args.prior_feature_mode}_direct_residual_base_conv"
-    )
+    if args.prediction_target == QUALITY_TARGET:
+        model_type = f"causal_transformer_{args.prior_feature_mode}_direct_quality_base_conv"
+    elif args.output_parameterization == LOG_P0_PLUS_DELTA:
+        model_type = "causal_transformer_log_p0_delta_residual_base_conv"
+    else:
+        model_type = f"causal_transformer_{args.prior_feature_mode}_direct_residual_base_conv"
     config = {
         "model_type": model_type,
+        "prediction_target": args.prediction_target,
+        "target": (
+            "quality_id_0_94"
+            if args.prediction_target == QUALITY_TARGET
+            else "residual_-94_94"
+        ),
         "prior_feature_mode": args.prior_feature_mode,
         "output_parameterization": args.output_parameterization,
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
         "uses_history_runs": args.history_run_embed_dim > 0,
+        "uses_q_hat": True,
+        "uses_residual_history": True,
         "uses_base_context": True,
         "base_context_is_bidirectional": True,
         "complete_base_read_available_before_quality": True,
@@ -412,7 +440,7 @@ def main() -> int:
         "feedforward_dim": args.feedforward_dim,
         "context_length": args.context_length,
         "dropout": args.dropout,
-        "output_dim": RESIDUAL_CLASSES,
+        "output_dim": selected_output_dim,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
@@ -432,6 +460,8 @@ def main() -> int:
         qmer_vocab_size=args.qmer_vocab_size,
         rmer_vocab_size=args.rmer_vocab_size,
         prior_feature_mode=args.prior_feature_mode,
+        prediction_target=args.prediction_target,
+        history_run_features=args.history_run_embed_dim > 0,
     )
     # Transformer 输入与阶段 3 Q/R-mer 版本使用相同的 causal features。
     model = ResidualTransformer(
@@ -456,7 +486,7 @@ def main() -> int:
         feedforward_dim=args.feedforward_dim,
         context_length=args.context_length,
         dropout=args.dropout,
-        output_dim=RESIDUAL_CLASSES,
+        output_dim=selected_output_dim,
         output_parameterization=args.output_parameterization,
     ).to(device)
     config["parameter_count"] = sum(parameter.numel() for parameter in model.parameters())
@@ -512,7 +542,7 @@ def main() -> int:
 
                 optimizer.zero_grad(set_to_none=True)
                 # causal attention 只看当前及历史位置；prev_q/prev_r 已右移，
-                # 因此当前位置输入不包含真实 residual。
+                # 因此当前位置输入不包含真实 quality 或 residual。
                 logits = model(
                     continuous=tensors["continuous"],
                     q_hat=tensors["q_hat"],
@@ -525,13 +555,15 @@ def main() -> int:
                     base_ids=tensors["base_ids"],
                     lengths=tensors["lengths"],
                 )
-                # 对每个位置独立 mask 不可能 residual，避免模型给非法质量值分配概率。
-                logits = mask_invalid_residual_logits(
-                    logits=logits,
-                    q_hat=tensors["q_hat"],
-                    valid_mask=tensors["valid_mask"],
-                )
-                # 展平成 [batch*seq_len, 189] 做交叉熵；padding 由 ignore_index 跳过。
+                # 直接质量目标的 95 类天然全合法；只有历史 residual 目标
+                # 才需要按 q_hat 屏蔽物理非法 residual。
+                if args.prediction_target == RESIDUAL_TARGET:
+                    logits = mask_invalid_residual_logits(
+                        logits=logits,
+                        q_hat=tensors["q_hat"],
+                        valid_mask=tensors["valid_mask"],
+                    )
+                # 展平成 [batch*seq_len, classes]；padding 由 ignore_index 跳过。
                 loss = criterion(logits.reshape(-1, logits.shape[-1]), tensors["targets"].reshape(-1))
                 loss.backward()
                 # 梯度裁剪用于抑制训练早期的异常梯度尖峰。
@@ -568,6 +600,8 @@ def main() -> int:
                 rmer_vocab_size=args.rmer_vocab_size,
                 base_sidecar_dir=args.base_sidecar_dir,
                 prior_feature_mode=args.prior_feature_mode,
+                prediction_target=args.prediction_target,
+                history_run_features=args.history_run_embed_dim > 0,
             )
             elapsed = time.time() - started
             row = {

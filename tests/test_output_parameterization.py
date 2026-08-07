@@ -4,6 +4,7 @@ import torch
 
 from sequence_residual_transformer_model import (
     CONTINUOUS_FEATURE_DIM,
+    DIRECT_LOGITS,
     DIRECT_RESIDUAL_LOGITS,
     LOG_P0_PLUS_DELTA,
     RESIDUAL_CLASSES,
@@ -35,7 +36,7 @@ class OutputParameterizationTest(unittest.TestCase):
         parser = build_parser()
         self.assertEqual(
             parser.parse_args([]).output_parameterization,
-            DIRECT_RESIDUAL_LOGITS,
+            DIRECT_LOGITS,
         )
         self.assertEqual(
             parser.parse_args(

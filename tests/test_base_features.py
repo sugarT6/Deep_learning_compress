@@ -9,6 +9,7 @@ import torch
 
 from prepare_base_sidecars import create_base_sidecar
 from sequence_residual_transformer_model import (
+    ALPHABET_SIZE,
     BASE_A_TOKEN,
     BASE_C_TOKEN,
     BASE_G_TOKEN,
@@ -16,7 +17,6 @@ from sequence_residual_transformer_model import (
     BASE_PAD_TOKEN,
     BASE_T_TOKEN,
     QHAT_ONLY_CONTINUOUS_FEATURE_DIM,
-    RESIDUAL_CLASSES,
     ResidualTransformer,
     base_sidecar_path_for_h5,
     batch_to_torch,
@@ -101,6 +101,7 @@ class BaseFeatureTest(unittest.TestCase):
             read_start=0,
             read_stop=3,
             base_sidecar_path=self.sidecar_path,
+            history_run_features=True,
         )
         np.testing.assert_array_equal(batch.lengths, np.asarray([3, 2]))
         np.testing.assert_array_equal(batch.base_lengths, np.asarray([4, 5]))
@@ -136,6 +137,7 @@ class BaseFeatureTest(unittest.TestCase):
             feedforward_dim=32,
             context_length=8,
             dropout=0.0,
+            output_dim=ALPHABET_SIZE,
         )
         logits = model(
             continuous=tensors["continuous"],
@@ -151,7 +153,7 @@ class BaseFeatureTest(unittest.TestCase):
             base_ids=tensors["base_ids"],
             lengths=tensors["lengths"],
         )
-        self.assertEqual(tuple(logits.shape), (2, 3, RESIDUAL_CLASSES))
+        self.assertEqual(tuple(logits.shape), (2, 3, ALPHABET_SIZE))
 
         with self.assertRaisesRegex(ValueError, "base_ids are required"):
             model(

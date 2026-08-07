@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate or sample predictions from a trained stage-4 Transformer model."""
+"""Evaluate a q-hat-conditioned quality or historical residual Transformer."""
 
 from __future__ import annotations
 
@@ -21,8 +21,9 @@ from sequence_residual_transformer_model import (
     FULL_PRIOR_CONTINUOUS_FEATURE_DIM,
     PAD_TARGET,
     QHAT_ONLY,
-    RESIDUAL_CLASSES,
+    QUALITY_TARGET,
     RESIDUAL_MIN,
+    RESIDUAL_TARGET,
     base_sidecar_path_for_h5,
     batch_to_torch,
     discover_h5_files,
@@ -45,7 +46,7 @@ def fmt4(value: float) -> str:
 
 
 def mer_params_from_config(config: dict[str, object]) -> dict[str, object]:
-    """Restore causal Q/R-mer settings from a checkpoint."""
+    """Restore target and causal feature settings from a checkpoint."""
 
     # Checkpoints created before prior_feature_mode existed all used the
     # 194-dimensional full-prior input. Infer that mode to keep them loadable.
@@ -58,6 +59,9 @@ def mer_params_from_config(config: dict[str, object]) -> dict[str, object]:
         )
 
     return {
+        # All checkpoints before this field was introduced predict residuals.
+        "prediction_target": str(config.get("prediction_target", RESIDUAL_TARGET)),
+        "history_run_features": int(config.get("history_run_embed_dim", 0)) > 0,
         "prior_feature_mode": str(prior_feature_mode),
         "exact_q_lags": tuple(int(value) for value in config.get("exact_q_lags", [])),
         "exact_r_lags": tuple(int(value) for value in config.get("exact_r_lags", [])),
@@ -81,12 +85,14 @@ def evaluate_file(
     mer_params: dict[str, object],
     base_sidecar_path: Path | None,
 ) -> dict[str, float | int | str]:
-    # 预测阶段同样按压缩目标评估：真实 residual 在模型分布下的 -log2 概率。
+    # 预测阶段按压缩目标评估真实 quality（或历史 residual checkpoint）
+    # 在模型分布下的 -log2 概率。
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TARGET, reduction="sum")
     total_nats = 0.0
     total_symbols = 0
     baseline_bits = 0.0
     zero_true_freq = 0
+    prediction_target = str(mer_params["prediction_target"])
 
     model.eval()
     if device.type == "cuda":
@@ -118,12 +124,12 @@ def evaluate_file(
             base_ids=tensors["base_ids"],
             lengths=tensors["lengths"],
         )
-        # 预测/评估时也必须做同样的非法 residual mask，保持训练和解码一致。
-        logits = mask_invalid_residual_logits(
-            logits=logits,
-            q_hat=tensors["q_hat"],
-            valid_mask=tensors["valid_mask"],
-        )
+        if prediction_target == RESIDUAL_TARGET:
+            logits = mask_invalid_residual_logits(
+                logits=logits,
+                q_hat=tensors["q_hat"],
+                valid_mask=tensors["valid_mask"],
+            )
         loss = criterion(logits.reshape(-1, logits.shape[-1]), tensors["targets"].reshape(-1))
 
         total_nats += float(loss.item())
@@ -183,6 +189,7 @@ def write_prediction_samples(
         )
     )
     tensors = batch_to_torch(first_batch, device)
+    prediction_target = str(mer_params["prediction_target"])
     logits = model(
         continuous=tensors["continuous"],
         q_hat=tensors["q_hat"],
@@ -197,11 +204,12 @@ def write_prediction_samples(
         base_ids=tensors["base_ids"],
         lengths=tensors["lengths"],
     )
-    logits = mask_invalid_residual_logits(
-        logits=logits,
-        q_hat=tensors["q_hat"],
-        valid_mask=tensors["valid_mask"],
-    )
+    if prediction_target == RESIDUAL_TARGET:
+        logits = mask_invalid_residual_logits(
+            logits=logits,
+            q_hat=tensors["q_hat"],
+            valid_mask=tensors["valid_mask"],
+        )
     probs = torch.softmax(logits, dim=-1).cpu().numpy()
 
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
@@ -229,13 +237,20 @@ def write_prediction_samples(
         for read_idx, length in enumerate(first_batch.lengths):
             for pos in range(int(length)):
                 target = int(first_batch.targets[read_idx, pos])
-                true_residual = target + RESIDUAL_MIN
                 q_hat = int(first_batch.q_hat[read_idx, pos])
-                observed = q_hat + true_residual
-
                 pred_class = int(np.argmax(probs[read_idx, pos]))
-                pred_residual = pred_class + RESIDUAL_MIN
-                pred_quality = int(np.clip(q_hat + pred_residual, 0, ALPHABET_SIZE - 1))
+                if prediction_target == QUALITY_TARGET:
+                    observed = target
+                    true_residual = observed - q_hat
+                    pred_quality = pred_class
+                    pred_residual = pred_quality - q_hat
+                else:
+                    true_residual = target + RESIDUAL_MIN
+                    observed = q_hat + true_residual
+                    pred_residual = pred_class + RESIDUAL_MIN
+                    pred_quality = int(
+                        np.clip(q_hat + pred_residual, 0, ALPHABET_SIZE - 1)
+                    )
                 pred_prob = float(probs[read_idx, pos, pred_class])
                 model_true_prob = float(probs[read_idx, pos, target])
 
@@ -289,6 +304,7 @@ def write_quality_probability_log(
 
     output_log.parent.mkdir(parents=True, exist_ok=True)
     rows_written = 0
+    prediction_target = str(mer_params["prediction_target"])
     model.eval()
 
     with output_log.open("w", encoding="utf-8", newline="\n") as out:
@@ -326,24 +342,35 @@ def write_quality_probability_log(
                     base_ids=tensors["base_ids"],
                     lengths=tensors["lengths"],
                 )
-                logits = mask_invalid_residual_logits(
-                    logits=logits,
-                    q_hat=tensors["q_hat"],
-                    valid_mask=tensors["valid_mask"],
-                )
+                if prediction_target == RESIDUAL_TARGET:
+                    logits = mask_invalid_residual_logits(
+                        logits=logits,
+                        q_hat=tensors["q_hat"],
+                        valid_mask=tensors["valid_mask"],
+                    )
                 probs = torch.softmax(logits, dim=-1).cpu().numpy()
 
                 for read_idx, length in enumerate(batch.lengths):
                     for pos in range(int(length)):
                         pred_class = int(np.argmax(probs[read_idx, pos]))
-                        pred_residual = pred_class + RESIDUAL_MIN
                         q_hat = int(batch.q_hat[read_idx, pos])
-                        quality_value = int(np.clip(q_hat + pred_residual, 0, ALPHABET_SIZE - 1))
+                        if prediction_target == QUALITY_TARGET:
+                            quality_value = pred_class
+                            true_quality_value = int(batch.targets[read_idx, pos])
+                        else:
+                            pred_residual = pred_class + RESIDUAL_MIN
+                            quality_value = int(
+                                np.clip(
+                                    q_hat + pred_residual,
+                                    0,
+                                    ALPHABET_SIZE - 1,
+                                )
+                            )
+                            true_class = int(batch.targets[read_idx, pos])
+                            true_residual = true_class + RESIDUAL_MIN
+                            true_quality_value = int(q_hat + true_residual)
                         quality_char = chr(quality_value + 33)
                         pred_prob = float(probs[read_idx, pos, pred_class])
-                        true_class = int(batch.targets[read_idx, pos])
-                        true_residual = true_class + RESIDUAL_MIN
-                        true_quality_value = int(q_hat + true_residual)
                         true_quality_char = chr(true_quality_value + 33)
 
                         out.write(
@@ -359,7 +386,10 @@ def write_quality_probability_log(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained causal Transformer residual model on H5 predictor files."
+        description=(
+            "Evaluate a trained causal Transformer quality/residual model "
+            "on H5 predictor files."
+        )
     )
     parser.add_argument("checkpoint", type=Path, help="path to best.pt")
     parser.add_argument(
@@ -383,7 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-csv",
         type=Path,
         default=Path(
-            "runs/transformer_residual_4layer_qhatonly_qrmer234_"
+            "runs/transformer_quality_4layer_qhatonly_qrmer234_"
             "baseconv357_b64_e15/"
             "predict_metrics.csv"
         ),

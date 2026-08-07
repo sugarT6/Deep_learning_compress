@@ -1,33 +1,30 @@
-# Stage 4: causal Transformer residual model with base motifs
+# Q-hat-conditioned direct-quality Transformer
 
-This repository contains the stage-4 FASTQ quality residual entropy model. It
-keeps the stage-3 H5 feature construction, read split, training sampler,
-physical residual mask, and bit-based evaluation, while replacing the
-GRU/TCN sequence backbone with a lightweight causal Transformer. The current
-model also uses the already-decoded full DNA read as side information through
-a small local motif branch.
+This repository now tests direct 95-class quality prediction while retaining
+the feature set that produced the best qhat-only residual result. Unlike
+`../fastq_quality_direct`, this experiment still reads the quality-model H5,
+uses `q_hat`, and retains decoded residual history and residual-mer features.
 
-The model predicts a 189-class residual distribution. The current default is
-the `qhat_only` ablation: the H5 matrix defines `q_hat` and the residual target,
-but the full probability matrix is not a model feature.
+The current default target is the true quality id:
 
 ```text
 q_hat_i = argmax P0_i(q)
-r_i = q_true_i - q_hat_i
-P_model(r_i | q_hat_i, position, bases, decoded history before i)
+r_j = q_j - q_hat_j, for already decoded positions j < i
+P_model(q_true_i | q_hat_i, position, bases, decoded q/r history before i)
 ```
 
 Two prior-feature modes are available:
 
 ```text
-qhat_only (default): use the matrix only for q_hat, residual target, and baseline
+qhat_only (default): use the matrix only for q_hat and H5 baseline
 full_prior:          additionally input log P0_r and probability summaries
 ```
 
 `full_prior` reproduces the previous input. It normalizes H5 counts into
 `P0(q)`, clamps probabilities to `1e-12`, and applies the natural logarithm
 before mapping them into the 189 residual classes. `log_p0_plus_delta` remains
-available only with `full_prior`; direct residual logits are the default.
+available only for historical `full_prior + residual` runs; direct 95-class
+quality logits are the current default.
 
 ## Input features
 
@@ -69,11 +66,13 @@ feature concatenation
 -> Linear + ReLU + Dropout
 -> sinusoidal positional encoding
 -> 4 causal Transformer encoder layers
--> Linear(d_model -> 189)
--> optionally add log P0_r in full_prior + log_p0_plus_delta mode
--> physical invalid-residual mask
--> softmax P(r_i)
+-> Linear(d_model -> 95)
+-> softmax P(q_i)
 ```
+
+All 95 output classes are legal quality ids, so the direct-quality target does
+not use the old q_hat-dependent invalid-residual mask. Historical residual
+checkpoints remain loadable and still apply that mask.
 
 Default dimensions:
 
@@ -154,22 +153,23 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-batch-reads 64 \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
+  --prediction-target quality \
   --prior-feature-mode qhat_only \
   --history-run-embed-dim 0 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
-  --output-parameterization direct_residual_logits \
-  --output-dir runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15
+  --output-parameterization direct_logits \
+  --output-dir runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15
 ```
 
 This run uses 64 reads and 2,000 optimizer updates per epoch. Relative to the
 previous 128-read experiment at the same step count, it samples half as many
 reads per epoch but preserves the same number of optimizer updates.
 
-If `qhat_only` is worse, restore the previous full-prior direct-logit input by
-changing only the prior mode and output directory:
+To reproduce the previous qhat-only residual target with the same code, change
+the target, output parameterization, and output directory:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
@@ -179,14 +179,15 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-batch-reads 64 \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
-  --prior-feature-mode full_prior \
+  --prediction-target residual \
+  --prior-feature-mode qhat_only \
   --history-run-embed-dim 0 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
   --output-parameterization direct_residual_logits \
-  --output-dir runs/transformer_residual_4layer_fullprior_qrmer234_baseconv357_b64_e15
+  --output-dir runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15
 ```
 
 Small smoke run:
@@ -207,9 +208,9 @@ python train_sequence_residual_transformer.py \
 Training writes:
 
 ```text
-runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/config.json
-runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/train_log.csv
-runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt
+runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/config.json
+runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/train_log.csv
+runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt
 ```
 
 The training CSV and terminal show all floating-point values with four decimal
@@ -224,10 +225,10 @@ and use a separate output directory.
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt \
+  runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt \
   --batch-reads 64 \
   --base-sidecar-dir base_sidecars \
-  --output-csv runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/predict_metrics.csv
+  --output-csv runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/predict_metrics.csv
 ```
 
 The default split is the last 20% test reads. Use `--split all` to evaluate the
@@ -235,19 +236,19 @@ whole H5 file. Optional detailed outputs remain compatible with stage 3:
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt \
+  runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt \
   --base-sidecar-dir base_sidecars \
-  --sample-predictions runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/samples.csv \
-  --quality-prob-log runs/transformer_residual_4layer_qhatonly_qrmer234_baseconv357_b64_e15/predict_quality_prob.log \
+  --sample-predictions runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/samples.csv \
+  --quality-prob-log runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/predict_quality_prob.log \
   --quality-prob-log-rows 1000
 ```
 
-The prior-feature, run-length, historical exact-lag, output-parameterization,
-Q/R-mer, and base-branch settings are restored from the checkpoint; no
-prediction-side switch is needed. Exact-lag support remains only for loading
-the completed ablation checkpoint and is disabled in current training. Old
-checkpoints without run-length fields load with those features disabled. Old
-checkpoints without `output_parameterization` default to
+The prediction target, prior-feature, run-length, historical exact-lag,
+output-parameterization, Q/R-mer, and base-branch settings are restored from
+the checkpoint; no prediction-side switch is needed. Exact-lag support remains
+only for loading the completed ablation checkpoint and is disabled in current
+training. Old checkpoints without `prediction_target` are interpreted as
+residual checkpoints; those without `output_parameterization` default to
 `direct_residual_logits`. Old stage-4 checkpoints without a base branch remain
 loadable and do not require sidecars. Prediction CSVs, optional sample outputs,
 compact probability logs, and terminal floating-point metrics use four decimal
@@ -267,7 +268,7 @@ relative_improvement = (h5_bits - model_bits) / h5_bits
 
 For a fair stage-3 comparison, use the same H5 files, read split, number of
 training steps, batch size, evaluation read limit, and test symbols. Argmax
-accuracy is not the compression objective; the true residual probability is.
+accuracy is not the compression objective; the true quality probability is.
 
 ## Files
 

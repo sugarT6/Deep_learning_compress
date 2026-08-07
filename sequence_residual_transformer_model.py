@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Read-level causal Transformer residual model for FASTQ quality compression.
+"""Read-level causal Transformer quality model with decoded residual history.
 
 This module implements the shared pieces for stage 4:
 
 * read-level HDF5 discovery and inspection;
-* conversion from H5 quality probabilities P0(q) to residual probabilities
-  P0_r(r), where r = q_true - q_hat;
+* q_hat extraction from H5 quality frequencies, with optional historical
+  full-prior residual probability features;
 * aligned full-read base side information from independent HDF5 sidecars;
 * a lightweight bidirectional local base-motif encoder;
 * causal history tokens for previous quality and previous residual;
 * causal residual-zero and same-quality run-length summaries;
 * padding/collation for variable-length reads;
-* a lightweight causal Transformer that predicts P(r_i | current H5 features,
-  current position, previous decoded quality, previous decoded residual).
+* a lightweight causal Transformer that predicts the current quality id while
+  retaining q_hat and previous decoded quality/residual context.
 
 FASTQ parsing is kept out of the training hot path. A separate preprocessing
 script writes complete base reads to compact HDF5 sidecars. The base stream is
@@ -71,11 +71,18 @@ BASE_TOKEN_COUNT = 7
 DEFAULT_BASE_CONV_KERNELS = (3, 5, 7)
 
 DIRECT_RESIDUAL_LOGITS = "direct_residual_logits"
+DIRECT_LOGITS = "direct_logits"
 LOG_P0_PLUS_DELTA = "log_p0_plus_delta"
 OUTPUT_PARAMETERIZATIONS = (
+    DIRECT_LOGITS,
     DIRECT_RESIDUAL_LOGITS,
     LOG_P0_PLUS_DELTA,
 )
+
+QUALITY_TARGET = "quality"
+RESIDUAL_TARGET = "residual"
+PREDICTION_TARGETS = (QUALITY_TARGET, RESIDUAL_TARGET)
+DEFAULT_PREDICTION_TARGET = QUALITY_TARGET
 
 # Quality buckets: 0-9, 10-19, 20-24, 25-29, 30-34, 35-39, 40+.
 Q_BUCKET_COUNT = 7
@@ -147,10 +154,11 @@ class SequenceBatch:
         These fields are empty in the current no-exact-lag experiment and are
         retained for historical checkpoint compatibility.
     zero_residual_run / same_quality_run:
-        Bucketed causal run lengths computed only from positions before the
-        current target, shape [batch, max_len].
+        Optional historical-checkpoint run lengths. Current batches leave
+        them zero and do not spend time constructing the feature.
     targets:
-        True residual class for the current position, or PAD_TARGET on padding.
+        True quality id (current default) or historical residual class for the
+        current position, and PAD_TARGET on padding.
     valid_mask:
         True at real quality positions and false on padding.
     lengths:
@@ -380,6 +388,19 @@ def continuous_feature_dim(prior_feature_mode: str) -> int:
     )
 
 
+def prediction_output_dim(prediction_target: str) -> int:
+    """Return the classification width for a quality or residual target."""
+
+    if prediction_target == QUALITY_TARGET:
+        return ALPHABET_SIZE
+    if prediction_target == RESIDUAL_TARGET:
+        return RESIDUAL_CLASSES
+    raise ValueError(
+        f"prediction_target must be one of {PREDICTION_TARGETS}, "
+        f"got {prediction_target!r}"
+    )
+
+
 def normalize_mer_ks(values: Iterable[int] | None) -> tuple[int, ...]:
     """Normalize Q/R-mer window lengths."""
 
@@ -565,6 +586,8 @@ def build_sequence_batch(
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
+    prediction_target: str = DEFAULT_PREDICTION_TARGET,
+    history_run_features: bool = False,
 ) -> SequenceBatch:
     """Build one padded batch from a contiguous group of reads.
 
@@ -627,6 +650,7 @@ def build_sequence_batch(
     exact_q_lags_t = normalize_exact_lags(exact_q_lags)
     exact_r_lags_t = normalize_exact_lags(exact_r_lags)
     continuous_dim = continuous_feature_dim(prior_feature_mode)
+    prediction_output_dim(prediction_target)
 
     # qhat_only 不构造或取 log 完整概率矩阵，只取 argmax q_hat。概率矩阵
     # 仍在 batch 末尾用于计算独立的 H5 baseline，不进入模型。
@@ -635,8 +659,8 @@ def build_sequence_batch(
     if np.any(observed_i < 0) or np.any(observed_i >= ALPHABET_SIZE):
         raise ValueError("observed quality id out of [0, 94]")
 
-    # q_hat 是 H5 predictor 的中心预测，即 P0(q) 的 argmax。
-    #    我们不直接预测 quality，而是预测 q_true - q_hat。
+    # q_hat 是 H5 predictor 的中心预测，即 P0(q) 的 argmax。当前实验直接
+    # 预测 quality，但仍保留 q_hat embedding 和可解码的 residual 历史。
     q_hat = np.argmax(freqs_f, axis=1).astype(np.int64)
 
     if prior_feature_mode == FULL_PRIOR:
@@ -651,11 +675,20 @@ def build_sequence_batch(
         ).astype(np.float32)
         log_p0_r = _residual_log_probs(probs, q_hat)
 
-    # 3. 训练目标：真实 residual 类别。
+    # Residual history is retained even when the current prediction target is
+    # the 95-class quality id: at decode time all earlier q values and q_hat
+    # values are known, so their residuals are known as well.
     residual = observed_i - q_hat
-    targets_flat = (residual - RESIDUAL_MIN).astype(np.int64)
-    if np.any(targets_flat < 0) or np.any(targets_flat >= RESIDUAL_CLASSES):
+    residual_classes_flat = (residual - RESIDUAL_MIN).astype(np.int64)
+    if np.any(residual_classes_flat < 0) or np.any(
+        residual_classes_flat >= RESIDUAL_CLASSES
+    ):
         raise ValueError("residual target out of range")
+    targets_flat = (
+        observed_i
+        if prediction_target == QUALITY_TARGET
+        else residual_classes_flat
+    )
 
     read_lengths = np.diff(local_offsets).astype(np.int64)
     batch_size = int(read_lengths.size)
@@ -752,18 +785,21 @@ def build_sequence_batch(
         prev_r_tokens[read_idx, 0] = R_BOS_TOKEN
         if length > 1:
             prev_q_tokens[read_idx, 1:length] = observed_i[start_i : end_i - 1]
-            prev_r_tokens[read_idx, 1:length] = targets_flat[start_i : end_i - 1]
+            prev_r_tokens[read_idx, 1:length] = residual_classes_flat[
+                start_i : end_i - 1
+            ]
         exact_q_lag_tokens[read_idx, :length, :] = build_exact_lag_tokens_for_read(
             observed_i[start_i:end_i], exact_q_lags_t, Q_BOS_TOKEN
         )
         exact_r_lag_tokens[read_idx, :length, :] = build_exact_lag_tokens_for_read(
-            targets_flat[start_i:end_i], exact_r_lags_t, R_BOS_TOKEN
+            residual_classes_flat[start_i:end_i], exact_r_lags_t, R_BOS_TOKEN
         )
-        zero_run, same_q_run = build_causal_run_length_tokens(
-            observed_i[start_i:end_i], residual[start_i:end_i]
-        )
-        zero_residual_run_tokens[read_idx, :length] = zero_run
-        same_quality_run_tokens[read_idx, :length] = same_q_run
+        if history_run_features:
+            zero_run, same_q_run = build_causal_run_length_tokens(
+                observed_i[start_i:end_i], residual[start_i:end_i]
+            )
+            zero_residual_run_tokens[read_idx, :length] = zero_run
+            same_quality_run_tokens[read_idx, :length] = same_q_run
 
     # H5 baseline bits 用于和神经模型 bits 对比：
     #   bits_i = -log2 P0(q_true_i)
@@ -822,6 +858,8 @@ class ContiguousReadBatchSampler:
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
+        prediction_target: str = DEFAULT_PREDICTION_TARGET,
+        history_run_features: bool = False,
     ) -> None:
         self.files = files
         self.train_fraction = train_fraction
@@ -836,6 +874,9 @@ class ContiguousReadBatchSampler:
         self.rmer_vocab_size = int(rmer_vocab_size)
         self.prior_feature_mode = prior_feature_mode
         continuous_feature_dim(self.prior_feature_mode)
+        self.prediction_target = prediction_target
+        prediction_output_dim(self.prediction_target)
+        self.history_run_features = bool(history_run_features)
         self.infos = [inspect_h5(path) for path in files]
         self.base_sidecars = (
             [base_sidecar_path_for_h5(path, base_sidecar_dir) for path in files]
@@ -875,6 +916,8 @@ class ContiguousReadBatchSampler:
                         qmer_vocab_size=self.qmer_vocab_size,
                         rmer_vocab_size=self.rmer_vocab_size,
                         prior_feature_mode=self.prior_feature_mode,
+                        prediction_target=self.prediction_target,
+                        history_run_features=self.history_run_features,
                     ),
                     path,
                 )
@@ -898,6 +941,8 @@ def read_h5_read_range(
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
+    prediction_target: str = DEFAULT_PREDICTION_TARGET,
+    history_run_features: bool = False,
 ) -> SequenceBatch:
     """Load a half-open read range [read_start, read_stop) from one H5 file."""
 
@@ -949,6 +994,8 @@ def read_h5_read_range(
         qmer_vocab_size=qmer_vocab_size,
         rmer_vocab_size=rmer_vocab_size,
         prior_feature_mode=prior_feature_mode,
+        prediction_target=prediction_target,
+        history_run_features=history_run_features,
     )
 
 
@@ -967,6 +1014,8 @@ def iter_read_batches(
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
+    prediction_target: str = DEFAULT_PREDICTION_TARGET,
+    history_run_features: bool = False,
 ) -> Iterator[SequenceBatch]:
     """Iterate deterministic read batches for train/test/all evaluation."""
 
@@ -1002,6 +1051,8 @@ def iter_read_batches(
                 qmer_vocab_size=qmer_vocab_size,
                 rmer_vocab_size=rmer_vocab_size,
                 prior_feature_mode=prior_feature_mode,
+                prediction_target=prediction_target,
+                history_run_features=history_run_features,
             )
         except ValueError as exc:
             # 顺序评估时，如果某个 batch 恰好全是空 read，就直接跳过。
@@ -1066,7 +1117,7 @@ class BaseContextEncoder(nn.Module):
 
 
 class ResidualTransformer(nn.Module):
-    """Lightweight causal Transformer for residual-distribution logits.
+    """Lightweight causal Transformer for quality or residual logits.
 
     Position ``i`` may attend to itself because its input contains only the
     current H5 predictor features plus history shifted by one position. Future
@@ -1074,7 +1125,8 @@ class ResidualTransformer(nn.Module):
     multi-scale summaries built exclusively from already decoded history, and
     run-length embeddings summarize decoded residual-zero/quality streaks.
 
-    ``direct_residual_logits`` uses the output head as the final logits.
+    ``direct_logits`` and legacy ``direct_residual_logits`` use the output head
+    as the final logits.
     ``log_p0_plus_delta`` treats the output head as a correction and adds it to
     the first 189 continuous features, which contain ``log P0_r``.
     """
