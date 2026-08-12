@@ -20,6 +20,7 @@ from sequence_residual_transformer_model import (
     ResidualTransformer,
     base_sidecar_path_for_h5,
     batch_to_torch,
+    discover_h5_files,
     inspect_base_sidecar,
     read_h5_read_range,
 )
@@ -70,6 +71,7 @@ class BaseFeatureTest(unittest.TestCase):
                 handle["/base_read_offsets"][:],
                 np.asarray([0, 4, 7, 12], dtype=np.int64),
             )
+
             np.testing.assert_array_equal(
                 handle["/body_lengths"][:],
                 np.asarray([3, 0, 2], dtype=np.int64),
@@ -95,13 +97,25 @@ class BaseFeatureTest(unittest.TestCase):
                 ),
             )
 
+    def test_discovery_includes_srr_and_err_quality_model_files(self) -> None:
+        err_path = self.root / "ERR2755197_1.block.fq.gz.qual_model.h5"
+        ignored_h5 = self.root / "unrelated.h5"
+        ignored_log = self.root / "ERR2755197_1.block.fq.gz.qual-export.log"
+        err_path.touch()
+        ignored_h5.touch()
+        ignored_log.touch()
+
+        self.assertEqual(
+            discover_h5_files([self.root]),
+            [err_path, self.h5_path],
+        )
+
     def test_batch_keeps_full_bases_and_skips_empty_quality_read(self) -> None:
         batch = read_h5_read_range(
             path=self.h5_path,
             read_start=0,
             read_stop=3,
             base_sidecar_path=self.sidecar_path,
-            history_run_features=True,
         )
         np.testing.assert_array_equal(batch.lengths, np.asarray([3, 2]))
         np.testing.assert_array_equal(batch.base_lengths, np.asarray([4, 5]))
@@ -112,8 +126,6 @@ class BaseFeatureTest(unittest.TestCase):
         self.assertEqual(batch.exact_q_lags.shape, (2, 3, 0))
         self.assertEqual(batch.exact_r_lags.shape, (2, 3, 0))
         self.assertEqual(batch.continuous.shape[-1], QHAT_ONLY_CONTINUOUS_FEATURE_DIM)
-        np.testing.assert_array_equal(batch.zero_residual_run[0], np.asarray([0, 1, 2]))
-        np.testing.assert_array_equal(batch.same_quality_run[0], np.asarray([0, 1, 1]))
 
     def test_base_conv_model_forward_and_checkpoint_shapes(self) -> None:
         batch = read_h5_read_range(
@@ -146,8 +158,6 @@ class BaseFeatureTest(unittest.TestCase):
             prev_r=tensors["prev_r"],
             exact_q_lags=tensors["exact_q_lags"],
             exact_r_lags=tensors["exact_r_lags"],
-            zero_residual_run=tensors["zero_residual_run"],
-            same_quality_run=tensors["same_quality_run"],
             qmer_tokens=tensors["qmer_tokens"],
             rmer_tokens=tensors["rmer_tokens"],
             base_ids=tensors["base_ids"],
@@ -163,8 +173,6 @@ class BaseFeatureTest(unittest.TestCase):
                 prev_r=tensors["prev_r"],
                 exact_q_lags=tensors["exact_q_lags"],
                 exact_r_lags=tensors["exact_r_lags"],
-                zero_residual_run=tensors["zero_residual_run"],
-                same_quality_run=tensors["same_quality_run"],
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
                 lengths=tensors["lengths"],

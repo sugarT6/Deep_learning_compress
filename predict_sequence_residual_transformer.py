@@ -61,7 +61,6 @@ def mer_params_from_config(config: dict[str, object]) -> dict[str, object]:
     return {
         # All checkpoints before this field was introduced predict residuals.
         "prediction_target": str(config.get("prediction_target", RESIDUAL_TARGET)),
-        "history_run_features": int(config.get("history_run_embed_dim", 0)) > 0,
         "prior_feature_mode": str(prior_feature_mode),
         "exact_q_lags": tuple(int(value) for value in config.get("exact_q_lags", [])),
         "exact_r_lags": tuple(int(value) for value in config.get("exact_r_lags", [])),
@@ -117,8 +116,6 @@ def evaluate_file(
             prev_r=tensors["prev_r"],
             exact_q_lags=tensors["exact_q_lags"],
             exact_r_lags=tensors["exact_r_lags"],
-            zero_residual_run=tensors["zero_residual_run"],
-            same_quality_run=tensors["same_quality_run"],
             qmer_tokens=tensors["qmer_tokens"],
             rmer_tokens=tensors["rmer_tokens"],
             base_ids=tensors["base_ids"],
@@ -197,8 +194,6 @@ def write_prediction_samples(
         prev_r=tensors["prev_r"],
         exact_q_lags=tensors["exact_q_lags"],
         exact_r_lags=tensors["exact_r_lags"],
-        zero_residual_run=tensors["zero_residual_run"],
-        same_quality_run=tensors["same_quality_run"],
         qmer_tokens=tensors["qmer_tokens"],
         rmer_tokens=tensors["rmer_tokens"],
         base_ids=tensors["base_ids"],
@@ -335,8 +330,6 @@ def write_quality_probability_log(
                     prev_r=tensors["prev_r"],
                     exact_q_lags=tensors["exact_q_lags"],
                     exact_r_lags=tensors["exact_r_lags"],
-                    zero_residual_run=tensors["zero_residual_run"],
-                    same_quality_run=tensors["same_quality_run"],
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
@@ -396,7 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
         "inputs",
         nargs="*",
         default=[Path("h5")],
-        help="HDF5 files or directories containing SRR*.h5 files; default: h5",
+        help="HDF5 files or directories containing SRR/ERR qual_model H5 files; default: h5",
     )
     parser.add_argument("--split", choices=["test", "train", "all"], default="test")
     parser.add_argument("--train-fraction", type=float, default=0.8)
@@ -414,7 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(
             "runs/transformer_quality_4layer_qhatonly_qrmer234_"
-            "baseconv357_b64_e15/"
+            "baseconv357_b64_e15_srr5_err2755197/"
             "predict_metrics.csv"
         ),
     )
@@ -480,6 +473,8 @@ def main() -> int:
                 path,
                 base_sidecar_path_for_h5(path, base_sidecar_dir),
             )
+    if args.output_csv.exists() and args.output_csv.is_dir():
+        args.output_csv = args.output_csv / "predict_metrics.csv"
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, float | int | str]] = []

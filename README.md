@@ -42,9 +42,8 @@ bidirectional local base context from complete DNA read
 ```
 
 `full_prior` adds 189-dimensional `log P0_r(r)`, H5 max probability,
-normalized H5 entropy, and normalized H5 expected quality. The completed
-exact-lag and run-length ablations are disabled for current training, while
-their code remains for historical checkpoint compatibility.
+normalized H5 entropy, and normalized H5 expected quality. Exact-lag support
+remains for historical checkpoint compatibility.
 
 Missing history at the start of a read uses BOS tokens. Q/R-mer tokens use the
 same bucket definitions, causal history construction, stride-1 hashing, and
@@ -105,7 +104,9 @@ loss and metrics. Context never crosses read boundaries.
 ## Data
 
 Place local H5 predictor files under `h5/`, or pass files/directories as
-positional arguments. Required datasets are:
+positional arguments. Directory discovery accepts standard SRA run accessions
+(`SRR` or `ERR`) ending in `.qual_model.h5`; this excludes unrelated
+HiFi/Nanopore files in the same directory. Required datasets are:
 
 ```text
 /observed
@@ -143,6 +144,10 @@ quality-model H5 files.
 
 ## Training
 
+The current six-dataset run discovers the original five SRR files plus
+`ERR2755197_1.block.fq.gz.qual_model.h5` from `h5/`. Use a new output directory
+so the five-dataset best checkpoint remains an unchanged comparison baseline.
+
 Run from this repository directory:
 
 ```bash
@@ -155,13 +160,12 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --num-layers 4 \
   --prediction-target quality \
   --prior-feature-mode qhat_only \
-  --history-run-embed-dim 0 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
   --base-conv-kernels 3,5,7 \
   --output-parameterization direct_logits \
-  --output-dir runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15
+  --output-dir runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197
 ```
 
 This run uses 64 reads and 2,000 optimizer updates per epoch. Relative to the
@@ -181,7 +185,6 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --num-layers 4 \
   --prediction-target residual \
   --prior-feature-mode qhat_only \
-  --history-run-embed-dim 0 \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
   --base-sidecar-dir base_sidecars \
@@ -208,9 +211,9 @@ python train_sequence_residual_transformer.py \
 Training writes:
 
 ```text
-runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/config.json
-runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/train_log.csv
-runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt
+runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197/config.json
+runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197/train_log.csv
+runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197/best.pt
 ```
 
 The training CSV and terminal show all floating-point values with four decimal
@@ -225,25 +228,29 @@ and use a separate output directory.
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt \
+  runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197/best.pt \
   --batch-reads 64 \
   --base-sidecar-dir base_sidecars \
-  --output-csv runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/predict_metrics.csv
+  --output-csv runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197/predict_metrics.csv
 ```
+
+`--output-csv` normally accepts the full CSV filename. If an existing
+directory is passed instead, the script writes `predict_metrics.csv` inside
+that directory.
 
 The default split is the last 20% test reads. Use `--split all` to evaluate the
 whole H5 file. Optional detailed outputs remain compatible with stage 3:
 
 ```bash
 python predict_sequence_residual_transformer.py \
-  runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/best.pt \
+  runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197/best.pt \
   --base-sidecar-dir base_sidecars \
-  --sample-predictions runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/samples.csv \
-  --quality-prob-log runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15/predict_quality_prob.log \
+  --sample-predictions runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197/samples.csv \
+  --quality-prob-log runs/transformer_quality_4layer_qhatonly_qrmer234_baseconv357_b64_e15_srr5_err2755197/predict_quality_prob.log \
   --quality-prob-log-rows 1000
 ```
 
-The prediction target, prior-feature, run-length, historical exact-lag,
+The prediction target, prior-feature, historical exact-lag,
 output-parameterization, Q/R-mer, and base-branch settings are restored from
 the checkpoint; no prediction-side switch is needed. Exact-lag support remains
 only for loading the completed ablation checkpoint and is disabled in current

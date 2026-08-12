@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the q-hat-conditioned quality/residual Transformer on SRR*.h5 files."""
+"""Train the q-hat-conditioned quality/residual Transformer on SRA H5 files."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ except ImportError:  # pragma: no cover
 
 from sequence_residual_transformer_model import (
     DEFAULT_BASE_CONV_KERNELS,
-    DEFAULT_HISTORY_RUN_EMBED_DIM,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
     DEFAULT_PRIOR_FEATURE_MODE,
@@ -90,7 +89,6 @@ def evaluate_model(
     base_sidecar_dir: Path,
     prior_feature_mode: str,
     prediction_target: str,
-    history_run_features: bool,
 ) -> dict[str, float]:
     """Evaluate compression metrics on a deterministic read split."""
 
@@ -120,7 +118,6 @@ def evaluate_model(
             rmer_vocab_size=rmer_vocab_size,
             prior_feature_mode=prior_feature_mode,
             prediction_target=prediction_target,
-            history_run_features=history_run_features,
         ):
             tensors = batch_to_torch(batch, device)
             # 模型输出当前实验的 95 个 quality 类别；旧 residual checkpoint
@@ -130,8 +127,6 @@ def evaluate_model(
                 q_hat=tensors["q_hat"],
                 prev_q=tensors["prev_q"],
                 prev_r=tensors["prev_r"],
-                zero_residual_run=tensors["zero_residual_run"],
-                same_quality_run=tensors["same_quality_run"],
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
                 base_ids=tensors["base_ids"],
@@ -181,14 +176,14 @@ def build_parser() -> argparse.ArgumentParser:
         "inputs",
         nargs="*",
         default=[Path("h5")],
-        help="HDF5 files or directories containing SRR*.h5 files; default: h5",
+        help="HDF5 files or directories containing SRR/ERR qual_model H5 files; default: h5",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(
             "runs/transformer_quality_4layer_qhatonly_qrmer234_"
-            "baseconv357_b64_e15"
+            "baseconv357_b64_e15_srr5_err2755197"
         ),
         help="directory for checkpoints, config, and train log",
     )
@@ -237,12 +232,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q-hat-embed-dim", type=int, default=16)
     parser.add_argument("--prev-q-embed-dim", type=int, default=16)
     parser.add_argument("--prev-r-embed-dim", type=int, default=32)
-    parser.add_argument(
-        "--history-run-embed-dim",
-        type=int,
-        default=DEFAULT_HISTORY_RUN_EMBED_DIM,
-        help="embedding dimension for causal residual-zero and same-quality run buckets",
-    )
     parser.add_argument(
         "--qmer-ks",
         type=parse_int_list,
@@ -317,8 +306,6 @@ def main() -> int:
         raise SystemExit("--feedforward-dim and --context-length must be positive")
     if args.mer_stride <= 0:
         raise SystemExit("--mer-stride must be positive")
-    if args.history_run_embed_dim < 0:
-        raise SystemExit("--history-run-embed-dim must be non-negative")
     if args.output_parameterization == LOG_P0_PLUS_DELTA and (
         args.prior_feature_mode != FULL_PRIOR
         or args.prediction_target != RESIDUAL_TARGET
@@ -347,7 +334,7 @@ def main() -> int:
     np.random.seed(args.seed)
     device = choose_device(args.device)
 
-    # 默认会读取 h5/ 下所有 SRR*.h5；也可以手动传入单个 H5 或目录。
+    # 默认读取 h5/ 下所有 SRR/ERR quality-model H5。
     files = discover_h5_files(args.inputs)
     infos = [inspect_h5(path) for path in files]
     for info in infos:
@@ -384,7 +371,6 @@ def main() -> int:
         "prior_feature_mode": args.prior_feature_mode,
         "output_parameterization": args.output_parameterization,
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
-        "uses_history_runs": args.history_run_embed_dim > 0,
         "uses_q_hat": True,
         "uses_residual_history": True,
         "uses_base_context": True,
@@ -422,7 +408,6 @@ def main() -> int:
         "q_hat_embed_dim": args.q_hat_embed_dim,
         "prev_q_embed_dim": args.prev_q_embed_dim,
         "prev_r_embed_dim": args.prev_r_embed_dim,
-        "history_run_embed_dim": args.history_run_embed_dim,
         "qmer_ks": list(args.qmer_ks),
         "rmer_ks": list(args.rmer_ks),
         "mer_stride": args.mer_stride,
@@ -461,7 +446,6 @@ def main() -> int:
         rmer_vocab_size=args.rmer_vocab_size,
         prior_feature_mode=args.prior_feature_mode,
         prediction_target=args.prediction_target,
-        history_run_features=args.history_run_embed_dim > 0,
     )
     # Transformer 输入与阶段 3 Q/R-mer 版本使用相同的 causal features。
     model = ResidualTransformer(
@@ -469,7 +453,6 @@ def main() -> int:
         q_hat_embed_dim=args.q_hat_embed_dim,
         prev_q_embed_dim=args.prev_q_embed_dim,
         prev_r_embed_dim=args.prev_r_embed_dim,
-        history_run_embed_dim=args.history_run_embed_dim,
         qmer_ks=args.qmer_ks,
         rmer_ks=args.rmer_ks,
         qmer_vocab_size=args.qmer_vocab_size,
@@ -548,8 +531,6 @@ def main() -> int:
                     q_hat=tensors["q_hat"],
                     prev_q=tensors["prev_q"],
                     prev_r=tensors["prev_r"],
-                    zero_residual_run=tensors["zero_residual_run"],
-                    same_quality_run=tensors["same_quality_run"],
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
@@ -601,7 +582,6 @@ def main() -> int:
                 base_sidecar_dir=args.base_sidecar_dir,
                 prior_feature_mode=args.prior_feature_mode,
                 prediction_target=args.prediction_target,
-                history_run_features=args.history_run_embed_dim > 0,
             )
             elapsed = time.time() - started
             row = {
