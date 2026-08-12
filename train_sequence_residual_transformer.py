@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover
     tqdm = None
 
 from sequence_residual_transformer_model import (
+    COMPACT_PRIOR,
     DEFAULT_BASE_CONV_KERNELS,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
@@ -206,6 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PRIOR_FEATURE_MODE,
         help=(
             "qhat_only uses the H5 matrix only to derive q_hat/residual; "
+            "compact_prior adds top-1 confidence, top-1/top-2 log-prob margin, "
+            "and normalized entropy; "
             "full_prior also feeds log P0_r and probability summaries to the model"
         ),
     )
@@ -369,6 +372,15 @@ def main() -> int:
             else "residual_-94_94"
         ),
         "prior_feature_mode": args.prior_feature_mode,
+        "prior_summary_features": (
+            [
+                "top1_confidence",
+                "top1_top2_log_probability_margin",
+                "normalized_entropy",
+            ]
+            if args.prior_feature_mode == COMPACT_PRIOR
+            else []
+        ),
         "output_parameterization": args.output_parameterization,
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
         "uses_q_hat": True,

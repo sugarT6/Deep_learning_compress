@@ -4,8 +4,8 @@
 This module implements the shared pieces for stage 4:
 
 * read-level HDF5 discovery and inspection;
-* q_hat extraction from H5 quality frequencies, with optional historical
-  full-prior residual probability features;
+* q_hat extraction from H5 quality frequencies, with optional compact prior
+  summaries or historical full-prior residual probability features;
 * aligned full-read base side information from independent HDF5 sidecars;
 * a lightweight bidirectional local base-motif encoder;
 * causal history tokens for previous quality and previous residual;
@@ -93,14 +93,17 @@ R_MER_BASE = R_BUCKET_COUNT + 1
 
 FULL_PRIOR = "full_prior"
 QHAT_ONLY = "qhat_only"
-PRIOR_FEATURE_MODES = (QHAT_ONLY, FULL_PRIOR)
+COMPACT_PRIOR = "compact_prior"
+PRIOR_FEATURE_MODES = (QHAT_ONLY, COMPACT_PRIOR, FULL_PRIOR)
 DEFAULT_PRIOR_FEATURE_MODE = QHAT_ONLY
 
 # full_prior 连续输入：189 维 log P0_r、max_prob、entropy、expected_q、
 # rel_pos、read_len_norm。qhat_only 只保留与概率矩阵无关的位置和长度特征；
-# q_hat 仍通过独立 embedding 输入。
+# compact_prior 输入 top-1 confidence、top-1/top-2 log-prob margin、
+# normalized entropy、位置和长度。q_hat 始终通过独立 embedding 输入。
 FULL_PRIOR_CONTINUOUS_FEATURE_DIM = RESIDUAL_CLASSES + 5
 QHAT_ONLY_CONTINUOUS_FEATURE_DIM = 2
+COMPACT_PRIOR_CONTINUOUS_FEATURE_DIM = 5
 # Historical public name retained for old checkpoints/tests that explicitly
 # construct the full-prior architecture.
 CONTINUOUS_FEATURE_DIM = FULL_PRIOR_CONTINUOUS_FEATURE_DIM
@@ -365,11 +368,39 @@ def _residual_log_probs(probs: np.ndarray, q_hat: np.ndarray) -> np.ndarray:
     return np.log(np.maximum(gathered, EPS)).astype(np.float32, copy=False)
 
 
+def _compact_prior_summaries(
+    probs: np.ndarray,
+    log_probs: np.ndarray,
+    q_hat: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return confidence, top-1/top-2 log margin, and normalized entropy."""
+
+    row_indices = np.arange(probs.shape[0])
+    top1_confidence = probs[row_indices, q_hat].astype(np.float32, copy=False)
+    # The second-largest probability remains well-defined when several classes
+    # tie for first place. Clamping makes all-zero/zero-runner-up rows finite.
+    top2_probability = np.partition(
+        probs,
+        ALPHABET_SIZE - 2,
+        axis=1,
+    )[:, ALPHABET_SIZE - 2]
+    top1_top2_log_margin = (
+        np.log(np.maximum(top1_confidence, EPS))
+        - np.log(np.maximum(top2_probability, EPS))
+    ).astype(np.float32, copy=False)
+    normalized_entropy = (
+        -(probs * log_probs).sum(axis=1) / math.log(ALPHABET_SIZE)
+    ).astype(np.float32, copy=False)
+    return top1_confidence, top1_top2_log_margin, normalized_entropy
+
+
 def continuous_feature_dim(prior_feature_mode: str) -> int:
     """Return the continuous input width for a prior-feature mode."""
 
     if prior_feature_mode == QHAT_ONLY:
         return QHAT_ONLY_CONTINUOUS_FEATURE_DIM
+    if prior_feature_mode == COMPACT_PRIOR:
+        return COMPACT_PRIOR_CONTINUOUS_FEATURE_DIM
     if prior_feature_mode == FULL_PRIOR:
         return FULL_PRIOR_CONTINUOUS_FEATURE_DIM
     raise ValueError(
@@ -603,13 +634,16 @@ def build_sequence_batch(
     # 预测 quality，但仍保留 q_hat embedding 和可解码的 residual 历史。
     q_hat = np.argmax(freqs_f, axis=1).astype(np.int64)
 
-    if prior_feature_mode == FULL_PRIOR:
+    if prior_feature_mode in (COMPACT_PRIOR, FULL_PRIOR):
         _, probs, log_probs = _quality_probs(freqs_f)
-        q_axis = np.arange(ALPHABET_SIZE, dtype=np.float32)
-        max_prob = probs[np.arange(probs.shape[0]), q_hat].astype(np.float32)
-        entropy = (-(probs * log_probs).sum(axis=1) / math.log(ALPHABET_SIZE)).astype(
-            np.float32
+        max_prob, top1_top2_log_margin, entropy = _compact_prior_summaries(
+            probs,
+            log_probs,
+            q_hat,
         )
+
+    if prior_feature_mode == FULL_PRIOR:
+        q_axis = np.arange(ALPHABET_SIZE, dtype=np.float32)
         expected_q = (
             (probs * q_axis[None, :]).sum(axis=1) / (ALPHABET_SIZE - 1)
         ).astype(np.float32)
@@ -686,6 +720,12 @@ def build_sequence_batch(
             continuous[read_idx, :length, RESIDUAL_CLASSES + 2] = expected_q[start_i:end_i]
             continuous[read_idx, :length, RESIDUAL_CLASSES + 3] = rel_pos
             continuous[read_idx, :length, RESIDUAL_CLASSES + 4] = read_len_norm
+        elif prior_feature_mode == COMPACT_PRIOR:
+            continuous[read_idx, :length, 0] = max_prob[start_i:end_i]
+            continuous[read_idx, :length, 1] = top1_top2_log_margin[start_i:end_i]
+            continuous[read_idx, :length, 2] = entropy[start_i:end_i]
+            continuous[read_idx, :length, 3] = rel_pos
+            continuous[read_idx, :length, 4] = read_len_norm
         else:
             continuous[read_idx, :length, 0] = rel_pos
             continuous[read_idx, :length, 1] = read_len_norm

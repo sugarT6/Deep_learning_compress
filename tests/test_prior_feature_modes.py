@@ -7,6 +7,8 @@ import sequence_residual_transformer_model as residual_model
 from predict_sequence_residual_transformer import mer_params_from_config
 from sequence_residual_transformer_model import (
     ALPHABET_SIZE,
+    COMPACT_PRIOR,
+    COMPACT_PRIOR_CONTINUOUS_FEATURE_DIM,
     FULL_PRIOR,
     FULL_PRIOR_CONTINUOUS_FEATURE_DIM,
     QHAT_ONLY,
@@ -55,6 +57,42 @@ class PriorFeatureModeTest(unittest.TestCase):
             side_effect=AssertionError("full prior path was used"),
         ):
             self.build(QHAT_ONLY)
+
+    def test_compact_prior_contains_three_distribution_summaries(self) -> None:
+        batch = self.build(COMPACT_PRIOR)
+        self.assertEqual(
+            batch.continuous.shape,
+            (2, 2, COMPACT_PRIOR_CONTINUOUS_FEATURE_DIM),
+        )
+
+        row = self.freqs[0].astype(np.float64)
+        probabilities = row / row.sum()
+        expected_confidence = probabilities[30]
+        expected_margin = np.log(30.0 / 1.0)
+        expected_entropy = -np.sum(probabilities * np.log(probabilities)) / np.log(95.0)
+        np.testing.assert_allclose(
+            batch.continuous[0, 0, :],
+            np.asarray(
+                [expected_confidence, expected_margin, expected_entropy, 0.0, 0.0002]
+            ),
+            rtol=1e-6,
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            batch.continuous[0, 1, 3:],
+            np.asarray([1.0, 0.0002]),
+        )
+        np.testing.assert_array_equal(batch.q_hat[0], np.asarray([30, 31]))
+        np.testing.assert_array_equal(batch.targets[0], self.observed[:2])
+
+    def test_compact_prior_shares_targets_and_baseline(self) -> None:
+        qhat_only = self.build(QHAT_ONLY)
+        compact_prior = self.build(COMPACT_PRIOR)
+
+        np.testing.assert_array_equal(qhat_only.q_hat, compact_prior.q_hat)
+        np.testing.assert_array_equal(qhat_only.targets, compact_prior.targets)
+        np.testing.assert_allclose(qhat_only.h5_true_prob, compact_prior.h5_true_prob)
+        self.assertAlmostEqual(qhat_only.baseline_bits, compact_prior.baseline_bits)
 
     def test_full_prior_and_qhat_only_share_targets_and_baseline(self) -> None:
         qhat_only = self.build(QHAT_ONLY)

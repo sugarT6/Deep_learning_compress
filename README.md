@@ -13,12 +13,20 @@ r_j = q_j - q_hat_j, for already decoded positions j < i
 P_model(q_true_i | q_hat_i, position, bases, decoded q/r history before i)
 ```
 
-Two prior-feature modes are available:
+Three prior-feature modes are available:
 
 ```text
 qhat_only (default): use the matrix only for q_hat and H5 baseline
+compact_prior:       additionally input three compact distribution summaries
 full_prior:          additionally input log P0_r and probability summaries
 ```
+
+`compact_prior` adds the top-1 probability, the natural-log probability margin
+between the top-1 and top-2 classes, and entropy normalized by `log(95)`. Its
+five continuous inputs are those three summaries, relative position, and
+normalized read length. This mode preserves the direct-quality target and all
+causal history/base features while testing whether a small amount of prior
+shape information recovers signal discarded by `qhat_only`.
 
 `full_prior` reproduces the previous input. It normalizes H5 counts into
 `P0(q)`, clamps probabilities to `1e-12`, and applies the natural logarithm
@@ -41,9 +49,10 @@ Residual-mer history embeddings for k = 2,3,4
 bidirectional local base context from complete DNA read
 ```
 
-`full_prior` adds 189-dimensional `log P0_r(r)`, H5 max probability,
-normalized H5 entropy, and normalized H5 expected quality. Exact-lag support
-remains for historical checkpoint compatibility.
+`compact_prior` adds top-1 confidence, top-1/top-2 log-probability margin, and
+normalized H5 entropy. `full_prior` adds 189-dimensional `log P0_r(r)`, H5 max
+probability, normalized H5 entropy, and normalized H5 expected quality.
+Exact-lag support remains for historical checkpoint compatibility.
 
 Missing history at the start of a read uses BOS tokens. Q/R-mer tokens use the
 same bucket definitions, causal history construction, stride-1 hashing, and
@@ -171,6 +180,39 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
 This run uses 64 reads and 2,000 optimizer updates per epoch. Relative to the
 previous 128-read experiment at the same step count, it samples half as many
 reads per epoch but preserves the same number of optimizer updates.
+
+To test the three compact prior summaries against the current six-dataset
+2,600-step baseline while keeping every other setting fixed:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  h5 \
+  --epochs 15 \
+  --steps-per-epoch 2600 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode compact_prior \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --output-dir runs/transformer_quality_4layer_compactprior_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197
+```
+
+Then run the full held-out prediction:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
+  runs/transformer_quality_4layer_compactprior_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/best.pt \
+  h5 \
+  --batch-reads 64 \
+  --base-sidecar-dir base_sidecars \
+  --output-csv runs/transformer_quality_4layer_compactprior_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/predict_metrics.csv
+```
 
 To reproduce the previous qhat-only residual target with the same code, change
 the target, output parameterization, and output directory:
