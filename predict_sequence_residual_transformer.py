@@ -20,6 +20,8 @@ from sequence_residual_transformer_model import (
     FULL_PRIOR,
     FULL_PRIOR_CONTINUOUS_FEATURE_DIM,
     PAD_TARGET,
+    PLATFORM_COUNT,
+    PLATFORM_TO_ID,
     QHAT_ONLY,
     QUALITY_TARGET,
     RESIDUAL_MIN,
@@ -72,6 +74,43 @@ def mer_params_from_config(config: dict[str, object]) -> dict[str, object]:
     }
 
 
+def platform_id_for_file(config: dict[str, object], path: Path) -> int | None:
+    """Restore a file's platform id from a platform-conditioned checkpoint."""
+
+    if int(config.get("platform_embed_dim", 0)) == 0:
+        return None
+    platform_id_by_file = config.get("platform_id_by_file")
+    if isinstance(platform_id_by_file, dict) and path.name in platform_id_by_file:
+        platform_id = int(platform_id_by_file[path.name])
+        if not 0 <= platform_id < PLATFORM_COUNT:
+            raise ValueError(f"{path}: checkpoint contains invalid platform id {platform_id}")
+        return platform_id
+    platform_by_file = config.get("platform_by_file")
+    if not isinstance(platform_by_file, dict) or path.name not in platform_by_file:
+        raise ValueError(
+            f"{path}: checkpoint has no platform mapping for basename {path.name!r}"
+        )
+    platform = str(platform_by_file[path.name])
+    if platform not in PLATFORM_TO_ID:
+        raise ValueError(f"{path}: checkpoint contains unknown platform {platform!r}")
+    return PLATFORM_TO_ID[platform]
+
+
+def platform_tensor(
+    platform_id: int | None,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if platform_id is None:
+        return None
+    return torch.full(
+        (batch_size,),
+        platform_id,
+        dtype=torch.long,
+        device=device,
+    )
+
+
 @torch.no_grad()
 def evaluate_file(
     model: nn.Module,
@@ -83,6 +122,7 @@ def evaluate_file(
     device: torch.device,
     mer_params: dict[str, object],
     base_sidecar_path: Path | None,
+    platform_id: int | None = None,
 ) -> dict[str, float | int | str]:
     # 预测阶段按压缩目标评估真实 quality（或历史 residual checkpoint）
     # 在模型分布下的 -log2 概率。
@@ -107,6 +147,11 @@ def evaluate_file(
         **mer_params,
     ):
         tensors = batch_to_torch(batch, device)
+        batch_platform_id = platform_tensor(
+            platform_id,
+            int(tensors["continuous"].shape[0]),
+            device,
+        )
         # 使用 teacher-forced 的 prev_q/prev_r 评估概率。
         # 对无损解码来说，前一位已经恢复，因此 encoder/decoder 也能得到同样历史。
         logits = model(
@@ -119,6 +164,7 @@ def evaluate_file(
             qmer_tokens=tensors["qmer_tokens"],
             rmer_tokens=tensors["rmer_tokens"],
             base_ids=tensors["base_ids"],
+            platform_id=batch_platform_id,
             lengths=tensors["lengths"],
         )
         if prediction_target == RESIDUAL_TARGET:
@@ -169,6 +215,7 @@ def write_prediction_samples(
     device: torch.device,
     mer_params: dict[str, object],
     base_sidecar_path: Path | None,
+    platform_id: int | None = None,
 ) -> None:
     """Write position-level examples from the first sample_reads reads."""
 
@@ -186,6 +233,11 @@ def write_prediction_samples(
         )
     )
     tensors = batch_to_torch(first_batch, device)
+    batch_platform_id = platform_tensor(
+        platform_id,
+        int(tensors["continuous"].shape[0]),
+        device,
+    )
     prediction_target = str(mer_params["prediction_target"])
     logits = model(
         continuous=tensors["continuous"],
@@ -197,6 +249,7 @@ def write_prediction_samples(
         qmer_tokens=tensors["qmer_tokens"],
         rmer_tokens=tensors["rmer_tokens"],
         base_ids=tensors["base_ids"],
+        platform_id=batch_platform_id,
         lengths=tensors["lengths"],
     )
     if prediction_target == RESIDUAL_TARGET:
@@ -286,6 +339,7 @@ def write_quality_probability_log(
     device: torch.device,
     mer_params: dict[str, object],
     base_sidecar_dir: Path | None,
+    platform_ids_by_file: dict[str, int] | None = None,
 ) -> int:
     """Write compact predicted quality/probability rows.
 
@@ -323,6 +377,15 @@ def write_quality_probability_log(
                 **mer_params,
             ):
                 tensors = batch_to_torch(batch, device)
+                batch_platform_id = platform_tensor(
+                    (
+                        platform_ids_by_file[path.name]
+                        if platform_ids_by_file is not None
+                        else None
+                    ),
+                    int(tensors["continuous"].shape[0]),
+                    device,
+                )
                 logits = model(
                     continuous=tensors["continuous"],
                     q_hat=tensors["q_hat"],
@@ -333,6 +396,7 @@ def write_quality_probability_log(
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
+                    platform_id=batch_platform_id,
                     lengths=tensors["lengths"],
                 )
                 if prediction_target == RESIDUAL_TARGET:
@@ -462,6 +526,14 @@ def main() -> int:
     # checkpoint 里保存了模型结构参数，所以预测时只需要传 best.pt。
     model, config = load_checkpoint(args.checkpoint, device)
     mer_params = mer_params_from_config(config)
+    try:
+        platform_ids_by_file = (
+            {path.name: platform_id_for_file(config, path) for path in files}
+            if int(config.get("platform_embed_dim", 0)) > 0
+            else None
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     uses_base_context = bool(config.get("uses_base_context", False))
     base_sidecar_dir = args.base_sidecar_dir
     if uses_base_context and base_sidecar_dir is None:
@@ -492,6 +564,11 @@ def main() -> int:
             base_sidecar_path=(
                 base_sidecar_path_for_h5(path, base_sidecar_dir)
                 if uses_base_context and base_sidecar_dir is not None
+                else None
+            ),
+            platform_id=(
+                platform_ids_by_file[path.name]
+                if platform_ids_by_file is not None
                 else None
             ),
         )
@@ -555,6 +632,11 @@ def main() -> int:
                 if uses_base_context and base_sidecar_dir is not None
                 else None
             ),
+            platform_id=(
+                platform_ids_by_file[files[0].name]
+                if platform_ids_by_file is not None
+                else None
+            ),
         )
 
     quality_log_rows = 0
@@ -570,6 +652,7 @@ def main() -> int:
             device=device,
             mer_params=mer_params,
             base_sidecar_dir=base_sidecar_dir if uses_base_context else None,
+            platform_ids_by_file=platform_ids_by_file,
         )
 
     total_elapsed_seconds = sum(float(row["elapsed_seconds"]) for row in rows)

@@ -54,6 +54,13 @@ normalized H5 entropy. `full_prior` adds 189-dimensional `log P0_r(r)`, H5 max
 probability, normalized H5 entropy, and normalized H5 expected quality.
 Exact-lag support remains for historical checkpoint compatibility.
 
+An optional file-level platform embedding is independent of the prior mode.
+Training requires an explicit mapping for every input file; the resolved
+basename-to-platform name and stable platform id are stored in the checkpoint,
+so prediction restores them automatically. The current platform vocabulary is
+`BGISEQ=0`, `Illumina=1`, and `IonTorrent=2`. The platform value must be
+available as file/container metadata to both the encoder and decoder.
+
 Missing history at the start of a read uses BOS tokens. Q/R-mer tokens use the
 same bucket definitions, causal history construction, stride-1 hashing, and
 default vocabulary size 4096 as the stage-3 Q/R-mer experiment. No token
@@ -212,6 +219,40 @@ CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
   --batch-reads 64 \
   --base-sidecar-dir base_sidecars \
   --output-csv runs/transformer_quality_4layer_compactprior_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/predict_metrics.csv
+```
+
+To test only an 8-dimensional platform embedding on the `qhat_only` baseline:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  h5 \
+  --epochs 15 \
+  --steps-per-epoch 2600 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --platform-embed-dim 8 \
+  --platform-map ERR2755197=BGISEQ,SRR1238539=IonTorrent,SRR3066199=Illumina,SRR5867380=IonTorrent,SRR622457=Illumina,SRR6691666=Illumina \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --output-dir runs/transformer_quality_4layer_qhatonly_platform8_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197
+```
+
+Prediction reads the mapping from the checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
+  runs/transformer_quality_4layer_qhatonly_platform8_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/best.pt \
+  h5 \
+  --batch-reads 64 \
+  --base-sidecar-dir base_sidecars \
+  --output-csv runs/transformer_quality_4layer_qhatonly_platform8_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/predict_metrics.csv
 ```
 
 To reproduce the previous qhat-only residual target with the same code, change

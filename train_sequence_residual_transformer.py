@@ -32,6 +32,8 @@ from sequence_residual_transformer_model import (
     LOG_P0_PLUS_DELTA,
     OUTPUT_PARAMETERIZATIONS,
     PAD_TARGET,
+    PLATFORM_NAMES,
+    PLATFORM_TO_ID,
     PREDICTION_TARGETS,
     PRIOR_FEATURE_MODES,
     QUALITY_TARGET,
@@ -73,6 +75,56 @@ def parse_int_list(text: str) -> tuple[int, ...]:
     return values
 
 
+def resolve_platform_map(files: list[Path], text: str) -> dict[str, str]:
+    """Resolve comma-separated accession-pattern=platform entries by basename."""
+
+    entries: list[tuple[str, str]] = []
+    for raw_entry in text.split(","):
+        entry = raw_entry.strip()
+        if not entry or "=" not in entry:
+            raise ValueError(
+                "--platform-map entries must use accession-pattern=platform"
+            )
+        pattern, platform = (part.strip() for part in entry.split("=", 1))
+        canonical = next(
+            (name for name in PLATFORM_NAMES if name.lower() == platform.lower()),
+            None,
+        )
+        if not pattern or canonical is None:
+            raise ValueError(
+                f"invalid platform mapping {entry!r}; platform must be one of "
+                f"{PLATFORM_NAMES}"
+            )
+        entries.append((pattern, canonical))
+
+    resolved: dict[str, str] = {}
+    for path in files:
+        matches = [platform for pattern, platform in entries if pattern in path.name]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{path}: expected exactly one --platform-map match, got {len(matches)}"
+            )
+        resolved[path.name] = matches[0]
+    return resolved
+
+
+def platform_ids_for_batch(
+    batch_size: int,
+    path: Path,
+    platform_by_file: dict[str, str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Return one file-level platform id repeated for every read in a batch."""
+
+    platform = platform_by_file[path.name]
+    return torch.full(
+        (batch_size,),
+        PLATFORM_TO_ID[platform],
+        dtype=torch.long,
+        device=device,
+    )
+
+
 @torch.no_grad()
 def evaluate_model(
     model: ResidualTransformer,
@@ -90,6 +142,7 @@ def evaluate_model(
     base_sidecar_dir: Path,
     prior_feature_mode: str,
     prediction_target: str,
+    platform_by_file: dict[str, str] | None = None,
 ) -> dict[str, float]:
     """Evaluate compression metrics on a deterministic read split."""
 
@@ -121,6 +174,16 @@ def evaluate_model(
             prediction_target=prediction_target,
         ):
             tensors = batch_to_torch(batch, device)
+            platform_id = (
+                platform_ids_for_batch(
+                    batch_size=int(tensors["continuous"].shape[0]),
+                    path=path,
+                    platform_by_file=platform_by_file,
+                    device=device,
+                )
+                if platform_by_file is not None
+                else None
+            )
             # 模型输出当前实验的 95 个 quality 类别；旧 residual checkpoint
             # 仍可通过 prediction_target=residual 使用 189 类。
             logits = model(
@@ -131,6 +194,7 @@ def evaluate_model(
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
                 base_ids=tensors["base_ids"],
+                platform_id=platform_id,
                 lengths=tensors["lengths"],
             )
             if prediction_target == RESIDUAL_TARGET:
@@ -261,6 +325,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-conv-channels", type=int, default=16)
     parser.add_argument("--base-context-dim", type=int, default=32)
+    parser.add_argument(
+        "--platform-embed-dim",
+        type=int,
+        default=0,
+        help="file-level platform embedding width; 0 disables platform conditioning",
+    )
+    parser.add_argument(
+        "--platform-map",
+        default="",
+        help=(
+            "comma-separated accession-pattern=platform mappings; platforms are "
+            "BGISEQ, Illumina, and IonTorrent"
+        ),
+    )
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=4)
@@ -327,6 +405,12 @@ def main() -> int:
         or args.base_context_dim <= 0
     ):
         raise SystemExit("base embedding, convolution, and context dimensions must be positive")
+    if args.platform_embed_dim < 0:
+        raise SystemExit("--platform-embed-dim must be non-negative")
+    if bool(args.platform_embed_dim) != bool(args.platform_map.strip()):
+        raise SystemExit(
+            "--platform-embed-dim and --platform-map must be enabled together"
+        )
     if not args.base_conv_kernels or any(
         kernel <= 0 or kernel % 2 == 0 for kernel in args.base_conv_kernels
     ):
@@ -339,6 +423,14 @@ def main() -> int:
 
     # 默认读取 h5/ 下所有 SRR/ERR quality-model H5。
     files = discover_h5_files(args.inputs)
+    try:
+        platform_by_file = (
+            resolve_platform_map(files, args.platform_map)
+            if args.platform_embed_dim > 0
+            else None
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     infos = [inspect_h5(path) for path in files]
     for info in infos:
         if info.alphabet_size != 95:
@@ -363,6 +455,8 @@ def main() -> int:
         model_type = "causal_transformer_log_p0_delta_residual_base_conv"
     else:
         model_type = f"causal_transformer_{args.prior_feature_mode}_direct_residual_base_conv"
+    if platform_by_file is not None:
+        model_type += "_platform"
     config = {
         "model_type": model_type,
         "prediction_target": args.prediction_target,
@@ -386,6 +480,17 @@ def main() -> int:
         "uses_q_hat": True,
         "uses_residual_history": True,
         "uses_base_context": True,
+        "uses_platform_embedding": platform_by_file is not None,
+        "platform_names": list(PLATFORM_NAMES),
+        "platform_by_file": platform_by_file or {},
+        "platform_id_by_file": (
+            {
+                basename: PLATFORM_TO_ID[platform]
+                for basename, platform in platform_by_file.items()
+            }
+            if platform_by_file is not None
+            else {}
+        ),
         "base_context_is_bidirectional": True,
         "complete_base_read_available_before_quality": True,
         "body_length_is_quality_side_information": True,
@@ -431,6 +536,7 @@ def main() -> int:
         "base_conv_kernels": list(args.base_conv_kernels),
         "base_conv_channels": args.base_conv_channels,
         "base_context_dim": args.base_context_dim,
+        "platform_embed_dim": args.platform_embed_dim,
         "d_model": args.d_model,
         "num_heads": args.num_heads,
         "num_layers": args.num_layers,
@@ -475,6 +581,7 @@ def main() -> int:
         base_conv_kernels=args.base_conv_kernels,
         base_conv_channels=args.base_conv_channels,
         base_context_dim=args.base_context_dim,
+        platform_embed_dim=args.platform_embed_dim,
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
@@ -532,8 +639,18 @@ def main() -> int:
                 )
 
             for step in step_iter:
-                batch, _ = sampler.sample()
+                batch, batch_path = sampler.sample()
                 tensors = batch_to_torch(batch, device)
+                platform_id = (
+                    platform_ids_for_batch(
+                        batch_size=int(tensors["continuous"].shape[0]),
+                        path=batch_path,
+                        platform_by_file=platform_by_file,
+                        device=device,
+                    )
+                    if platform_by_file is not None
+                    else None
+                )
 
                 optimizer.zero_grad(set_to_none=True)
                 # causal attention 只看当前及历史位置；prev_q/prev_r 已右移，
@@ -546,6 +663,7 @@ def main() -> int:
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
+                    platform_id=platform_id,
                     lengths=tensors["lengths"],
                 )
                 # 直接质量目标的 95 类天然全合法；只有历史 residual 目标
@@ -594,6 +712,7 @@ def main() -> int:
                 base_sidecar_dir=args.base_sidecar_dir,
                 prior_feature_mode=args.prior_feature_mode,
                 prediction_target=args.prediction_target,
+                platform_by_file=platform_by_file,
             )
             elapsed = time.time() - started
             row = {

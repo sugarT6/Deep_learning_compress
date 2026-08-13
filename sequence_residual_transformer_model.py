@@ -64,6 +64,10 @@ BASE_PAD_TOKEN = 6
 BASE_TOKEN_COUNT = 7
 DEFAULT_BASE_CONV_KERNELS = (3, 5, 7)
 
+PLATFORM_NAMES = ("BGISEQ", "Illumina", "IonTorrent")
+PLATFORM_TO_ID = {name: index for index, name in enumerate(PLATFORM_NAMES)}
+PLATFORM_COUNT = len(PLATFORM_NAMES)
+
 DIRECT_RESIDUAL_LOGITS = "direct_residual_logits"
 DIRECT_LOGITS = "direct_logits"
 LOG_P0_PLUS_DELTA = "log_p0_plus_delta"
@@ -1110,6 +1114,7 @@ class ResidualTransformer(nn.Module):
         base_conv_kernels: Iterable[int] | None = None,
         base_conv_channels: int = 0,
         base_context_dim: int = 0,
+        platform_embed_dim: int = 0,
         d_model: int = 256,
         num_heads: int = 4,
         num_layers: int = 4,
@@ -1158,6 +1163,9 @@ class ResidualTransformer(nn.Module):
             else tuple()
         )
         self.base_context_dim = int(base_context_dim)
+        self.platform_embed_dim = int(platform_embed_dim)
+        if self.platform_embed_dim < 0:
+            raise ValueError("platform_embed_dim must be non-negative")
         self.q_hat_embedding = nn.Embedding(ALPHABET_SIZE, q_hat_embed_dim)
         self.prev_q_embedding = nn.Embedding(Q_TOKEN_COUNT, prev_q_embed_dim)
         self.prev_r_embedding = nn.Embedding(R_TOKEN_COUNT, prev_r_embed_dim)
@@ -1166,6 +1174,11 @@ class ResidualTransformer(nn.Module):
         )
         self.rmer_embeddings = nn.ModuleList(
             [nn.Embedding(rmer_vocab_size, rmer_embed_dim) for _ in self.rmer_ks]
+        )
+        self.platform_embedding = (
+            nn.Embedding(PLATFORM_COUNT, self.platform_embed_dim)
+            if self.platform_embed_dim > 0
+            else None
         )
         if self.base_context_dim > 0:
             self.base_encoder: BaseContextEncoder | None = BaseContextEncoder(
@@ -1190,6 +1203,7 @@ class ResidualTransformer(nn.Module):
             + len(self.qmer_ks) * qmer_embed_dim
             + len(self.rmer_ks) * rmer_embed_dim
             + self.base_context_dim
+            + self.platform_embed_dim
         )
         self.input_projection = nn.Sequential(
             nn.Linear(combined_dim, d_model),
@@ -1256,6 +1270,7 @@ class ResidualTransformer(nn.Module):
         qmer_tokens: torch.Tensor | None = None,
         rmer_tokens: torch.Tensor | None = None,
         base_ids: torch.Tensor | None = None,
+        platform_id: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pieces = [
@@ -1297,6 +1312,15 @@ class ResidualTransformer(nn.Module):
                 raise ValueError("complete base reads are shorter than padded body qualities")
             base_context = self.base_encoder(base_ids)
             pieces.append(base_context[:, : continuous.shape[1], :])
+        if self.platform_embedding is not None:
+            if platform_id is None:
+                raise ValueError("platform_id is required by this checkpoint")
+            if platform_id.ndim != 1 or platform_id.shape[0] != continuous.shape[0]:
+                raise ValueError("platform_id must have shape [batch]")
+            platform_context = self.platform_embedding(platform_id.long())
+            pieces.append(
+                platform_context.unsqueeze(1).expand(-1, continuous.shape[1], -1)
+            )
         x = self.input_projection(torch.cat(pieces, dim=-1))
         x = x + self._position_encoding(x)
 
@@ -1394,6 +1418,7 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransform
         base_conv_kernels=config.get("base_conv_kernels", []),
         base_conv_channels=int(config.get("base_conv_channels", 0)),
         base_context_dim=int(config.get("base_context_dim", 0)),
+        platform_embed_dim=int(config.get("platform_embed_dim", 0)),
         d_model=int(config["d_model"]),
         num_heads=int(config["num_heads"]),
         num_layers=int(config["num_layers"]),
