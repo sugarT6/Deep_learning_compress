@@ -11,6 +11,8 @@ from typing import BinaryIO, Iterator
 import h5py
 import numpy as np
 
+from dataset_registry import resolve_dataset_files
+
 from sequence_residual_transformer_model import (
     BASE_A_TOKEN,
     BASE_C_TOKEN,
@@ -237,21 +239,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "inputs",
         nargs="*",
-        default=[Path("h5")],
-        help="quality-model H5 files or directories; default: h5",
+        default=[],
+        help="explicit quality-model H5 files/directories; default: h5",
     )
+    parser.add_argument(
+        "--datasets",
+        default="",
+        help="registered datasets/groups such as illumina, bgi_mgi, or mixed",
+    )
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--fastq-dir", type=Path, default=Path("fq"))
-    parser.add_argument("--output-dir", type=Path, default=Path("base_sidecars"))
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--force", action="store_true")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    files = discover_h5_files(args.inputs)
-    for h5_path in files:
-        fastq_path = fastq_path_for_h5(h5_path, args.fastq_dir)
-        output_path = base_sidecar_path_for_h5(h5_path, args.output_dir)
+    if args.datasets:
+        if args.inputs:
+            raise SystemExit("--datasets cannot be combined with positional inputs")
+        try:
+            registered_files = resolve_dataset_files(
+                args.datasets,
+                args.data_root,
+                require_h5=True,
+                require_fastq=True,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise SystemExit(str(exc)) from exc
+        pairs = [(item.h5_path, item.fastq_path) for item in registered_files]
+        output_dir = args.output_dir or (args.data_root / "base_sidecars")
+    else:
+        files = discover_h5_files(args.inputs or [Path("h5")])
+        pairs = [
+            (h5_path, fastq_path_for_h5(h5_path, args.fastq_dir))
+            for h5_path in files
+        ]
+        output_dir = args.output_dir or Path("base_sidecars")
+
+    for h5_path, fastq_path in pairs:
+        output_path = base_sidecar_path_for_h5(h5_path, output_dir)
         create_base_sidecar(
             h5_path=h5_path,
             fastq_path=fastq_path,

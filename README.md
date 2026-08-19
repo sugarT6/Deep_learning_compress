@@ -61,6 +61,137 @@ so prediction restores them automatically. The current platform vocabulary is
 `BGISEQ=0`, `Illumina=1`, and `IonTorrent=2`. The platform value must be
 available as file/container metadata to both the encoder and decoder.
 
+## Registered multi-platform datasets
+
+`dataset_registry.py` keeps dataset selection separate from HDF5 batching. It
+registers four instrument datasets under `data/`:
+
+```text
+novaseq       -> two NovaSeq files, Illumina
+nextseq2000   -> two NextSeq 2000 files, Illumina
+dnbseq_t7     -> two DNBSEQ-T7 files, BGI/MGI
+mgiseq2000    -> two MGISEQ-2000 files, BGI/MGI
+```
+
+The group aliases are:
+
+```text
+illumina -> novaseq,nextseq2000
+bgi_mgi  -> dnbseq_t7,mgiseq2000
+mixed    -> all four datasets
+```
+
+Training, prediction, and sidecar preparation accept `--datasets` and
+`--data-root`. Positional H5 inputs remain supported for historical runs, but
+cannot be combined with `--datasets`. Registered paths are explicit, so the
+legacy `h5/` directory discovery remains restricted to SRR/ERR files.
+
+Generate and validate the registered base sidecars once:
+
+```bash
+python prepare_base_sidecars.py --datasets mixed --data-root data
+```
+
+The current eight files each contain 250,000 reads. The existing sampler is
+unchanged: it selects files in proportion to their training-read counts, which
+is exactly uniform across these eight equal-sized files.
+
+### Illumina versus BGI/MGI mixing experiment
+
+The three runs below intentionally disable compact prior and platform
+embedding. They differ only in the registered training data. The mixed run
+uses twice as many steps per epoch so each file receives the same expected
+training exposure and its total optimizer budget matches the two separate
+models combined.
+
+```bash
+# Terminal/GPU 0: Illumina-only
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  --datasets illumina \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 2600 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --output-dir runs/platform_mixing_20260819/illumina_only
+
+# Terminal/GPU 1: BGI/MGI-only
+CUDA_VISIBLE_DEVICES=1 python train_sequence_residual_transformer.py \
+  --datasets bgi_mgi \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 2600 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --output-dir runs/platform_mixing_20260819/bgi_mgi_only
+
+# Terminal/GPU 2: all four instruments, equal per-file exposure
+CUDA_VISIBLE_DEVICES=2 python train_sequence_residual_transformer.py \
+  --datasets mixed \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 5200 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --output-dir runs/platform_mixing_20260819/mixed
+```
+
+After training, every checkpoint is evaluated on the same held-out 20% of all
+eight files:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
+  runs/platform_mixing_20260819/illumina_only/best.pt \
+  --datasets mixed \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/platform_mixing_20260819/illumina_only/predict_mixed_test.csv
+
+CUDA_VISIBLE_DEVICES=1 python predict_sequence_residual_transformer.py \
+  runs/platform_mixing_20260819/bgi_mgi_only/best.pt \
+  --datasets mixed \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/platform_mixing_20260819/bgi_mgi_only/predict_mixed_test.csv
+
+CUDA_VISIBLE_DEVICES=2 python predict_sequence_residual_transformer.py \
+  runs/platform_mixing_20260819/mixed/best.pt \
+  --datasets mixed \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/platform_mixing_20260819/mixed/predict_mixed_test.csv
+```
+
 Missing history at the start of a read uses BOS tokens. Q/R-mer tokens use the
 same bucket definitions, causal history construction, stride-1 hashing, and
 default vocabulary size 4096 as the stage-3 Q/R-mer experiment. No token

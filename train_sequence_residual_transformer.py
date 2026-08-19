@@ -13,6 +13,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from dataset_registry import dataset_metadata, resolve_dataset_files
+
 try:
     from tqdm import tqdm
 except ImportError:  # pragma: no cover
@@ -240,8 +242,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "inputs",
         nargs="*",
-        default=[Path("h5")],
-        help="HDF5 files or directories containing SRR/ERR qual_model H5 files; default: h5",
+        default=[],
+        help=(
+            "explicit HDF5 files/directories; defaults to h5 when --datasets is absent"
+        ),
+    )
+    parser.add_argument(
+        "--datasets",
+        default="",
+        help=(
+            "comma-separated registered datasets/groups, for example illumina, "
+            "bgi_mgi, mixed, or novaseq,nextseq2000"
+        ),
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("data"),
+        help="root containing registered h5/ and fq/ data; default: data",
     )
     parser.add_argument(
         "--output-dir",
@@ -421,8 +439,29 @@ def main() -> int:
     np.random.seed(args.seed)
     device = choose_device(args.device)
 
-    # 默认读取 h5/ 下所有 SRR/ERR quality-model H5。
-    files = discover_h5_files(args.inputs)
+    # Registered datasets use explicit paths and therefore do not loosen the
+    # legacy SRR/ERR-only directory discovery rule.
+    if args.datasets:
+        if args.inputs:
+            raise SystemExit("--datasets cannot be combined with positional inputs")
+        try:
+            registered_files = resolve_dataset_files(
+                args.datasets,
+                args.data_root,
+                require_h5=True,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise SystemExit(str(exc)) from exc
+        files = [item.h5_path for item in registered_files]
+        registered_metadata = dataset_metadata(registered_files)
+    else:
+        files = discover_h5_files(args.inputs or [Path("h5")])
+        registered_metadata = {
+            "dataset_names": [],
+            "dataset_by_file": {},
+            "dataset_platform_by_file": {},
+            "fastq_by_file": {},
+        }
     try:
         platform_by_file = (
             resolve_platform_map(files, args.platform_map)
@@ -504,6 +543,9 @@ def main() -> int:
             for path, base_info in zip(files, base_infos)
         },
         "input_files": [str(path) for path in files],
+        "dataset_selection": args.datasets,
+        "data_root": str(args.data_root),
+        **registered_metadata,
         "file_rows": {str(info.path): info.rows for info in infos},
         "file_reads": {str(info.path): info.read_count for info in infos},
         "file_empty_reads": {str(info.path): info.empty_read_count for info in infos},

@@ -13,6 +13,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from dataset_registry import resolve_dataset_files
+
 from sequence_residual_transformer_model import (
     ALPHABET_SIZE,
     DEFAULT_MER_STRIDE,
@@ -452,8 +454,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "inputs",
         nargs="*",
-        default=[Path("h5")],
-        help="HDF5 files or directories containing SRR/ERR qual_model H5 files; default: h5",
+        default=[],
+        help=(
+            "explicit HDF5 files/directories; defaults to h5 when --datasets is absent"
+        ),
+    )
+    parser.add_argument(
+        "--datasets",
+        default="",
+        help=(
+            "comma-separated registered datasets/groups, for example illumina, "
+            "bgi_mgi, mixed, or novaseq,nextseq2000"
+        ),
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("data"),
+        help="root containing registered h5/ and fq/ data; default: data",
     )
     parser.add_argument("--split", choices=["test", "train", "all"], default="test")
     parser.add_argument("--train-fraction", type=float, default=0.8)
@@ -518,7 +536,22 @@ def main() -> int:
         raise SystemExit("--quality-prob-log-rows must be positive")
 
     device = choose_device(args.device)
-    files = discover_h5_files(args.inputs)
+    if args.datasets:
+        if args.inputs:
+            raise SystemExit("--datasets cannot be combined with positional inputs")
+        try:
+            files = [
+                item.h5_path
+                for item in resolve_dataset_files(
+                    args.datasets,
+                    args.data_root,
+                    require_h5=True,
+                )
+            ]
+        except (ValueError, FileNotFoundError) as exc:
+            raise SystemExit(str(exc)) from exc
+    else:
+        files = discover_h5_files(args.inputs or [Path("h5")])
     for info in [inspect_h5(path) for path in files]:
         if info.alphabet_size != 95:
             raise SystemExit(f"{info.path}: expected alphabet size 95, got {info.alphabet_size}")
