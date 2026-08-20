@@ -288,11 +288,11 @@ CUDA_VISIBLE_DEVICES=2 python predict_sequence_residual_transformer.py \
   --output-csv runs/instrument_transfer_20260820/mgiseq2000_only/predict_dnbseq_t7_test.csv
 ```
 
-Query the aggregate true-quality distribution of one or more explicit HDF5
-files. Multiple files are merged. Only quality ids that occur are printed, in
-ascending order. Each entry is `Q<quality_id> <percentage>`, with two decimal
-places and a percent sign. Five entries are printed per line, separated by
-tabs:
+Query the true-quality distribution of one or more explicit HDF5 files. Each
+file is reported separately under its basename, with a blank line between
+files. Only quality ids that occur are printed, in ascending order. Each entry
+is `Q<quality_id> <percentage>`, with four decimal places and a percent sign.
+Five entries are printed per line, separated by tabs:
 
 ```bash
 python query_quality_distribution.py \

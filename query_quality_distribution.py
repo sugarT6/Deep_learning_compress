@@ -69,7 +69,7 @@ def format_quality_distribution(
         raise ValueError("selected dataset contains no quality values")
 
     entries = [
-        f"Q{quality_id} {100.0 * int(count) / total:.2f}%"
+        f"Q{quality_id} {100.0 * int(count) / total:.4f}%"
         for quality_id, count in enumerate(counts)
         if count
     ]
@@ -80,18 +80,31 @@ def format_quality_distribution(
     return "\n".join(lines)
 
 
+def format_h5_distribution_reports(
+    paths: Iterable[Path],
+    *,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+) -> str:
+    """Format one named quality-distribution section per HDF5 file."""
+
+    reports = []
+    for path in paths:
+        counts = count_quality_ids([path], chunk_rows=chunk_rows)
+        reports.append(f"{path.name}\n{format_quality_distribution(counts)}")
+    return "\n\n".join(reports)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Print the aggregate distribution of true quality ids from one or "
-            "more quality-model HDF5 files."
+            "Print the true-quality distribution of each quality-model HDF5 file."
         )
     )
     parser.add_argument(
         "h5_files",
         nargs="+",
         type=Path,
-        help="one or more quality-model HDF5 file paths; distributions are merged",
+        help="one or more quality-model HDF5 file paths",
     )
     parser.add_argument(
         "--chunk-rows",
@@ -105,11 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        counts = count_quality_ids(
-            args.h5_files,
-            chunk_rows=args.chunk_rows,
+        print(
+            format_h5_distribution_reports(
+                args.h5_files,
+                chunk_rows=args.chunk_rows,
+            )
         )
-        print(format_quality_distribution(counts))
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     return 0
