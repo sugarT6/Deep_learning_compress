@@ -192,6 +192,114 @@ CUDA_VISIBLE_DEVICES=2 python predict_sequence_residual_transformer.py \
   --output-csv runs/platform_mixing_20260819/mixed/predict_mixed_test.csv
 ```
 
+### Instrument-transfer experiment
+
+These three runs test transfer between instruments after the platform-family
+experiment. A single-instrument run contains two files, so it uses 1300 steps
+per epoch. This preserves the same expected exposure per file as the previous
+four-file specialist runs with 2600 steps per epoch. NextSeq 2000 is not used
+as a training-only group because one of its two files contains only one true
+quality id.
+
+```bash
+# Terminal/GPU 0: train NovaSeq only
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  --datasets novaseq \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 1300 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --output-dir runs/instrument_transfer_20260820/novaseq_only
+
+# Terminal/GPU 1: train DNBSEQ-T7 only
+CUDA_VISIBLE_DEVICES=1 python train_sequence_residual_transformer.py \
+  --datasets dnbseq_t7 \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 1300 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --output-dir runs/instrument_transfer_20260820/dnbseq_t7_only
+
+# Terminal/GPU 2: train MGISEQ-2000 only
+CUDA_VISIBLE_DEVICES=2 python train_sequence_residual_transformer.py \
+  --datasets mgiseq2000 \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 1300 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --output-dir runs/instrument_transfer_20260820/mgiseq2000_only
+```
+
+Evaluate each checkpoint on the full held-out 20% of its target instrument:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
+  runs/instrument_transfer_20260820/novaseq_only/best.pt \
+  --datasets nextseq2000 \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/instrument_transfer_20260820/novaseq_only/predict_nextseq2000_test.csv
+
+CUDA_VISIBLE_DEVICES=1 python predict_sequence_residual_transformer.py \
+  runs/instrument_transfer_20260820/dnbseq_t7_only/best.pt \
+  --datasets mgiseq2000 \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/instrument_transfer_20260820/dnbseq_t7_only/predict_mgiseq2000_test.csv
+
+CUDA_VISIBLE_DEVICES=2 python predict_sequence_residual_transformer.py \
+  runs/instrument_transfer_20260820/mgiseq2000_only/best.pt \
+  --datasets dnbseq_t7 \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/instrument_transfer_20260820/mgiseq2000_only/predict_dnbseq_t7_test.csv
+```
+
+Query the aggregate true-quality distribution of any registered dataset or
+group. Only quality ids that occur are printed, in ascending order. Each entry
+is `quality_id proportion`, proportions are decimals in `[0, 1]`, five entries
+are printed per line, and entries are separated by tabs:
+
+```bash
+python query_quality_distribution.py --datasets novaseq --data-root data
+python query_quality_distribution.py --datasets nextseq2000 --data-root data
+python query_quality_distribution.py --datasets dnbseq_t7 --data-root data
+python query_quality_distribution.py --datasets mgiseq2000 --data-root data
+```
+
 Missing history at the start of a read uses BOS tokens. Q/R-mer tokens use the
 same bucket definitions, causal history construction, stride-1 hashing, and
 default vocabulary size 4096 as the stage-3 Q/R-mer experiment. No token
