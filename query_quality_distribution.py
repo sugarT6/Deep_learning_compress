@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print the observed quality-id distribution of registered datasets."""
+"""Print the observed quality-id distribution of explicit HDF5 files."""
 
 from __future__ import annotations
 
@@ -9,9 +9,6 @@ from typing import Iterable
 
 import h5py
 import numpy as np
-
-from dataset_registry import resolve_dataset_files
-
 
 QUALITY_ALPHABET_SIZE = 95
 DEFAULT_CHUNK_ROWS = 1_000_000
@@ -60,7 +57,7 @@ def format_quality_distribution(
     *,
     entries_per_line: int = 5,
 ) -> str:
-    """Format nonzero ``quality_id proportion`` entries in id order."""
+    """Format nonzero ``Q<id> percentage`` entries in id order."""
 
     if entries_per_line <= 0:
         raise ValueError("entries_per_line must be positive")
@@ -72,7 +69,7 @@ def format_quality_distribution(
         raise ValueError("selected dataset contains no quality values")
 
     entries = [
-        f"{quality_id} {int(count) / total:.8f}"
+        f"Q{quality_id} {100.0 * int(count) / total:.2f}%"
         for quality_id, count in enumerate(counts)
         if count
     ]
@@ -87,22 +84,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Print the aggregate distribution of true quality ids from one or "
-            "more registered datasets. Proportions are decimals in [0, 1]."
+            "more quality-model HDF5 files."
         )
     )
     parser.add_argument(
-        "--datasets",
-        required=True,
-        help=(
-            "comma-separated registered datasets/groups, for example novaseq, "
-            "dnbseq_t7, illumina, or mixed"
-        ),
-    )
-    parser.add_argument(
-        "--data-root",
+        "h5_files",
+        nargs="+",
         type=Path,
-        default=Path("data"),
-        help="root containing registered h5/ data; default: data",
+        help="one or more quality-model HDF5 file paths; distributions are merged",
     )
     parser.add_argument(
         "--chunk-rows",
@@ -116,13 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        files = resolve_dataset_files(
-            args.datasets,
-            args.data_root,
-            require_h5=True,
-        )
         counts = count_quality_ids(
-            (item.h5_path for item in files),
+            args.h5_files,
             chunk_rows=args.chunk_rows,
         )
         print(format_quality_distribution(counts))

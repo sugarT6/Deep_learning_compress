@@ -37,8 +37,8 @@ class QualityDistributionTest(unittest.TestCase):
 
         self.assertEqual(
             output,
-            "0 0.16666667\t1 0.16666667\t2 0.16666667\t3 0.16666667\t4 0.16666667\n"
-            "5 0.16666667",
+            "Q0 16.67%\tQ1 16.67%\tQ2 16.67%\tQ3 16.67%\tQ4 16.67%\n"
+            "Q5 16.67%",
         )
 
     def test_rejects_out_of_range_quality_id(self) -> None:

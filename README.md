@@ -288,16 +288,16 @@ CUDA_VISIBLE_DEVICES=2 python predict_sequence_residual_transformer.py \
   --output-csv runs/instrument_transfer_20260820/mgiseq2000_only/predict_dnbseq_t7_test.csv
 ```
 
-Query the aggregate true-quality distribution of any registered dataset or
-group. Only quality ids that occur are printed, in ascending order. Each entry
-is `quality_id proportion`, proportions are decimals in `[0, 1]`, five entries
-are printed per line, and entries are separated by tabs:
+Query the aggregate true-quality distribution of one or more explicit HDF5
+files. Multiple files are merged. Only quality ids that occur are printed, in
+ascending order. Each entry is `Q<quality_id> <percentage>`, with two decimal
+places and a percent sign. Five entries are printed per line, separated by
+tabs:
 
 ```bash
-python query_quality_distribution.py --datasets novaseq --data-root data
-python query_quality_distribution.py --datasets nextseq2000 --data-root data
-python query_quality_distribution.py --datasets dnbseq_t7 --data-root data
-python query_quality_distribution.py --datasets mgiseq2000 --data-root data
+python query_quality_distribution.py \
+  data/h5/subset_HG001_1.fq.gz.qual_model.h5 \
+  data/h5/subset_HG002_1.fq.gz.qual_model.h5
 ```
 
 Missing history at the start of a read uses BOS tokens. Q/R-mer tokens use the
