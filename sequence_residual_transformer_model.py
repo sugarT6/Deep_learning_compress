@@ -94,6 +94,10 @@ R_MER_BASE = R_BUCKET_COUNT + 1
 
 # 质量值 alphabet 固定为 95，对应 Phred+33 后的 quality id: 0..94。
 # residual = q_true - q_hat，因此 residual 范围是 -94..94，共 189 类。
+DEFAULT_QUALITY_DISTRIBUTION_EMBED_DIM = 32
+DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM = 64
+DEFAULT_QUALITY_DELTA_LIMIT = 4.0
+QUALITY_DISTRIBUTION_ADD_ALPHA = 1.0
 
 FULL_PRIOR = "full_prior"
 QHAT_ONLY = "qhat_only"
@@ -125,6 +129,17 @@ class H5SequenceInfo:
     min_read_len: int
     max_read_len: int
     mean_read_len: float
+
+
+@dataclass(frozen=True)
+class QualityDistributionInfo:
+    """Add-alpha-smoothed true-quality distribution for one HDF5 body."""
+
+    path: Path
+    counts: np.ndarray
+    probabilities: np.ndarray
+    log_probabilities: np.ndarray
+    total_symbols: int
 
 
 @dataclass(frozen=True)
@@ -333,6 +348,71 @@ def inspect_h5(path: Path) -> H5SequenceInfo:
             max_read_len=int(nonempty_lengths.max()),
             mean_read_len=float(nonempty_lengths.mean()),
         )
+
+
+def inspect_quality_distribution(
+    path: Path,
+    *,
+    add_alpha: float = QUALITY_DISTRIBUTION_ADD_ALPHA,
+    chunk_rows: int = 1_000_000,
+) -> QualityDistributionInfo:
+    """Count one file's true body qualities and return smoothed log probabilities."""
+
+    if add_alpha <= 0.0:
+        raise ValueError("quality distribution add_alpha must be positive")
+    if chunk_rows <= 0:
+        raise ValueError("quality distribution chunk_rows must be positive")
+
+    counts = np.zeros(ALPHABET_SIZE, dtype=np.int64)
+    with h5py.File(path, "r") as handle:
+        if "/observed" not in handle:
+            raise ValueError(f"{path}: missing required dataset /observed")
+        observed = handle["/observed"]
+        if observed.ndim != 1:
+            raise ValueError(f"{path}: /observed must be one-dimensional")
+        for start in range(0, int(observed.shape[0]), chunk_rows):
+            values = np.asarray(observed[start : start + chunk_rows])
+            if not np.issubdtype(values.dtype, np.integer):
+                raise ValueError(f"{path}: /observed must contain integer quality ids")
+            values_i = values.astype(np.int64, copy=False)
+            if values_i.size and (
+                int(values_i.min()) < 0 or int(values_i.max()) >= ALPHABET_SIZE
+            ):
+                raise ValueError(f"{path}: observed quality id out of [0, 94]")
+            counts += np.bincount(values_i, minlength=ALPHABET_SIZE)
+
+    total_symbols = int(counts.sum())
+    if total_symbols == 0:
+        raise ValueError(f"{path}: contains no body quality values")
+    smoothed = counts.astype(np.float64) + float(add_alpha)
+    probabilities = smoothed / float(smoothed.sum())
+    log_probabilities = np.log(probabilities)
+    return QualityDistributionInfo(
+        path=path,
+        counts=counts,
+        probabilities=probabilities.astype(np.float32),
+        log_probabilities=log_probabilities.astype(np.float32),
+        total_symbols=total_symbols,
+    )
+
+
+def quality_distribution_bits_for_batch(
+    batch: SequenceBatch,
+    log_probabilities: np.ndarray,
+) -> float:
+    """Return histogram-only bits for a direct-quality batch."""
+
+    if log_probabilities.shape != (ALPHABET_SIZE,):
+        raise ValueError(
+            f"quality distribution must have shape ({ALPHABET_SIZE},), "
+            f"got {log_probabilities.shape}"
+        )
+    qualities = batch.targets[batch.valid_mask]
+    if qualities.size and (
+        int(qualities.min()) < 0 or int(qualities.max()) >= ALPHABET_SIZE
+    ):
+        raise ValueError("quality histogram bits require direct quality targets")
+    return float((-log_probabilities[qualities] / math.log(2.0)).sum())
 
 
 def split_reads(read_count: int, train_fraction: float) -> tuple[int, int]:
@@ -1094,6 +1174,11 @@ class ResidualTransformer(nn.Module):
     as the final logits.
     ``log_p0_plus_delta`` treats the output head as a correction and adds it to
     the first 189 continuous features, which contain ``log P0_r``.
+
+    The optional file-quality-distribution mode instead uses an add-one-
+    smoothed 95-class true-quality histogram as a file-level embedding and as
+    the output prior. Its zero-initialized head learns a tanh-bounded direct-
+    quality logit correction.
     """
 
     def __init__(
@@ -1115,6 +1200,10 @@ class ResidualTransformer(nn.Module):
         base_conv_channels: int = 0,
         base_context_dim: int = 0,
         platform_embed_dim: int = 0,
+        quality_distribution_prior: bool = False,
+        quality_distribution_embed_dim: int = 0,
+        quality_distribution_hidden_dim: int = DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM,
+        quality_delta_limit: float = DEFAULT_QUALITY_DELTA_LIMIT,
         d_model: int = 256,
         num_heads: int = 4,
         num_layers: int = 4,
@@ -1166,6 +1255,33 @@ class ResidualTransformer(nn.Module):
         self.platform_embed_dim = int(platform_embed_dim)
         if self.platform_embed_dim < 0:
             raise ValueError("platform_embed_dim must be non-negative")
+        self.quality_distribution_prior = bool(quality_distribution_prior)
+        self.quality_distribution_embed_dim = int(quality_distribution_embed_dim)
+        self.quality_distribution_hidden_dim = int(quality_distribution_hidden_dim)
+        self.quality_delta_limit = float(quality_delta_limit)
+        if self.quality_distribution_prior:
+            if output_dim != ALPHABET_SIZE:
+                raise ValueError(
+                    "quality distribution prior requires the 95-class quality output"
+                )
+            if output_parameterization != DIRECT_LOGITS:
+                raise ValueError(
+                    "quality distribution prior requires direct_logits output"
+                )
+            if self.quality_distribution_embed_dim <= 0:
+                raise ValueError(
+                    "quality_distribution_embed_dim must be positive when enabled"
+                )
+            if self.quality_distribution_hidden_dim <= 0:
+                raise ValueError(
+                    "quality_distribution_hidden_dim must be positive when enabled"
+                )
+            if self.quality_delta_limit <= 0.0:
+                raise ValueError("quality_delta_limit must be positive when enabled")
+        elif self.quality_distribution_embed_dim != 0:
+            raise ValueError(
+                "quality_distribution_embed_dim must be 0 when prior is disabled"
+            )
         self.q_hat_embedding = nn.Embedding(ALPHABET_SIZE, q_hat_embed_dim)
         self.prev_q_embedding = nn.Embedding(Q_TOKEN_COUNT, prev_q_embed_dim)
         self.prev_r_embedding = nn.Embedding(R_TOKEN_COUNT, prev_r_embed_dim)
@@ -1178,6 +1294,18 @@ class ResidualTransformer(nn.Module):
         self.platform_embedding = (
             nn.Embedding(PLATFORM_COUNT, self.platform_embed_dim)
             if self.platform_embed_dim > 0
+            else None
+        )
+        self.quality_distribution_encoder = (
+            nn.Sequential(
+                nn.Linear(ALPHABET_SIZE, self.quality_distribution_hidden_dim),
+                nn.GELU(),
+                nn.Linear(
+                    self.quality_distribution_hidden_dim,
+                    self.quality_distribution_embed_dim,
+                ),
+            )
+            if self.quality_distribution_prior
             else None
         )
         if self.base_context_dim > 0:
@@ -1204,6 +1332,7 @@ class ResidualTransformer(nn.Module):
             + len(self.rmer_ks) * rmer_embed_dim
             + self.base_context_dim
             + self.platform_embed_dim
+            + self.quality_distribution_embed_dim
         )
         self.input_projection = nn.Sequential(
             nn.Linear(combined_dim, d_model),
@@ -1225,10 +1354,9 @@ class ResidualTransformer(nn.Module):
             norm=nn.LayerNorm(d_model),
         )
         self.output_head = nn.Linear(d_model, output_dim)
-        if self.output_parameterization == LOG_P0_PLUS_DELTA:
-            # An untrained delta model should reproduce the H5 prior exactly.
-            # Subsequent optimizer steps learn which residual logits to raise
-            # or lower relative to that prior.
+        if self.output_parameterization == LOG_P0_PLUS_DELTA or self.quality_distribution_prior:
+            # An untrained correction model reproduces its H5/file-histogram
+            # prior exactly. Training then learns which logits to raise/lower.
             nn.init.zeros_(self.output_head.weight)
             nn.init.zeros_(self.output_head.bias)
 
@@ -1271,6 +1399,7 @@ class ResidualTransformer(nn.Module):
         rmer_tokens: torch.Tensor | None = None,
         base_ids: torch.Tensor | None = None,
         platform_id: torch.Tensor | None = None,
+        quality_distribution_log_probs: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pieces = [
@@ -1321,6 +1450,41 @@ class ResidualTransformer(nn.Module):
             pieces.append(
                 platform_context.unsqueeze(1).expand(-1, continuous.shape[1], -1)
             )
+        expanded_quality_distribution: torch.Tensor | None = None
+        if self.quality_distribution_encoder is not None:
+            if quality_distribution_log_probs is None:
+                raise ValueError(
+                    "quality_distribution_log_probs are required by this checkpoint"
+                )
+            if quality_distribution_log_probs.ndim == 1:
+                if quality_distribution_log_probs.shape[0] != ALPHABET_SIZE:
+                    raise ValueError(
+                        "quality_distribution_log_probs must have 95 classes"
+                    )
+                expanded_quality_distribution = quality_distribution_log_probs.unsqueeze(0).expand(
+                    continuous.shape[0], -1
+                )
+            elif quality_distribution_log_probs.ndim == 2:
+                if quality_distribution_log_probs.shape != (
+                    continuous.shape[0],
+                    ALPHABET_SIZE,
+                ):
+                    raise ValueError(
+                        "quality_distribution_log_probs must have shape [batch, 95]"
+                    )
+                expanded_quality_distribution = quality_distribution_log_probs
+            else:
+                raise ValueError(
+                    "quality_distribution_log_probs must have shape [95] or [batch, 95]"
+                )
+            quality_distribution_context = self.quality_distribution_encoder(
+                expanded_quality_distribution
+            )
+            pieces.append(
+                quality_distribution_context.unsqueeze(1).expand(
+                    -1, continuous.shape[1], -1
+                )
+            )
         x = self.input_projection(torch.cat(pieces, dim=-1))
         x = x + self._position_encoding(x)
 
@@ -1342,6 +1506,12 @@ class ResidualTransformer(nn.Module):
                 mask=self._attention_mask(x.shape[1], x.device),
             )
         output_logits = self.output_head(out)
+        if self.quality_distribution_prior:
+            assert expanded_quality_distribution is not None
+            bounded_delta = self.quality_delta_limit * torch.tanh(
+                output_logits / self.quality_delta_limit
+            )
+            return expanded_quality_distribution.unsqueeze(1) + bounded_delta
         if self.output_parameterization == LOG_P0_PLUS_DELTA:
             log_p0_r = continuous[..., :RESIDUAL_CLASSES]
             return log_p0_r + output_logits
@@ -1419,6 +1589,21 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransform
         base_conv_channels=int(config.get("base_conv_channels", 0)),
         base_context_dim=int(config.get("base_context_dim", 0)),
         platform_embed_dim=int(config.get("platform_embed_dim", 0)),
+        quality_distribution_prior=bool(
+            config.get("quality_distribution_prior", False)
+        ),
+        quality_distribution_embed_dim=int(
+            config.get("quality_distribution_embed_dim", 0)
+        ),
+        quality_distribution_hidden_dim=int(
+            config.get(
+                "quality_distribution_hidden_dim",
+                DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM,
+            )
+        ),
+        quality_delta_limit=float(
+            config.get("quality_delta_limit", DEFAULT_QUALITY_DELTA_LIMIT)
+        ),
         d_model=int(config["d_model"]),
         num_heads=int(config["num_heads"]),
         num_layers=int(config["num_layers"]),

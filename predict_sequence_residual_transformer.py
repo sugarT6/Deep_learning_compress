@@ -25,7 +25,9 @@ from sequence_residual_transformer_model import (
     PLATFORM_COUNT,
     PLATFORM_TO_ID,
     QHAT_ONLY,
+    QUALITY_DISTRIBUTION_ADD_ALPHA,
     QUALITY_TARGET,
+    QualityDistributionInfo,
     RESIDUAL_MIN,
     RESIDUAL_TARGET,
     base_sidecar_path_for_h5,
@@ -33,9 +35,11 @@ from sequence_residual_transformer_model import (
     discover_h5_files,
     inspect_h5,
     inspect_base_sidecar,
+    inspect_quality_distribution,
     iter_read_batches,
     load_checkpoint,
     mask_invalid_residual_logits,
+    quality_distribution_bits_for_batch,
 )
 
 
@@ -125,6 +129,7 @@ def evaluate_file(
     mer_params: dict[str, object],
     base_sidecar_path: Path | None,
     platform_id: int | None = None,
+    quality_distribution: QualityDistributionInfo | None = None,
 ) -> dict[str, float | int | str]:
     # 预测阶段按压缩目标评估真实 quality（或历史 residual checkpoint）
     # 在模型分布下的 -log2 概率。
@@ -133,7 +138,13 @@ def evaluate_file(
     total_symbols = 0
     baseline_bits = 0.0
     zero_true_freq = 0
+    quality_histogram_bits = 0.0
     prediction_target = str(mer_params["prediction_target"])
+    quality_distribution_log_probs = (
+        torch.from_numpy(quality_distribution.log_probabilities).to(device)
+        if quality_distribution is not None
+        else None
+    )
 
     model.eval()
     if device.type == "cuda":
@@ -167,6 +178,7 @@ def evaluate_file(
             rmer_tokens=tensors["rmer_tokens"],
             base_ids=tensors["base_ids"],
             platform_id=batch_platform_id,
+            quality_distribution_log_probs=quality_distribution_log_probs,
             lengths=tensors["lengths"],
         )
         if prediction_target == RESIDUAL_TARGET:
@@ -181,6 +193,11 @@ def evaluate_file(
         total_symbols += batch.total_symbols
         baseline_bits += batch.baseline_bits
         zero_true_freq += batch.zero_true_freq
+        if quality_distribution is not None:
+            quality_histogram_bits += quality_distribution_bits_for_batch(
+                batch,
+                quality_distribution.log_probabilities,
+            )
 
     if total_symbols == 0:
         raise ValueError(f"{path}: evaluation split produced zero symbols")
@@ -192,7 +209,7 @@ def evaluate_file(
     model_total_bits = total_nats / math.log(2.0)
     model_avg_bits = model_total_bits / total_symbols
     h5_avg_bits = baseline_bits / total_symbols
-    return {
+    metrics: dict[str, float | int | str] = {
         "file": str(path),
         "total_symbols": total_symbols,
         "model_total_bits": model_total_bits,
@@ -204,6 +221,16 @@ def evaluate_file(
         "zero_true_freq": zero_true_freq,
         "elapsed_seconds": elapsed_seconds,
     }
+    if quality_distribution is not None:
+        metrics.update(
+            {
+                "quality_histogram_total_bits": quality_histogram_bits,
+                "quality_histogram_avg_bits_per_quality": (
+                    quality_histogram_bits / total_symbols
+                ),
+            }
+        )
+    return metrics
 
 
 @torch.no_grad()
@@ -218,6 +245,7 @@ def write_prediction_samples(
     mer_params: dict[str, object],
     base_sidecar_path: Path | None,
     platform_id: int | None = None,
+    quality_distribution: QualityDistributionInfo | None = None,
 ) -> None:
     """Write position-level examples from the first sample_reads reads."""
 
@@ -241,6 +269,11 @@ def write_prediction_samples(
         device,
     )
     prediction_target = str(mer_params["prediction_target"])
+    quality_distribution_log_probs = (
+        torch.from_numpy(quality_distribution.log_probabilities).to(device)
+        if quality_distribution is not None
+        else None
+    )
     logits = model(
         continuous=tensors["continuous"],
         q_hat=tensors["q_hat"],
@@ -252,6 +285,7 @@ def write_prediction_samples(
         rmer_tokens=tensors["rmer_tokens"],
         base_ids=tensors["base_ids"],
         platform_id=batch_platform_id,
+        quality_distribution_log_probs=quality_distribution_log_probs,
         lengths=tensors["lengths"],
     )
     if prediction_target == RESIDUAL_TARGET:
@@ -342,6 +376,7 @@ def write_quality_probability_log(
     mer_params: dict[str, object],
     base_sidecar_dir: Path | None,
     platform_ids_by_file: dict[str, int] | None = None,
+    quality_distributions_by_file: dict[Path, QualityDistributionInfo] | None = None,
 ) -> int:
     """Write compact predicted quality/probability rows.
 
@@ -362,6 +397,15 @@ def write_quality_probability_log(
         for path in files:
             if rows_written >= rows_to_write:
                 break
+            quality_distribution_log_probs = (
+                torch.from_numpy(
+                    quality_distributions_by_file[
+                        path.resolve()
+                    ].log_probabilities
+                ).to(device)
+                if quality_distributions_by_file is not None
+                else None
+            )
 
             # 为了得到“预测部分结果日志”，这里从指定 split 的开头顺序取样。
             # 默认 rows_to_write=1000，避免日志过大。
@@ -399,6 +443,7 @@ def write_quality_probability_log(
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
                     platform_id=batch_platform_id,
+                    quality_distribution_log_probs=quality_distribution_log_probs,
                     lengths=tensors["lengths"],
                 )
                 if prediction_target == RESIDUAL_TARGET:
@@ -559,6 +604,25 @@ def main() -> int:
     # checkpoint 里保存了模型结构参数，所以预测时只需要传 best.pt。
     model, config = load_checkpoint(args.checkpoint, device)
     mer_params = mer_params_from_config(config)
+    uses_quality_distribution_prior = bool(
+        config.get("quality_distribution_prior", False)
+    )
+    quality_distributions_by_file = (
+        {
+            path.resolve(): inspect_quality_distribution(
+                path,
+                add_alpha=float(
+                    config.get(
+                        "quality_distribution_add_alpha",
+                        QUALITY_DISTRIBUTION_ADD_ALPHA,
+                    )
+                ),
+            )
+            for path in files
+        }
+        if uses_quality_distribution_prior
+        else None
+    )
     try:
         platform_ids_by_file = (
             {path.name: platform_id_for_file(config, path) for path in files}
@@ -604,11 +668,24 @@ def main() -> int:
                 if platform_ids_by_file is not None
                 else None
             ),
+            quality_distribution=(
+                quality_distributions_by_file[path.resolve()]
+                if quality_distributions_by_file is not None
+                else None
+            ),
         )
         rows.append(metric)
+        histogram_text = (
+            "hist_bits={:.4f} ".format(
+                metric["quality_histogram_avg_bits_per_quality"]
+            )
+            if uses_quality_distribution_prior
+            else ""
+        )
         print(
             f"{path.name}: model_bits={metric['model_avg_bits_per_quality']:.4f} "
             f"h5_bits={metric['h5_baseline_avg_bits_per_quality']:.4f} "
+            f"{histogram_text}"
             f"delta={metric['delta_bits']:.4f} "
             f"rel_improve={metric['relative_improvement']:.4%} "
             f"symbols={metric['total_symbols']} "
@@ -625,30 +702,57 @@ def main() -> int:
             "model_avg_bits_per_quality",
             "h5_baseline_total_bits",
             "h5_baseline_avg_bits_per_quality",
-            "delta_bits",
-            "relative_improvement",
-            "zero_true_freq",
-            "elapsed_seconds",
         ]
+        if uses_quality_distribution_prior:
+            fieldnames.extend(
+                [
+                    "quality_histogram_total_bits",
+                    "quality_histogram_avg_bits_per_quality",
+                    "quality_distribution_header_bits_included",
+                ]
+            )
+        fieldnames.extend(
+            [
+                "delta_bits",
+                "relative_improvement",
+                "zero_true_freq",
+                "elapsed_seconds",
+            ]
+        )
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow(
-                {
-                    "file": row["file"],
-                    "total_symbols": row["total_symbols"],
-                    "model_total_bits": fmt4(float(row["model_total_bits"])),
-                    "model_avg_bits_per_quality": fmt4(float(row["model_avg_bits_per_quality"])),
-                    "h5_baseline_total_bits": fmt4(float(row["h5_baseline_total_bits"])),
-                    "h5_baseline_avg_bits_per_quality": fmt4(
-                        float(row["h5_baseline_avg_bits_per_quality"])
-                    ),
-                    "delta_bits": fmt4(float(row["delta_bits"])),
-                    "relative_improvement": fmt4(float(row["relative_improvement"])),
-                    "zero_true_freq": row["zero_true_freq"],
-                    "elapsed_seconds": fmt4(float(row["elapsed_seconds"])),
-                }
-            )
+            output_row = {
+                "file": row["file"],
+                "total_symbols": row["total_symbols"],
+                "model_total_bits": fmt4(float(row["model_total_bits"])),
+                "model_avg_bits_per_quality": fmt4(
+                    float(row["model_avg_bits_per_quality"])
+                ),
+                "h5_baseline_total_bits": fmt4(
+                    float(row["h5_baseline_total_bits"])
+                ),
+                "h5_baseline_avg_bits_per_quality": fmt4(
+                    float(row["h5_baseline_avg_bits_per_quality"])
+                ),
+                "delta_bits": fmt4(float(row["delta_bits"])),
+                "relative_improvement": fmt4(float(row["relative_improvement"])),
+                "zero_true_freq": row["zero_true_freq"],
+                "elapsed_seconds": fmt4(float(row["elapsed_seconds"])),
+            }
+            if uses_quality_distribution_prior:
+                output_row.update(
+                    {
+                        "quality_histogram_total_bits": fmt4(
+                            float(row["quality_histogram_total_bits"])
+                        ),
+                        "quality_histogram_avg_bits_per_quality": fmt4(
+                            float(row["quality_histogram_avg_bits_per_quality"])
+                        ),
+                        "quality_distribution_header_bits_included": False,
+                    }
+                )
+            writer.writerow(output_row)
 
     if args.sample_predictions is not None:
         write_prediction_samples(
@@ -670,6 +774,11 @@ def main() -> int:
                 if platform_ids_by_file is not None
                 else None
             ),
+            quality_distribution=(
+                quality_distributions_by_file[files[0].resolve()]
+                if quality_distributions_by_file is not None
+                else None
+            ),
         )
 
     quality_log_rows = 0
@@ -686,6 +795,7 @@ def main() -> int:
             mer_params=mer_params,
             base_sidecar_dir=base_sidecar_dir if uses_base_context else None,
             platform_ids_by_file=platform_ids_by_file,
+            quality_distributions_by_file=quality_distributions_by_file,
         )
 
     total_elapsed_seconds = sum(float(row["elapsed_seconds"]) for row in rows)

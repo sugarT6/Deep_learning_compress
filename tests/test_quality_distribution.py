@@ -34,7 +34,7 @@ class QualityDistributionTest(unittest.TestCase):
         counts = np.zeros(95, dtype=np.int64)
         counts[:6] = 1
 
-        output = format_quality_distribution(counts)
+        output = format_quality_distribution(counts, entries_per_line=5)
 
         self.assertEqual(
             output,

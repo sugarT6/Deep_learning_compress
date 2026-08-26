@@ -300,6 +300,127 @@ python query_quality_distribution.py \
   data/h5/subset_HG002_1.fq.gz.qual_model.h5
 ```
 
+### File-quality-distribution prior with bounded neural correction
+
+The optional `--quality-distribution-prior` mode computes one full-body true
+quality histogram per HDF5 file, applies add-one smoothing, and caches its 95
+natural-log probabilities. A `95 -> 64 -> 32` MLP supplies a file-level
+distribution embedding to every position. The zero-initialized output head
+predicts a bounded correction:
+
+```text
+delta = 4 * tanh(raw_delta / 4)
+final_logits = log(file_quality_distribution) + delta
+```
+
+Thus every delta logit is in `[-4, 4]`, and an untrained model exactly
+reproduces the add-one-smoothed file histogram. Training and prediction report
+the histogram-only bits as a separate reference. The distribution is assumed
+to be transmitted in a future file header; its header cost is not included in
+the current body-quality metrics.
+
+The following runs repeat the three instrument-transfer experiments with the
+distribution prior. Each two-file training group retains 1300 steps per epoch.
+
+```bash
+# Terminal/GPU 0: NovaSeq only
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  --datasets novaseq \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 1300 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 \
+  --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/instrument_transfer_qdistprior_c4_20260826/novaseq_only
+
+# Terminal/GPU 1: DNBSEQ-T7 only
+CUDA_VISIBLE_DEVICES=1 python train_sequence_residual_transformer.py \
+  --datasets dnbseq_t7 \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 1300 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 \
+  --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/instrument_transfer_qdistprior_c4_20260826/dnbseq_t7_only
+
+# Terminal/GPU 2: MGISEQ-2000 only
+CUDA_VISIBLE_DEVICES=2 python train_sequence_residual_transformer.py \
+  --datasets mgiseq2000 \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 1300 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 \
+  --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/instrument_transfer_qdistprior_c4_20260826/mgiseq2000_only
+```
+
+Evaluate each checkpoint on both its own instrument and the transfer target:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
+  runs/instrument_transfer_qdistprior_c4_20260826/novaseq_only/best.pt \
+  --datasets novaseq,nextseq2000 \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/instrument_transfer_qdistprior_c4_20260826/novaseq_only/predict_novaseq_nextseq2000_test.csv
+
+CUDA_VISIBLE_DEVICES=1 python predict_sequence_residual_transformer.py \
+  runs/instrument_transfer_qdistprior_c4_20260826/dnbseq_t7_only/best.pt \
+  --datasets dnbseq_t7,mgiseq2000 \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/instrument_transfer_qdistprior_c4_20260826/dnbseq_t7_only/predict_dnbseq_t7_mgiseq2000_test.csv
+
+CUDA_VISIBLE_DEVICES=2 python predict_sequence_residual_transformer.py \
+  runs/instrument_transfer_qdistprior_c4_20260826/mgiseq2000_only/best.pt \
+  --datasets mgiseq2000,dnbseq_t7 \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/instrument_transfer_qdistprior_c4_20260826/mgiseq2000_only/predict_mgiseq2000_dnbseq_t7_test.csv
+```
+
 Missing history at the start of a read uses BOS tokens. Q/R-mer tokens use the
 same bucket definitions, causal history construction, stride-1 hashing, and
 default vocabulary size 4096 as the stage-3 Q/R-mer experiment. No token

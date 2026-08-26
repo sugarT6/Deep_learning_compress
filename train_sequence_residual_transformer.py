@@ -27,6 +27,9 @@ from sequence_residual_transformer_model import (
     DEFAULT_MER_VOCAB_SIZE,
     DEFAULT_PRIOR_FEATURE_MODE,
     DEFAULT_PREDICTION_TARGET,
+    DEFAULT_QUALITY_DELTA_LIMIT,
+    DEFAULT_QUALITY_DISTRIBUTION_EMBED_DIM,
+    DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM,
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
     DIRECT_LOGITS,
@@ -39,6 +42,8 @@ from sequence_residual_transformer_model import (
     PREDICTION_TARGETS,
     PRIOR_FEATURE_MODES,
     QUALITY_TARGET,
+    QUALITY_DISTRIBUTION_ADD_ALPHA,
+    QualityDistributionInfo,
     RESIDUAL_TARGET,
     ContiguousReadBatchSampler,
     ResidualTransformer,
@@ -48,9 +53,11 @@ from sequence_residual_transformer_model import (
     discover_h5_files,
     inspect_h5,
     inspect_base_sidecar,
+    inspect_quality_distribution,
     iter_read_batches,
     mask_invalid_residual_logits,
     prediction_output_dim,
+    quality_distribution_bits_for_batch,
     save_json,
 )
 
@@ -145,6 +152,7 @@ def evaluate_model(
     prior_feature_mode: str,
     prediction_target: str,
     platform_by_file: dict[str, str] | None = None,
+    quality_distributions_by_file: dict[Path, QualityDistributionInfo] | None = None,
 ) -> dict[str, float]:
     """Evaluate compression metrics on a deterministic read split."""
 
@@ -157,8 +165,19 @@ def evaluate_model(
     total_symbols = 0
     baseline_bits = 0.0
     zero_true_freq = 0
+    quality_histogram_bits = 0.0
 
     for path in files:
+        quality_distribution = (
+            quality_distributions_by_file[path.resolve()]
+            if quality_distributions_by_file is not None
+            else None
+        )
+        quality_distribution_log_probs = (
+            torch.from_numpy(quality_distribution.log_probabilities).to(device)
+            if quality_distribution is not None
+            else None
+        )
         # 验证/测试按 read 顺序遍历，不随机采样，保证指标稳定可复现。
         for batch in iter_read_batches(
             path=path,
@@ -197,6 +216,7 @@ def evaluate_model(
                 rmer_tokens=tensors["rmer_tokens"],
                 base_ids=tensors["base_ids"],
                 platform_id=platform_id,
+                quality_distribution_log_probs=quality_distribution_log_probs,
                 lengths=tensors["lengths"],
             )
             if prediction_target == RESIDUAL_TARGET:
@@ -212,6 +232,11 @@ def evaluate_model(
             total_symbols += batch.total_symbols
             baseline_bits += batch.baseline_bits
             zero_true_freq += batch.zero_true_freq
+            if quality_distribution is not None:
+                quality_histogram_bits += quality_distribution_bits_for_batch(
+                    batch,
+                    quality_distribution.log_probabilities,
+                )
 
     if total_symbols == 0:
         raise ValueError("evaluation split produced zero symbols")
@@ -220,7 +245,7 @@ def evaluate_model(
     model_total_bits = total_nats / math.log(2.0)
     model_avg_bits = model_total_bits / total_symbols
     h5_avg_bits = baseline_bits / total_symbols
-    return {
+    metrics = {
         "total_symbols": float(total_symbols),
         "model_total_bits": model_total_bits,
         "model_avg_bits_per_quality": model_avg_bits,
@@ -230,6 +255,16 @@ def evaluate_model(
         "relative_improvement": (h5_avg_bits - model_avg_bits) / h5_avg_bits,
         "zero_true_freq": float(zero_true_freq),
     }
+    if quality_distributions_by_file is not None:
+        metrics.update(
+            {
+                "quality_histogram_total_bits": quality_histogram_bits,
+                "quality_histogram_avg_bits_per_quality": (
+                    quality_histogram_bits / total_symbols
+                ),
+            }
+        )
+    return metrics
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -357,6 +392,30 @@ def build_parser() -> argparse.ArgumentParser:
             "BGISEQ, Illumina, and IonTorrent"
         ),
     )
+    parser.add_argument(
+        "--quality-distribution-prior",
+        action="store_true",
+        help=(
+            "condition on each H5 file's add-one-smoothed true-quality histogram "
+            "and predict a bounded logit correction"
+        ),
+    )
+    parser.add_argument(
+        "--quality-distribution-embed-dim",
+        type=int,
+        default=DEFAULT_QUALITY_DISTRIBUTION_EMBED_DIM,
+    )
+    parser.add_argument(
+        "--quality-distribution-hidden-dim",
+        type=int,
+        default=DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM,
+    )
+    parser.add_argument(
+        "--quality-delta-limit",
+        type=float,
+        default=DEFAULT_QUALITY_DELTA_LIMIT,
+        help="absolute tanh bound for histogram-prior delta logits; default: 4",
+    )
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=4)
@@ -429,6 +488,21 @@ def main() -> int:
         raise SystemExit(
             "--platform-embed-dim and --platform-map must be enabled together"
         )
+    if args.quality_distribution_prior:
+        if args.prediction_target != QUALITY_TARGET:
+            raise SystemExit(
+                "--quality-distribution-prior requires --prediction-target quality"
+            )
+        if args.output_parameterization != DIRECT_LOGITS:
+            raise SystemExit(
+                "--quality-distribution-prior requires direct_logits output"
+            )
+        if args.quality_distribution_embed_dim <= 0:
+            raise SystemExit("--quality-distribution-embed-dim must be positive")
+        if args.quality_distribution_hidden_dim <= 0:
+            raise SystemExit("--quality-distribution-hidden-dim must be positive")
+        if args.quality_delta_limit <= 0.0:
+            raise SystemExit("--quality-delta-limit must be positive")
     if not args.base_conv_kernels or any(
         kernel <= 0 or kernel % 2 == 0 for kernel in args.base_conv_kernels
     ):
@@ -474,6 +548,17 @@ def main() -> int:
     for info in infos:
         if info.alphabet_size != 95:
             raise SystemExit(f"{info.path}: expected alphabet size 95, got {info.alphabet_size}")
+    quality_distributions_by_file = (
+        {
+            path.resolve(): inspect_quality_distribution(
+                path,
+                add_alpha=QUALITY_DISTRIBUTION_ADD_ALPHA,
+            )
+            for path in files
+        }
+        if args.quality_distribution_prior
+        else None
+    )
     base_infos = [
         inspect_base_sidecar(
             path,
@@ -496,6 +581,8 @@ def main() -> int:
         model_type = f"causal_transformer_{args.prior_feature_mode}_direct_residual_base_conv"
     if platform_by_file is not None:
         model_type += "_platform"
+    if args.quality_distribution_prior:
+        model_type += "_quality_distribution_prior"
     config = {
         "model_type": model_type,
         "prediction_target": args.prediction_target,
@@ -520,6 +607,32 @@ def main() -> int:
         "uses_residual_history": True,
         "uses_base_context": True,
         "uses_platform_embedding": platform_by_file is not None,
+        "quality_distribution_prior": args.quality_distribution_prior,
+        "quality_distribution_scope": (
+            "full_h5_body_per_file" if args.quality_distribution_prior else "disabled"
+        ),
+        "quality_distribution_add_alpha": QUALITY_DISTRIBUTION_ADD_ALPHA,
+        "quality_distribution_embed_dim": (
+            args.quality_distribution_embed_dim
+            if args.quality_distribution_prior
+            else 0
+        ),
+        "quality_distribution_hidden_dim": args.quality_distribution_hidden_dim,
+        "quality_delta_limit": args.quality_delta_limit,
+        "quality_delta_transform": (
+            "limit*tanh(raw_delta/limit)"
+            if args.quality_distribution_prior
+            else "disabled"
+        ),
+        "quality_distribution_header_bits_included": False,
+        "quality_distribution_counts_by_file": (
+            {
+                str(path): quality_distributions_by_file[path.resolve()].counts.tolist()
+                for path in files
+            }
+            if quality_distributions_by_file is not None
+            else {}
+        ),
         "platform_names": list(PLATFORM_NAMES),
         "platform_by_file": platform_by_file or {},
         "platform_id_by_file": (
@@ -624,6 +737,14 @@ def main() -> int:
         base_conv_channels=args.base_conv_channels,
         base_context_dim=args.base_context_dim,
         platform_embed_dim=args.platform_embed_dim,
+        quality_distribution_prior=args.quality_distribution_prior,
+        quality_distribution_embed_dim=(
+            args.quality_distribution_embed_dim
+            if args.quality_distribution_prior
+            else 0
+        ),
+        quality_distribution_hidden_dim=args.quality_distribution_hidden_dim,
+        quality_delta_limit=args.quality_delta_limit,
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
@@ -639,29 +760,49 @@ def main() -> int:
         torch.cuda.reset_peak_memory_stats(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TARGET)
+    quality_distribution_tensors_by_file = (
+        {
+            path.resolve(): torch.from_numpy(
+                quality_distributions_by_file[path.resolve()].log_probabilities
+            ).to(device)
+            for path in files
+        }
+        if quality_distributions_by_file is not None
+        else None
+    )
 
     log_path = args.output_dir / "train_log.csv"
     best_bits = float("inf")
     started = time.time()
 
     with log_path.open("w", encoding="utf-8", newline="") as log_file:
-        writer = csv.DictWriter(
-            log_file,
-            fieldnames=[
-                "epoch",
-                "train_loss",
-                "train_bits_per_quality",
-                "train_h5_baseline_bits",
+        log_fieldnames = [
+            "epoch",
+            "train_loss",
+            "train_bits_per_quality",
+            "train_h5_baseline_bits",
+        ]
+        if args.quality_distribution_prior:
+            log_fieldnames.append("train_quality_histogram_bits")
+        log_fieldnames.extend(
+            [
                 "val_model_avg_bits_per_quality",
                 "val_h5_baseline_avg_bits_per_quality",
+            ]
+        )
+        if args.quality_distribution_prior:
+            log_fieldnames.append("val_quality_histogram_avg_bits_per_quality")
+        log_fieldnames.extend(
+            [
                 "val_delta_bits",
                 "val_relative_improvement",
                 "val_total_symbols",
                 "val_zero_true_freq",
                 "gpu_peak_memory_bytes",
                 "elapsed_seconds",
-            ],
+            ]
         )
+        writer = csv.DictWriter(log_file, fieldnames=log_fieldnames)
         writer.writeheader()
 
         for epoch in range(1, args.epochs + 1):
@@ -669,6 +810,7 @@ def main() -> int:
             running_nats = 0.0
             running_symbols = 0
             running_baseline_bits = 0.0
+            running_quality_histogram_bits = 0.0
 
             step_iter = range(1, args.steps_per_epoch + 1)
             if tqdm is not None and not args.no_progress:
@@ -693,6 +835,11 @@ def main() -> int:
                     if platform_by_file is not None
                     else None
                 )
+                quality_distribution_log_probs = (
+                    quality_distribution_tensors_by_file[batch_path.resolve()]
+                    if quality_distribution_tensors_by_file is not None
+                    else None
+                )
 
                 optimizer.zero_grad(set_to_none=True)
                 # causal attention 只看当前及历史位置；prev_q/prev_r 已右移，
@@ -706,6 +853,7 @@ def main() -> int:
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
                     platform_id=platform_id,
+                    quality_distribution_log_probs=quality_distribution_log_probs,
                     lengths=tensors["lengths"],
                 )
                 # 直接质量目标的 95 类天然全合法；只有历史 residual 目标
@@ -728,6 +876,13 @@ def main() -> int:
                 running_nats += float(loss.item()) * symbols
                 running_symbols += symbols
                 running_baseline_bits += batch.baseline_bits
+                if quality_distributions_by_file is not None:
+                    running_quality_histogram_bits += quality_distribution_bits_for_batch(
+                        batch,
+                        quality_distributions_by_file[
+                            batch_path.resolve()
+                        ].log_probabilities,
+                    )
 
                 if tqdm is not None and not args.no_progress and step % 10 == 0:
                     train_bits = (running_nats / max(running_symbols, 1)) / math.log(2.0)
@@ -736,6 +891,11 @@ def main() -> int:
             train_avg_bits = (running_nats / running_symbols) / math.log(2.0)
             train_loss = running_nats / running_symbols
             train_baseline_bits = running_baseline_bits / running_symbols
+            train_quality_histogram_bits = (
+                running_quality_histogram_bits / running_symbols
+                if quality_distributions_by_file is not None
+                else None
+            )
 
             # 每个 epoch 后与 H5 baseline 比较 bits，而不是只看分类准确率。
             val = evaluate_model(
@@ -755,6 +915,7 @@ def main() -> int:
                 prior_feature_mode=args.prior_feature_mode,
                 prediction_target=args.prediction_target,
                 platform_by_file=platform_by_file,
+                quality_distributions_by_file=quality_distributions_by_file,
             )
             elapsed = time.time() - started
             row = {
@@ -775,18 +936,34 @@ def main() -> int:
                 ),
                 "elapsed_seconds": fmt4(elapsed),
             }
+            if train_quality_histogram_bits is not None:
+                row["train_quality_histogram_bits"] = fmt4(
+                    train_quality_histogram_bits
+                )
+                row["val_quality_histogram_avg_bits_per_quality"] = fmt4(
+                    val["quality_histogram_avg_bits_per_quality"]
+                )
             writer.writerow(row)
             log_file.flush()
 
+            histogram_text = (
+                " hist_bits={:.4f}".format(
+                    val["quality_histogram_avg_bits_per_quality"]
+                )
+                if quality_distributions_by_file is not None
+                else ""
+            )
             print(
                 "epoch={epoch} loss={loss:.4f} train_bits={train_bits:.4f} "
-                "val_bits={val_bits:.4f} h5_bits={h5_bits:.4f} "
-                "delta={delta:.4f} rel_improve={rel:.4%} symbols={symbols}".format(
+                "val_bits={val_bits:.4f} h5_bits={h5_bits:.4f}"
+                "{histogram_text} delta={delta:.4f} "
+                "rel_improve={rel:.4%} symbols={symbols}".format(
                     epoch=epoch,
                     loss=train_loss,
                     train_bits=train_avg_bits,
                     val_bits=val["model_avg_bits_per_quality"],
                     h5_bits=val["h5_baseline_avg_bits_per_quality"],
+                    histogram_text=histogram_text,
                     delta=val["delta_bits"],
                     rel=val["relative_improvement"],
                     symbols=int(val["total_symbols"]),
