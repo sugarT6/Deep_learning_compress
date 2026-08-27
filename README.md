@@ -64,11 +64,12 @@ available as file/container metadata to both the encoder and decoder.
 ## Registered multi-platform datasets
 
 `dataset_registry.py` keeps dataset selection separate from HDF5 batching. It
-registers four instrument datasets under `data/`:
+registers the following instrument selections under `data/`:
 
 ```text
-novaseq       -> two NovaSeq files, Illumina
-nextseq2000   -> two NextSeq 2000 files, Illumina
+novaseq       -> HG001/HG002/HG003 plus NA12891, Illumina
+novaseq_hg    -> HG001/HG002/HG003 training subset, Illumina
+nextseq2000   -> three NextSeq 2000 files, Illumina
 dnbseq_t7     -> two DNBSEQ-T7 files, BGI/MGI
 mgiseq2000    -> two MGISEQ-2000 files, BGI/MGI
 ```
@@ -92,9 +93,9 @@ Generate and validate the registered base sidecars once:
 python prepare_base_sidecars.py --datasets mixed --data-root data
 ```
 
-The current eight files each contain 250,000 reads. The existing sampler is
+The current eleven unique files each contain 250,000 reads. The existing sampler is
 unchanged: it selects files in proportion to their training-read counts, which
-is exactly uniform across these eight equal-sized files.
+is exactly uniform across equal-sized selected files.
 
 ### Illumina versus BGI/MGI mixing experiment
 
@@ -318,6 +319,46 @@ reproduces the add-one-smoothed file histogram. Training and prediction report
 the histogram-only bits as a separate reference. The distribution is assumed
 to be transmitted in a future file header; its header cost is not included in
 the current body-quality metrics.
+
+### HG001-HG003 NovaSeq-only transfer experiment
+
+The `novaseq_hg` selection contains only HG001, HG002, and HG003 for
+training. The broader `novaseq` evaluation selection additionally includes
+NA12891. `nextseq2000` contains SRR15731087, SRR22228918, and SRR15731080.
+All training files have equal read counts, and 1950 steps preserve the prior
+expected exposure of 650 batches per file per epoch.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  --datasets novaseq_hg \
+  --data-root data \
+  --epochs 15 \
+  --steps-per-epoch 1950 \
+  --batch-reads 64 \
+  --eval-batch-reads 64 \
+  --eval-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --prediction-target quality \
+  --prior-feature-mode qhat_only \
+  --qmer-ks 2,3,4 \
+  --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/base_sidecars \
+  --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits \
+  --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 \
+  --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/instrument_transfer_qdistprior_c4_hg123_20260827/novaseq_only
+
+CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
+  runs/instrument_transfer_qdistprior_c4_hg123_20260827/novaseq_only/best.pt \
+  --datasets novaseq,nextseq2000 \
+  --data-root data \
+  --batch-reads 64 \
+  --base-sidecar-dir data/base_sidecars \
+  --output-csv runs/instrument_transfer_qdistprior_c4_hg123_20260827/novaseq_only/predict_novaseq_nextseq2000_test.csv
+```
 
 The following runs repeat the three instrument-transfer experiments with the
 distribution prior. Each two-file training group retains 1300 steps per epoch.

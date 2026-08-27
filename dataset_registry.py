@@ -42,10 +42,28 @@ DATASETS: dict[str, DatasetSpec] = {
         h5_names=(
             "subset_HG001_1.fq.gz.qual_model.h5",
             "subset_HG002_1.fq.gz.qual_model.h5",
+            "subset_HG003_1.fq.gz.qual_model.h5",
+            "subset_NA12891.novaseq_1.fq.gz.qual_model.h5",
         ),
         fastq_relative_paths=(
             "fq/NovaSeq/subset_HG001_1.fq.gz",
             "fq/NovaSeq/subset_HG002_1.fq.gz",
+            "fq/NovaSeq/subset_HG003_1.fq.gz",
+            "fq/subset_NA12891.novaseq_1.fq.gz",
+        ),
+    ),
+    "novaseq_hg": DatasetSpec(
+        name="novaseq_hg",
+        platform="Illumina",
+        h5_names=(
+            "subset_HG001_1.fq.gz.qual_model.h5",
+            "subset_HG002_1.fq.gz.qual_model.h5",
+            "subset_HG003_1.fq.gz.qual_model.h5",
+        ),
+        fastq_relative_paths=(
+            "fq/NovaSeq/subset_HG001_1.fq.gz",
+            "fq/NovaSeq/subset_HG002_1.fq.gz",
+            "fq/NovaSeq/subset_HG003_1.fq.gz",
         ),
     ),
     "nextseq2000": DatasetSpec(
@@ -54,10 +72,12 @@ DATASETS: dict[str, DatasetSpec] = {
         h5_names=(
             "subset_SRR15731087_1.fq.gz.qual_model.h5",
             "subset_SRR22228918_1.fq.gz.qual_model.h5",
+            "subset_SRR15731080_1.fq.gz.qual_model.h5",
         ),
         fastq_relative_paths=(
             "fq/NextSeq-2000/subset_SRR15731087_1.fq.gz",
             "fq/NextSeq-2000/subset_SRR22228918_1.fq.gz",
+            "fq/NextSeq-2000/subset_SRR15731080_1.fq.gz",
         ),
     ),
     "dnbseq_t7": DatasetSpec(
@@ -95,6 +115,7 @@ DATASET_GROUPS: dict[str, tuple[str, ...]] = {
 
 
 _ALIASES = {
+    "novaseq_train": "novaseq_hg",
     "nextseq_2000": "nextseq2000",
     "dnbseqt7": "dnbseq_t7",
     "dnbseq_t_7": "dnbseq_t7",
