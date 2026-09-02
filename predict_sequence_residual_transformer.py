@@ -21,6 +21,7 @@ from sequence_residual_transformer_model import (
     DEFAULT_MER_VOCAB_SIZE,
     FULL_PRIOR,
     FULL_PRIOR_CONTINUOUS_FEATURE_DIM,
+    H5_ALPHABET_SIZE,
     PAD_TARGET,
     PLATFORM_COUNT,
     PLATFORM_TO_ID,
@@ -66,9 +67,20 @@ def mer_params_from_config(config: dict[str, object]) -> dict[str, object]:
             else QHAT_ONLY
         )
 
+    prediction_target = str(config.get("prediction_target", RESIDUAL_TARGET))
+    quality_alphabet_size = int(
+        config.get(
+            "quality_alphabet_size",
+            config.get("output_dim", H5_ALPHABET_SIZE)
+            if prediction_target == QUALITY_TARGET
+            else H5_ALPHABET_SIZE,
+        )
+    )
+
     return {
         # All checkpoints before this field was introduced predict residuals.
-        "prediction_target": str(config.get("prediction_target", RESIDUAL_TARGET)),
+        "prediction_target": prediction_target,
+        "quality_alphabet_size": quality_alphabet_size,
         "prior_feature_mode": str(prior_feature_mode),
         "exact_q_lags": tuple(int(value) for value in config.get("exact_q_lags", [])),
         "exact_r_lags": tuple(int(value) for value in config.get("exact_r_lags", [])),
@@ -137,6 +149,7 @@ def evaluate_file(
     total_nats = 0.0
     total_symbols = 0
     baseline_bits = 0.0
+    support_matched_baseline_bits = 0.0
     zero_true_freq = 0
     quality_histogram_bits = 0.0
     prediction_target = str(mer_params["prediction_target"])
@@ -192,6 +205,7 @@ def evaluate_file(
         total_nats += float(loss.item())
         total_symbols += batch.total_symbols
         baseline_bits += batch.baseline_bits
+        support_matched_baseline_bits += batch.support_matched_baseline_bits
         zero_true_freq += batch.zero_true_freq
         if quality_distribution is not None:
             quality_histogram_bits += quality_distribution_bits_for_batch(
@@ -209,6 +223,7 @@ def evaluate_file(
     model_total_bits = total_nats / math.log(2.0)
     model_avg_bits = model_total_bits / total_symbols
     h5_avg_bits = baseline_bits / total_symbols
+    h5_support_matched_avg_bits = support_matched_baseline_bits / total_symbols
     metrics: dict[str, float | int | str] = {
         "file": str(path),
         "total_symbols": total_symbols,
@@ -216,8 +231,17 @@ def evaluate_file(
         "model_avg_bits_per_quality": model_avg_bits,
         "h5_baseline_total_bits": baseline_bits,
         "h5_baseline_avg_bits_per_quality": h5_avg_bits,
+        "h5_support_matched_baseline_total_bits": support_matched_baseline_bits,
+        "h5_support_matched_baseline_avg_bits_per_quality": h5_support_matched_avg_bits,
         "delta_bits": model_avg_bits - h5_avg_bits,
         "relative_improvement": (h5_avg_bits - model_avg_bits) / h5_avg_bits,
+        "delta_bits_vs_h5_support_matched": (
+            model_avg_bits - h5_support_matched_avg_bits
+        ),
+        "relative_improvement_vs_h5_support_matched": (
+            (h5_support_matched_avg_bits - model_avg_bits)
+            / h5_support_matched_avg_bits
+        ),
         "zero_true_freq": zero_true_freq,
         "elapsed_seconds": elapsed_seconds,
     }
@@ -314,6 +338,8 @@ def write_prediction_samples(
                 "model_bits",
                 "h5_true_prob",
                 "h5_bits",
+                "h5_support_matched_true_prob",
+                "h5_support_matched_bits",
             ],
         )
         writer.writeheader()
@@ -342,6 +368,9 @@ def write_prediction_samples(
                 # mode it is deliberately not present in model inputs.
                 h5_true_prob = float(first_batch.h5_true_prob[read_idx, pos])
                 h5_log_prob = math.log(max(h5_true_prob, 1e-12))
+                h5_support_matched_true_prob = float(
+                    first_batch.h5_support_matched_true_prob[read_idx, pos]
+                )
 
                 writer.writerow(
                     {
@@ -359,6 +388,12 @@ def write_prediction_samples(
                         "model_bits": fmt4(-math.log2(max(model_true_prob, 1e-300))),
                         "h5_true_prob": fmt4(h5_true_prob),
                         "h5_bits": fmt4(-h5_log_prob / math.log(2.0)),
+                        "h5_support_matched_true_prob": fmt4(
+                            h5_support_matched_true_prob
+                        ),
+                        "h5_support_matched_bits": fmt4(
+                            -math.log2(max(h5_support_matched_true_prob, 1e-300))
+                        ),
                     }
                 )
 
@@ -598,8 +633,11 @@ def main() -> int:
     else:
         files = discover_h5_files(args.inputs or [Path("h5")])
     for info in [inspect_h5(path) for path in files]:
-        if info.alphabet_size != 95:
-            raise SystemExit(f"{info.path}: expected alphabet size 95, got {info.alphabet_size}")
+        if info.alphabet_size != H5_ALPHABET_SIZE:
+            raise SystemExit(
+                f"{info.path}: expected H5 alphabet size {H5_ALPHABET_SIZE}, "
+                f"got {info.alphabet_size}"
+            )
 
     # checkpoint 里保存了模型结构参数，所以预测时只需要传 best.pt。
     model, config = load_checkpoint(args.checkpoint, device)
@@ -607,10 +645,11 @@ def main() -> int:
     uses_quality_distribution_prior = bool(
         config.get("quality_distribution_prior", False)
     )
-    quality_distributions_by_file = (
-        {
+    try:
+        inspected_quality_distributions = {
             path.resolve(): inspect_quality_distribution(
                 path,
+                quality_alphabet_size=int(mer_params["quality_alphabet_size"]),
                 add_alpha=float(
                     config.get(
                         "quality_distribution_add_alpha",
@@ -620,6 +659,10 @@ def main() -> int:
             )
             for path in files
         }
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    quality_distributions_by_file = (
+        inspected_quality_distributions
         if uses_quality_distribution_prior
         else None
     )
@@ -685,6 +728,8 @@ def main() -> int:
         print(
             f"{path.name}: model_bits={metric['model_avg_bits_per_quality']:.4f} "
             f"h5_bits={metric['h5_baseline_avg_bits_per_quality']:.4f} "
+            "h5_support_bits="
+            f"{metric['h5_support_matched_baseline_avg_bits_per_quality']:.4f} "
             f"{histogram_text}"
             f"delta={metric['delta_bits']:.4f} "
             f"rel_improve={metric['relative_improvement']:.4%} "
@@ -702,6 +747,8 @@ def main() -> int:
             "model_avg_bits_per_quality",
             "h5_baseline_total_bits",
             "h5_baseline_avg_bits_per_quality",
+            "h5_support_matched_baseline_total_bits",
+            "h5_support_matched_baseline_avg_bits_per_quality",
         ]
         if uses_quality_distribution_prior:
             fieldnames.extend(
@@ -715,6 +762,8 @@ def main() -> int:
             [
                 "delta_bits",
                 "relative_improvement",
+                "delta_bits_vs_h5_support_matched",
+                "relative_improvement_vs_h5_support_matched",
                 "zero_true_freq",
                 "elapsed_seconds",
             ]
@@ -735,8 +784,20 @@ def main() -> int:
                 "h5_baseline_avg_bits_per_quality": fmt4(
                     float(row["h5_baseline_avg_bits_per_quality"])
                 ),
+                "h5_support_matched_baseline_total_bits": fmt4(
+                    float(row["h5_support_matched_baseline_total_bits"])
+                ),
+                "h5_support_matched_baseline_avg_bits_per_quality": fmt4(
+                    float(row["h5_support_matched_baseline_avg_bits_per_quality"])
+                ),
                 "delta_bits": fmt4(float(row["delta_bits"])),
                 "relative_improvement": fmt4(float(row["relative_improvement"])),
+                "delta_bits_vs_h5_support_matched": fmt4(
+                    float(row["delta_bits_vs_h5_support_matched"])
+                ),
+                "relative_improvement_vs_h5_support_matched": fmt4(
+                    float(row["relative_improvement_vs_h5_support_matched"])
+                ),
                 "zero_true_freq": row["zero_true_freq"],
                 "elapsed_seconds": fmt4(float(row["elapsed_seconds"])),
             }

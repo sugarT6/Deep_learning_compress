@@ -27,6 +27,7 @@ from sequence_residual_transformer_model import (
     DEFAULT_MER_VOCAB_SIZE,
     DEFAULT_PRIOR_FEATURE_MODE,
     DEFAULT_PREDICTION_TARGET,
+    DEFAULT_QUALITY_ALPHABET_SIZE,
     DEFAULT_QUALITY_DELTA_LIMIT,
     DEFAULT_QUALITY_DISTRIBUTION_EMBED_DIM,
     DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM,
@@ -34,6 +35,7 @@ from sequence_residual_transformer_model import (
     DEFAULT_RMER_KS,
     DIRECT_LOGITS,
     FULL_PRIOR,
+    H5_ALPHABET_SIZE,
     LOG_P0_PLUS_DELTA,
     OUTPUT_PARAMETERIZATIONS,
     PAD_TARGET,
@@ -151,6 +153,7 @@ def evaluate_model(
     base_sidecar_dir: Path,
     prior_feature_mode: str,
     prediction_target: str,
+    quality_alphabet_size: int,
     platform_by_file: dict[str, str] | None = None,
     quality_distributions_by_file: dict[Path, QualityDistributionInfo] | None = None,
 ) -> dict[str, float]:
@@ -164,6 +167,7 @@ def evaluate_model(
     total_nats = 0.0
     total_symbols = 0
     baseline_bits = 0.0
+    support_matched_baseline_bits = 0.0
     zero_true_freq = 0
     quality_histogram_bits = 0.0
 
@@ -193,6 +197,7 @@ def evaluate_model(
             rmer_vocab_size=rmer_vocab_size,
             prior_feature_mode=prior_feature_mode,
             prediction_target=prediction_target,
+            quality_alphabet_size=quality_alphabet_size,
         ):
             tensors = batch_to_torch(batch, device)
             platform_id = (
@@ -205,7 +210,7 @@ def evaluate_model(
                 if platform_by_file is not None
                 else None
             )
-            # 模型输出当前实验的 95 个 quality 类别；旧 residual checkpoint
+            # 模型输出checkpoint配置的body-quality类别；旧 residual checkpoint
             # 仍可通过 prediction_target=residual 使用 189 类。
             logits = model(
                 continuous=tensors["continuous"],
@@ -231,6 +236,7 @@ def evaluate_model(
             total_nats += float(loss.item())
             total_symbols += batch.total_symbols
             baseline_bits += batch.baseline_bits
+            support_matched_baseline_bits += batch.support_matched_baseline_bits
             zero_true_freq += batch.zero_true_freq
             if quality_distribution is not None:
                 quality_histogram_bits += quality_distribution_bits_for_batch(
@@ -245,14 +251,24 @@ def evaluate_model(
     model_total_bits = total_nats / math.log(2.0)
     model_avg_bits = model_total_bits / total_symbols
     h5_avg_bits = baseline_bits / total_symbols
+    h5_support_matched_avg_bits = support_matched_baseline_bits / total_symbols
     metrics = {
         "total_symbols": float(total_symbols),
         "model_total_bits": model_total_bits,
         "model_avg_bits_per_quality": model_avg_bits,
         "h5_baseline_total_bits": baseline_bits,
         "h5_baseline_avg_bits_per_quality": h5_avg_bits,
+        "h5_support_matched_baseline_total_bits": support_matched_baseline_bits,
+        "h5_support_matched_baseline_avg_bits_per_quality": h5_support_matched_avg_bits,
         "delta_bits": model_avg_bits - h5_avg_bits,
         "relative_improvement": (h5_avg_bits - model_avg_bits) / h5_avg_bits,
+        "delta_bits_vs_h5_support_matched": (
+            model_avg_bits - h5_support_matched_avg_bits
+        ),
+        "relative_improvement_vs_h5_support_matched": (
+            (h5_support_matched_avg_bits - model_avg_bits)
+            / h5_support_matched_avg_bits
+        ),
         "zero_true_freq": float(zero_true_freq),
     }
     if quality_distributions_by_file is not None:
@@ -316,7 +332,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--prediction-target",
         choices=PREDICTION_TARGETS,
         default=DEFAULT_PREDICTION_TARGET,
-        help="predict the 95-class quality id (default) or historical 189-class residual",
+        help="predict the body quality id (default) or historical 189-class residual",
+    )
+    parser.add_argument(
+        "--quality-alphabet-size",
+        type=int,
+        default=DEFAULT_QUALITY_ALPHABET_SIZE,
+        help=(
+            "number of direct body-quality classes starting at Q0; default: "
+            f"{DEFAULT_QUALITY_ALPHABET_SIZE} (Q0..Q{DEFAULT_QUALITY_ALPHABET_SIZE - 1})"
+        ),
     )
     parser.add_argument(
         "--prior-feature-mode",
@@ -456,6 +481,10 @@ def main() -> int:
         raise SystemExit("--batch-reads and --eval-batch-reads must be positive")
     if args.eval_max_reads_per_file is not None and args.eval_max_reads_per_file < 0:
         raise SystemExit("--eval-max-reads-per-file must be >= 0")
+    if not 1 <= args.quality_alphabet_size <= H5_ALPHABET_SIZE:
+        raise SystemExit(
+            f"--quality-alphabet-size must be in [1, {H5_ALPHABET_SIZE}]"
+        )
     if args.num_layers <= 0:
         raise SystemExit("--num-layers must be positive")
     if args.d_model <= 0 or args.num_heads <= 0 or args.d_model % args.num_heads != 0:
@@ -507,6 +536,11 @@ def main() -> int:
         kernel <= 0 or kernel % 2 == 0 for kernel in args.base_conv_kernels
     ):
         raise SystemExit("--base-conv-kernels must contain positive odd integers")
+    selected_quality_alphabet_size = (
+        args.quality_alphabet_size
+        if args.prediction_target == QUALITY_TARGET
+        else H5_ALPHABET_SIZE
+    )
 
     # 固定随机种子，方便比较不同模型/参数的实验结果。
     torch.manual_seed(args.seed)
@@ -546,16 +580,24 @@ def main() -> int:
         raise SystemExit(str(exc)) from exc
     infos = [inspect_h5(path) for path in files]
     for info in infos:
-        if info.alphabet_size != 95:
-            raise SystemExit(f"{info.path}: expected alphabet size 95, got {info.alphabet_size}")
-    quality_distributions_by_file = (
-        {
+        if info.alphabet_size != H5_ALPHABET_SIZE:
+            raise SystemExit(
+                f"{info.path}: expected H5 alphabet size {H5_ALPHABET_SIZE}, "
+                f"got {info.alphabet_size}"
+            )
+    try:
+        inspected_quality_distributions = {
             path.resolve(): inspect_quality_distribution(
                 path,
+                quality_alphabet_size=selected_quality_alphabet_size,
                 add_alpha=QUALITY_DISTRIBUTION_ADD_ALPHA,
             )
             for path in files
         }
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    quality_distributions_by_file = (
+        inspected_quality_distributions
         if args.quality_distribution_prior
         else None
     )
@@ -570,7 +612,10 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     eval_limit = None if args.eval_max_reads_per_file == 0 else args.eval_max_reads_per_file
     selected_continuous_dim = continuous_feature_dim(args.prior_feature_mode)
-    selected_output_dim = prediction_output_dim(args.prediction_target)
+    selected_output_dim = prediction_output_dim(
+        args.prediction_target,
+        selected_quality_alphabet_size,
+    )
 
     # 保存完整配置，后续 predict 脚本会从 checkpoint 里恢复模型结构。
     if args.prediction_target == QUALITY_TARGET:
@@ -586,8 +631,11 @@ def main() -> int:
     config = {
         "model_type": model_type,
         "prediction_target": args.prediction_target,
+        "h5_alphabet_size": H5_ALPHABET_SIZE,
+        "quality_alphabet_size": selected_quality_alphabet_size,
+        "max_quality_id": selected_quality_alphabet_size - 1,
         "target": (
-            "quality_id_0_94"
+            f"quality_id_0_{selected_quality_alphabet_size - 1}"
             if args.prediction_target == QUALITY_TARGET
             else "residual_-94_94"
         ),
@@ -719,6 +767,7 @@ def main() -> int:
         rmer_vocab_size=args.rmer_vocab_size,
         prior_feature_mode=args.prior_feature_mode,
         prediction_target=args.prediction_target,
+        quality_alphabet_size=selected_quality_alphabet_size,
     )
     # Transformer 输入与阶段 3 Q/R-mer 版本使用相同的 causal features。
     model = ResidualTransformer(
@@ -781,6 +830,7 @@ def main() -> int:
             "train_loss",
             "train_bits_per_quality",
             "train_h5_baseline_bits",
+            "train_h5_support_matched_baseline_bits",
         ]
         if args.quality_distribution_prior:
             log_fieldnames.append("train_quality_histogram_bits")
@@ -788,6 +838,7 @@ def main() -> int:
             [
                 "val_model_avg_bits_per_quality",
                 "val_h5_baseline_avg_bits_per_quality",
+                "val_h5_support_matched_baseline_avg_bits_per_quality",
             ]
         )
         if args.quality_distribution_prior:
@@ -796,6 +847,8 @@ def main() -> int:
             [
                 "val_delta_bits",
                 "val_relative_improvement",
+                "val_delta_bits_vs_h5_support_matched",
+                "val_relative_improvement_vs_h5_support_matched",
                 "val_total_symbols",
                 "val_zero_true_freq",
                 "gpu_peak_memory_bytes",
@@ -810,6 +863,7 @@ def main() -> int:
             running_nats = 0.0
             running_symbols = 0
             running_baseline_bits = 0.0
+            running_support_matched_baseline_bits = 0.0
             running_quality_histogram_bits = 0.0
 
             step_iter = range(1, args.steps_per_epoch + 1)
@@ -856,7 +910,7 @@ def main() -> int:
                     quality_distribution_log_probs=quality_distribution_log_probs,
                     lengths=tensors["lengths"],
                 )
-                # 直接质量目标的 95 类天然全合法；只有历史 residual 目标
+                # 直接质量目标的已配置类别天然全合法；只有历史 residual 目标
                 # 才需要按 q_hat 屏蔽物理非法 residual。
                 if args.prediction_target == RESIDUAL_TARGET:
                     logits = mask_invalid_residual_logits(
@@ -876,6 +930,9 @@ def main() -> int:
                 running_nats += float(loss.item()) * symbols
                 running_symbols += symbols
                 running_baseline_bits += batch.baseline_bits
+                running_support_matched_baseline_bits += (
+                    batch.support_matched_baseline_bits
+                )
                 if quality_distributions_by_file is not None:
                     running_quality_histogram_bits += quality_distribution_bits_for_batch(
                         batch,
@@ -891,6 +948,9 @@ def main() -> int:
             train_avg_bits = (running_nats / running_symbols) / math.log(2.0)
             train_loss = running_nats / running_symbols
             train_baseline_bits = running_baseline_bits / running_symbols
+            train_support_matched_baseline_bits = (
+                running_support_matched_baseline_bits / running_symbols
+            )
             train_quality_histogram_bits = (
                 running_quality_histogram_bits / running_symbols
                 if quality_distributions_by_file is not None
@@ -914,6 +974,7 @@ def main() -> int:
                 base_sidecar_dir=args.base_sidecar_dir,
                 prior_feature_mode=args.prior_feature_mode,
                 prediction_target=args.prediction_target,
+                quality_alphabet_size=selected_quality_alphabet_size,
                 platform_by_file=platform_by_file,
                 quality_distributions_by_file=quality_distributions_by_file,
             )
@@ -923,10 +984,22 @@ def main() -> int:
                 "train_loss": fmt4(train_loss),
                 "train_bits_per_quality": fmt4(train_avg_bits),
                 "train_h5_baseline_bits": fmt4(train_baseline_bits),
+                "train_h5_support_matched_baseline_bits": fmt4(
+                    train_support_matched_baseline_bits
+                ),
                 "val_model_avg_bits_per_quality": fmt4(val["model_avg_bits_per_quality"]),
                 "val_h5_baseline_avg_bits_per_quality": fmt4(val["h5_baseline_avg_bits_per_quality"]),
+                "val_h5_support_matched_baseline_avg_bits_per_quality": fmt4(
+                    val["h5_support_matched_baseline_avg_bits_per_quality"]
+                ),
                 "val_delta_bits": fmt4(val["delta_bits"]),
                 "val_relative_improvement": fmt4(val["relative_improvement"]),
+                "val_delta_bits_vs_h5_support_matched": fmt4(
+                    val["delta_bits_vs_h5_support_matched"]
+                ),
+                "val_relative_improvement_vs_h5_support_matched": fmt4(
+                    val["relative_improvement_vs_h5_support_matched"]
+                ),
                 "val_total_symbols": int(val["total_symbols"]),
                 "val_zero_true_freq": int(val["zero_true_freq"]),
                 "gpu_peak_memory_bytes": (
@@ -955,7 +1028,8 @@ def main() -> int:
             )
             print(
                 "epoch={epoch} loss={loss:.4f} train_bits={train_bits:.4f} "
-                "val_bits={val_bits:.4f} h5_bits={h5_bits:.4f}"
+                "val_bits={val_bits:.4f} h5_bits={h5_bits:.4f} "
+                "h5_support_bits={h5_support_bits:.4f}"
                 "{histogram_text} delta={delta:.4f} "
                 "rel_improve={rel:.4%} symbols={symbols}".format(
                     epoch=epoch,
@@ -963,6 +1037,9 @@ def main() -> int:
                     train_bits=train_avg_bits,
                     val_bits=val["model_avg_bits_per_quality"],
                     h5_bits=val["h5_baseline_avg_bits_per_quality"],
+                    h5_support_bits=val[
+                        "h5_support_matched_baseline_avg_bits_per_quality"
+                    ],
                     histogram_text=histogram_text,
                     delta=val["delta_bits"],
                     rel=val["relative_improvement"],

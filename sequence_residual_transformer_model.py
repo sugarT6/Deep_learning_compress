@@ -35,13 +35,16 @@ import torch
 from torch import nn
 
 
-ALPHABET_SIZE = 95
-RESIDUAL_MIN = -(ALPHABET_SIZE - 1)
-RESIDUAL_MAX = ALPHABET_SIZE - 1
+H5_ALPHABET_SIZE = 95
+DEFAULT_QUALITY_ALPHABET_SIZE = 42
+# Historical public name retained for H5/q_hat/residual checkpoint compatibility.
+ALPHABET_SIZE = H5_ALPHABET_SIZE
+RESIDUAL_MIN = -(H5_ALPHABET_SIZE - 1)
+RESIDUAL_MAX = H5_ALPHABET_SIZE - 1
 RESIDUAL_CLASSES = RESIDUAL_MAX - RESIDUAL_MIN + 1
 
-Q_BOS_TOKEN = ALPHABET_SIZE
-Q_TOKEN_COUNT = ALPHABET_SIZE + 1
+Q_BOS_TOKEN = H5_ALPHABET_SIZE
+Q_TOKEN_COUNT = H5_ALPHABET_SIZE + 1
 R_BOS_TOKEN = RESIDUAL_CLASSES
 R_TOKEN_COUNT = RESIDUAL_CLASSES + 1
 
@@ -92,8 +95,9 @@ R_BUCKET_COUNT = 11
 R_MER_BOS_BUCKET = R_BUCKET_COUNT
 R_MER_BASE = R_BUCKET_COUNT + 1
 
-# 质量值 alphabet 固定为 95，对应 Phred+33 后的 quality id: 0..94。
-# residual = q_true - q_hat，因此 residual 范围是 -94..94，共 189 类。
+# SeqArc H5 固定保留95列，但当前二代数据的body quality模型默认只
+# 输出 Q0..Q41 的42类。q_hat仍从完整95列取argmax，所以 q_hat embedding
+# 和历史 residual 范围保持 0..94 / -94..94，以兼容上游格式和旧checkpoint。
 DEFAULT_QUALITY_DISTRIBUTION_EMBED_DIM = 32
 DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM = 64
 DEFAULT_QUALITY_DELTA_LIMIT = 4.0
@@ -140,6 +144,7 @@ class QualityDistributionInfo:
     probabilities: np.ndarray
     log_probabilities: np.ndarray
     total_symbols: int
+    alphabet_size: int
 
 
 @dataclass(frozen=True)
@@ -186,12 +191,17 @@ class SequenceBatch:
     base_lengths:
         Complete raw base-read lengths before padding.
     baseline_bits:
-        Sum of -log2 P0(q_true) over real positions in this batch.
+        Sum of -log2 P0(q_true) over the original 95-column H5 distribution.
+    support_matched_baseline_bits:
+        Sum of -log2 P0(q_true) after renormalizing the H5 distribution over
+        the quality classes supported by the current model.
     zero_true_freq:
         Number of real positions where H5 assigned zero count to q_true.
     h5_true_prob:
         Padded per-position P0(q_true), retained only for reports/debug output;
         it is not a model input in qhat_only mode.
+    h5_support_matched_true_prob:
+        The same report-only probability after support-matched renormalization.
     """
 
     continuous: np.ndarray
@@ -208,8 +218,10 @@ class SequenceBatch:
     base_ids: np.ndarray
     base_lengths: np.ndarray
     baseline_bits: float
+    support_matched_baseline_bits: float
     zero_true_freq: int
     h5_true_prob: np.ndarray
+    h5_support_matched_true_prob: np.ndarray
 
     @property
     def total_symbols(self) -> int:
@@ -350,9 +362,22 @@ def inspect_h5(path: Path) -> H5SequenceInfo:
         )
 
 
+def normalize_quality_alphabet_size(value: int) -> int:
+    """Validate a body-quality output alphabet against the fixed H5 alphabet."""
+
+    alphabet_size = int(value)
+    if not 1 <= alphabet_size <= H5_ALPHABET_SIZE:
+        raise ValueError(
+            "quality alphabet size must be in "
+            f"[1, {H5_ALPHABET_SIZE}], got {alphabet_size}"
+        )
+    return alphabet_size
+
+
 def inspect_quality_distribution(
     path: Path,
     *,
+    quality_alphabet_size: int = DEFAULT_QUALITY_ALPHABET_SIZE,
     add_alpha: float = QUALITY_DISTRIBUTION_ADD_ALPHA,
     chunk_rows: int = 1_000_000,
 ) -> QualityDistributionInfo:
@@ -363,7 +388,8 @@ def inspect_quality_distribution(
     if chunk_rows <= 0:
         raise ValueError("quality distribution chunk_rows must be positive")
 
-    counts = np.zeros(ALPHABET_SIZE, dtype=np.int64)
+    quality_alphabet_size = normalize_quality_alphabet_size(quality_alphabet_size)
+    counts = np.zeros(quality_alphabet_size, dtype=np.int64)
     with h5py.File(path, "r") as handle:
         if "/observed" not in handle:
             raise ValueError(f"{path}: missing required dataset /observed")
@@ -376,10 +402,14 @@ def inspect_quality_distribution(
                 raise ValueError(f"{path}: /observed must contain integer quality ids")
             values_i = values.astype(np.int64, copy=False)
             if values_i.size and (
-                int(values_i.min()) < 0 or int(values_i.max()) >= ALPHABET_SIZE
+                int(values_i.min()) < 0
+                or int(values_i.max()) >= quality_alphabet_size
             ):
-                raise ValueError(f"{path}: observed quality id out of [0, 94]")
-            counts += np.bincount(values_i, minlength=ALPHABET_SIZE)
+                raise ValueError(
+                    f"{path}: observed quality id outside model range "
+                    f"[0, {quality_alphabet_size - 1}]"
+                )
+            counts += np.bincount(values_i, minlength=quality_alphabet_size)
 
     total_symbols = int(counts.sum())
     if total_symbols == 0:
@@ -393,6 +423,7 @@ def inspect_quality_distribution(
         probabilities=probabilities.astype(np.float32),
         log_probabilities=log_probabilities.astype(np.float32),
         total_symbols=total_symbols,
+        alphabet_size=quality_alphabet_size,
     )
 
 
@@ -402,16 +433,21 @@ def quality_distribution_bits_for_batch(
 ) -> float:
     """Return histogram-only bits for a direct-quality batch."""
 
-    if log_probabilities.shape != (ALPHABET_SIZE,):
+    if log_probabilities.ndim != 1 or log_probabilities.size == 0:
         raise ValueError(
-            f"quality distribution must have shape ({ALPHABET_SIZE},), "
+            "quality distribution must be a non-empty 1-D array, "
             f"got {log_probabilities.shape}"
         )
+    quality_alphabet_size = int(log_probabilities.shape[0])
     qualities = batch.targets[batch.valid_mask]
     if qualities.size and (
-        int(qualities.min()) < 0 or int(qualities.max()) >= ALPHABET_SIZE
+        int(qualities.min()) < 0
+        or int(qualities.max()) >= quality_alphabet_size
     ):
-        raise ValueError("quality histogram bits require direct quality targets")
+        raise ValueError(
+            "quality target out of range for file distribution with "
+            f"{quality_alphabet_size} classes"
+        )
     return float((-log_probabilities[qualities] / math.log(2.0)).sum())
 
 
@@ -493,11 +529,14 @@ def continuous_feature_dim(prior_feature_mode: str) -> int:
     )
 
 
-def prediction_output_dim(prediction_target: str) -> int:
+def prediction_output_dim(
+    prediction_target: str,
+    quality_alphabet_size: int = DEFAULT_QUALITY_ALPHABET_SIZE,
+) -> int:
     """Return the classification width for a quality or residual target."""
 
     if prediction_target == QUALITY_TARGET:
-        return ALPHABET_SIZE
+        return normalize_quality_alphabet_size(quality_alphabet_size)
     if prediction_target == RESIDUAL_TARGET:
         return RESIDUAL_CLASSES
     raise ValueError(
@@ -643,6 +682,7 @@ def build_sequence_batch(
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
     prediction_target: str = DEFAULT_PREDICTION_TARGET,
+    quality_alphabet_size: int = DEFAULT_QUALITY_ALPHABET_SIZE,
 ) -> SequenceBatch:
     """Build one padded batch from a contiguous group of reads.
 
@@ -651,8 +691,10 @@ def build_sequence_batch(
     [0, len(read0), len(read0)+len(read1), total_rows].
     """
 
-    if freqs.ndim != 2 or freqs.shape[1] != ALPHABET_SIZE:
-        raise ValueError(f"expected freqs shape [N, {ALPHABET_SIZE}], got {freqs.shape}")
+    if freqs.ndim != 2 or freqs.shape[1] != H5_ALPHABET_SIZE:
+        raise ValueError(
+            f"expected freqs shape [N, {H5_ALPHABET_SIZE}], got {freqs.shape}"
+        )
     if observed.ndim != 1 or observed.shape[0] != freqs.shape[0]:
         raise ValueError("observed must be a 1-D array with the same row count as freqs")
     if local_offsets.ndim != 1 or local_offsets.size < 2:
@@ -705,14 +747,25 @@ def build_sequence_batch(
     exact_q_lags_t = normalize_exact_lags(exact_q_lags)
     exact_r_lags_t = normalize_exact_lags(exact_r_lags)
     continuous_dim = continuous_feature_dim(prior_feature_mode)
-    prediction_output_dim(prediction_target)
+    quality_alphabet_size = normalize_quality_alphabet_size(quality_alphabet_size)
+    prediction_output_dim(prediction_target, quality_alphabet_size)
+    supported_quality_alphabet_size = (
+        quality_alphabet_size
+        if prediction_target == QUALITY_TARGET
+        else H5_ALPHABET_SIZE
+    )
 
     # qhat_only 不构造或取 log 完整概率矩阵，只取 argmax q_hat。概率矩阵
     # 仍在 batch 末尾用于计算独立的 H5 baseline，不进入模型。
     freqs_f = freqs.astype(np.float32, copy=False)
     observed_i = observed.astype(np.int64, copy=False)
-    if np.any(observed_i < 0) or np.any(observed_i >= ALPHABET_SIZE):
-        raise ValueError("observed quality id out of [0, 94]")
+    if np.any(observed_i < 0) or np.any(
+        observed_i >= supported_quality_alphabet_size
+    ):
+        raise ValueError(
+            "observed quality id outside model range "
+            f"[0, {supported_quality_alphabet_size - 1}]"
+        )
 
     # q_hat 是 H5 predictor 的中心预测，即 P0(q) 的 argmax。当前实验直接
     # 预测 quality，但仍保留 q_hat embedding 和可解码的 residual 历史。
@@ -727,14 +780,14 @@ def build_sequence_batch(
         )
 
     if prior_feature_mode == FULL_PRIOR:
-        q_axis = np.arange(ALPHABET_SIZE, dtype=np.float32)
+        q_axis = np.arange(H5_ALPHABET_SIZE, dtype=np.float32)
         expected_q = (
-            (probs * q_axis[None, :]).sum(axis=1) / (ALPHABET_SIZE - 1)
+            (probs * q_axis[None, :]).sum(axis=1) / (H5_ALPHABET_SIZE - 1)
         ).astype(np.float32)
         log_p0_r = _residual_log_probs(probs, q_hat)
 
     # Residual history is retained even when the current prediction target is
-    # the 95-class quality id: at decode time all earlier q values and q_hat
+    # the direct quality id: at decode time all earlier q values and q_hat
     # values are known, so their residuals are known as well.
     residual = observed_i - q_hat
     residual_classes_flat = (residual - RESIDUAL_MIN).astype(np.int64)
@@ -756,6 +809,9 @@ def build_sequence_batch(
     #    padding 位置的 target 使用 PAD_TARGET，loss 会 ignore。
     continuous = np.zeros((batch_size, max_len, continuous_dim), dtype=np.float32)
     h5_true_prob = np.zeros((batch_size, max_len), dtype=np.float32)
+    h5_support_matched_true_prob = np.zeros(
+        (batch_size, max_len), dtype=np.float32
+    )
     q_hat_tokens = np.zeros((batch_size, max_len), dtype=np.int64)
     prev_q_tokens = np.full((batch_size, max_len), Q_BOS_TOKEN, dtype=np.int64)
     prev_r_tokens = np.full((batch_size, max_len), R_BOS_TOKEN, dtype=np.int64)
@@ -862,12 +918,20 @@ def build_sequence_batch(
     row_sum = freqs_f.sum(axis=1)
     true_prob = true_freq / np.maximum(row_sum, EPS)
     baseline_bits = float((-np.log2(np.maximum(true_prob, EPS))).sum())
+    support_matched_row_sum = freqs_f[:, :supported_quality_alphabet_size].sum(axis=1)
+    support_matched_true_prob = true_freq / np.maximum(support_matched_row_sum, EPS)
+    support_matched_baseline_bits = float(
+        (-np.log2(np.maximum(support_matched_true_prob, EPS))).sum()
+    )
     zero_true_freq = int(np.count_nonzero(true_freq <= 0))
 
     for read_idx, (start, end) in enumerate(zip(local_offsets[:-1], local_offsets[1:])):
         start_i = int(start)
         end_i = int(end)
         h5_true_prob[read_idx, : end_i - start_i] = true_prob[start_i:end_i]
+        h5_support_matched_true_prob[read_idx, : end_i - start_i] = (
+            support_matched_true_prob[start_i:end_i]
+        )
 
     return SequenceBatch(
         continuous=continuous,
@@ -884,8 +948,10 @@ def build_sequence_batch(
         base_ids=padded_base_ids,
         base_lengths=base_lengths,
         baseline_bits=baseline_bits,
+        support_matched_baseline_bits=support_matched_baseline_bits,
         zero_true_freq=zero_true_freq,
         h5_true_prob=h5_true_prob,
+        h5_support_matched_true_prob=h5_support_matched_true_prob,
     )
 
 
@@ -912,6 +978,7 @@ class ContiguousReadBatchSampler:
         rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
         prediction_target: str = DEFAULT_PREDICTION_TARGET,
+        quality_alphabet_size: int = DEFAULT_QUALITY_ALPHABET_SIZE,
     ) -> None:
         self.files = files
         self.train_fraction = train_fraction
@@ -927,7 +994,10 @@ class ContiguousReadBatchSampler:
         self.prior_feature_mode = prior_feature_mode
         continuous_feature_dim(self.prior_feature_mode)
         self.prediction_target = prediction_target
-        prediction_output_dim(self.prediction_target)
+        self.quality_alphabet_size = normalize_quality_alphabet_size(
+            quality_alphabet_size
+        )
+        prediction_output_dim(self.prediction_target, self.quality_alphabet_size)
         self.infos = [inspect_h5(path) for path in files]
         self.base_sidecars = (
             [base_sidecar_path_for_h5(path, base_sidecar_dir) for path in files]
@@ -968,6 +1038,7 @@ class ContiguousReadBatchSampler:
                         rmer_vocab_size=self.rmer_vocab_size,
                         prior_feature_mode=self.prior_feature_mode,
                         prediction_target=self.prediction_target,
+                        quality_alphabet_size=self.quality_alphabet_size,
                     ),
                     path,
                 )
@@ -992,6 +1063,7 @@ def read_h5_read_range(
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
     prediction_target: str = DEFAULT_PREDICTION_TARGET,
+    quality_alphabet_size: int = DEFAULT_QUALITY_ALPHABET_SIZE,
 ) -> SequenceBatch:
     """Load a half-open read range [read_start, read_stop) from one H5 file."""
 
@@ -1044,6 +1116,7 @@ def read_h5_read_range(
         rmer_vocab_size=rmer_vocab_size,
         prior_feature_mode=prior_feature_mode,
         prediction_target=prediction_target,
+        quality_alphabet_size=quality_alphabet_size,
     )
 
 
@@ -1063,6 +1136,7 @@ def iter_read_batches(
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     prior_feature_mode: str = DEFAULT_PRIOR_FEATURE_MODE,
     prediction_target: str = DEFAULT_PREDICTION_TARGET,
+    quality_alphabet_size: int = DEFAULT_QUALITY_ALPHABET_SIZE,
 ) -> Iterator[SequenceBatch]:
     """Iterate deterministic read batches for train/test/all evaluation."""
 
@@ -1099,6 +1173,7 @@ def iter_read_batches(
                 rmer_vocab_size=rmer_vocab_size,
                 prior_feature_mode=prior_feature_mode,
                 prediction_target=prediction_target,
+                quality_alphabet_size=quality_alphabet_size,
             )
         except ValueError as exc:
             # 顺序评估时，如果某个 batch 恰好全是空 read，就直接跳过。
@@ -1176,9 +1251,9 @@ class ResidualTransformer(nn.Module):
     the first 189 continuous features, which contain ``log P0_r``.
 
     The optional file-quality-distribution mode instead uses an add-one-
-    smoothed 95-class true-quality histogram as a file-level embedding and as
-    the output prior. Its zero-initialized head learns a tanh-bounded direct-
-    quality logit correction.
+    smoothed body-quality histogram with the same width as the output head as
+    a file-level embedding and output prior. Its zero-initialized head learns a
+    tanh-bounded direct-quality logit correction.
     """
 
     def __init__(
@@ -1260,9 +1335,10 @@ class ResidualTransformer(nn.Module):
         self.quality_distribution_hidden_dim = int(quality_distribution_hidden_dim)
         self.quality_delta_limit = float(quality_delta_limit)
         if self.quality_distribution_prior:
-            if output_dim != ALPHABET_SIZE:
+            if not 1 <= output_dim <= H5_ALPHABET_SIZE:
                 raise ValueError(
-                    "quality distribution prior requires the 95-class quality output"
+                    "quality distribution prior requires a direct-quality output "
+                    f"width in [1, {H5_ALPHABET_SIZE}]"
                 )
             if output_parameterization != DIRECT_LOGITS:
                 raise ValueError(
@@ -1298,7 +1374,7 @@ class ResidualTransformer(nn.Module):
         )
         self.quality_distribution_encoder = (
             nn.Sequential(
-                nn.Linear(ALPHABET_SIZE, self.quality_distribution_hidden_dim),
+                nn.Linear(output_dim, self.quality_distribution_hidden_dim),
                 nn.GELU(),
                 nn.Linear(
                     self.quality_distribution_hidden_dim,
@@ -1457,9 +1533,9 @@ class ResidualTransformer(nn.Module):
                     "quality_distribution_log_probs are required by this checkpoint"
                 )
             if quality_distribution_log_probs.ndim == 1:
-                if quality_distribution_log_probs.shape[0] != ALPHABET_SIZE:
+                if quality_distribution_log_probs.shape[0] != self.output_head.out_features:
                     raise ValueError(
-                        "quality_distribution_log_probs must have 95 classes"
+                        "quality_distribution_log_probs width must match the output head"
                     )
                 expanded_quality_distribution = quality_distribution_log_probs.unsqueeze(0).expand(
                     continuous.shape[0], -1
@@ -1467,15 +1543,17 @@ class ResidualTransformer(nn.Module):
             elif quality_distribution_log_probs.ndim == 2:
                 if quality_distribution_log_probs.shape != (
                     continuous.shape[0],
-                    ALPHABET_SIZE,
+                    self.output_head.out_features,
                 ):
                     raise ValueError(
-                        "quality_distribution_log_probs must have shape [batch, 95]"
+                        "quality_distribution_log_probs must have shape "
+                        "[batch, output_dim]"
                     )
                 expanded_quality_distribution = quality_distribution_log_probs
             else:
                 raise ValueError(
-                    "quality_distribution_log_probs must have shape [95] or [batch, 95]"
+                    "quality_distribution_log_probs must have shape [output_dim] "
+                    "or [batch, output_dim]"
                 )
             quality_distribution_context = self.quality_distribution_encoder(
                 expanded_quality_distribution

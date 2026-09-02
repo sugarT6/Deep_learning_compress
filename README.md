@@ -1,7 +1,8 @@
 # Q-hat-conditioned direct-quality Transformer
 
-This repository now tests direct 95-class quality prediction while retaining
-the feature set that produced the best qhat-only residual result. Unlike
+This repository now defaults to direct 42-class body-quality prediction
+(`Q0..Q41`) while retaining the fixed 95-column SeqArc H5 input and the
+feature set that produced the best qhat-only residual result. Unlike
 `../fastq_quality_direct`, this experiment still reads the quality-model H5,
 uses `q_hat`, and retains decoded residual history and residual-mer features.
 
@@ -31,8 +32,19 @@ shape information recovers signal discarded by `qhat_only`.
 `full_prior` reproduces the previous input. It normalizes H5 counts into
 `P0(q)`, clamps probabilities to `1e-12`, and applies the natural logarithm
 before mapping them into the 189 residual classes. `log_p0_plus_delta` remains
-available only for historical `full_prior + residual` runs; direct 95-class
-quality logits are the current default.
+available only for historical `full_prior + residual` runs; direct 42-class
+body-quality logits are the current default.
+
+The two alphabets are deliberately separate. `/freqs` remains `[N, 95]`, and
+`q_hat` is still the argmax of all 95 upstream columns. The direct model output
+and optional file histogram default to 42 classes. `--quality-alphabet-size`
+can restore 95-class training, and old checkpoints without this config field
+are inferred from their saved `output_dim`.
+
+For new Q0..Q41 experiments, pass `--quality-alphabet-size 42` explicitly in
+saved run commands even though it is the default. Historical reproduction
+commands below use `--quality-alphabet-size 95` because their reported
+checkpoints and metrics predate the 42-class change.
 
 ## Input features
 
@@ -117,6 +129,7 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -136,6 +149,7 @@ CUDA_VISIBLE_DEVICES=1 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -155,6 +169,7 @@ CUDA_VISIBLE_DEVICES=2 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -214,6 +229,7 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -233,6 +249,7 @@ CUDA_VISIBLE_DEVICES=1 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -252,6 +269,7 @@ CUDA_VISIBLE_DEVICES=2 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -304,8 +322,8 @@ python query_quality_distribution.py \
 ### File-quality-distribution prior with bounded neural correction
 
 The optional `--quality-distribution-prior` mode computes one full-body true
-quality histogram per HDF5 file, applies add-one smoothing, and caches its 95
-natural-log probabilities. A `95 -> 64 -> 32` MLP supplies a file-level
+quality histogram per HDF5 file, applies add-one smoothing, and caches its 42
+natural-log probabilities. A `42 -> 64 -> 32` MLP supplies a file-level
 distribution embedding to every position. The zero-initialized output head
 predicts a bounded correction:
 
@@ -339,6 +357,7 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -375,6 +394,7 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -398,6 +418,7 @@ CUDA_VISIBLE_DEVICES=1 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -421,6 +442,7 @@ CUDA_VISIBLE_DEVICES=2 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -482,13 +504,15 @@ feature concatenation
 -> Linear + ReLU + Dropout
 -> sinusoidal positional encoding
 -> 4 causal Transformer encoder layers
--> Linear(d_model -> 95)
+-> Linear(d_model -> 42)
 -> softmax P(q_i)
 ```
 
-All 95 output classes are legal quality ids, so the direct-quality target does
-not use the old q_hat-dependent invalid-residual mask. Historical residual
-checkpoints remain loadable and still apply that mask.
+All 42 output classes are legal body-quality ids Q0..Q41, so the direct-quality
+target does not use the old q_hat-dependent invalid-residual mask. Input files
+containing a body quality above Q41 fail before training or prediction; values
+are never clamped because the target is lossless compression. Historical
+95-class direct-quality and residual checkpoints remain loadable.
 
 Default dimensions:
 
@@ -530,6 +554,10 @@ HiFi/Nanopore files in the same directory. Required datasets are:
 /freqs
 /read_offsets
 ```
+
+`/freqs` must retain the upstream width of 95. The model does not rewrite or
+truncate the H5 matrix. Body lengths are side information, so the SeqArc
+terminator/sentinel column is not a neural output class.
 
 By default, each H5 file is split by read id: the first 80% of reads form the
 training pool and the last 20% form validation/test. Empty reads are skipped.
@@ -576,6 +604,7 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -602,6 +631,7 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode compact_prior \
   --qmer-ks 2,3,4 \
   --rmer-ks 2,3,4 \
@@ -634,6 +664,7 @@ CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
   --eval-max-reads-per-file 5000 \
   --num-layers 4 \
   --prediction-target quality \
+  --quality-alphabet-size 95 \
   --prior-feature-mode qhat_only \
   --platform-embed-dim 8 \
   --platform-map ERR2755197=BGISEQ,SRR1238539=IonTorrent,SRR3066199=Illumina,SRR5867380=IonTorrent,SRR622457=Illumina,SRR6691666=Illumina \
@@ -734,7 +765,7 @@ python predict_sequence_residual_transformer.py \
   --quality-prob-log-rows 1000
 ```
 
-The prediction target, prior-feature, historical exact-lag,
+The prediction target, body-quality alphabet, prior-feature, historical exact-lag,
 output-parameterization, Q/R-mer, and base-branch settings are restored from
 the checkpoint; no prediction-side switch is needed. Exact-lag support remains
 only for loading the completed ablation checkpoint and is disabled in current
@@ -753,9 +784,17 @@ The primary comparison fields are:
 ```text
 model_avg_bits_per_quality
 h5_baseline_avg_bits_per_quality
+h5_support_matched_baseline_avg_bits_per_quality
 delta_bits = model_avg_bits - h5_baseline_avg_bits
 relative_improvement = (h5_bits - model_bits) / h5_bits
+delta_bits_vs_h5_support_matched
+relative_improvement_vs_h5_support_matched
 ```
+
+The original H5 baseline always uses all 95 columns. The support-matched H5
+baseline renormalizes columns `Q0..Q41` (or the configured direct-quality
+alphabet), so it separates neural-model gains from the gain obtained merely by
+declaring higher body qualities impossible.
 
 For a fair stage-3 comparison, use the same H5 files, read split, number of
 training steps, batch size, evaluation read limit, and test symbols. Argmax

@@ -8,6 +8,7 @@ from sequence_residual_transformer_model import (
     DEFAULT_EXACT_R_LAGS,
     DEFAULT_PRIOR_FEATURE_MODE,
     DEFAULT_PREDICTION_TARGET,
+    DEFAULT_QUALITY_ALPHABET_SIZE,
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
     build_exact_lag_tokens_for_read,
@@ -53,6 +54,7 @@ class MerTokenTest(unittest.TestCase):
         self.assertEqual(args.rmer_ks, (2, 3, 4))
         self.assertEqual(args.prior_feature_mode, DEFAULT_PRIOR_FEATURE_MODE)
         self.assertEqual(args.prediction_target, DEFAULT_PREDICTION_TARGET)
+        self.assertEqual(args.quality_alphabet_size, DEFAULT_QUALITY_ALPHABET_SIZE)
         self.assertEqual(args.base_conv_kernels, (3, 5, 7))
         self.assertEqual(args.num_layers, 4)
         self.assertEqual(

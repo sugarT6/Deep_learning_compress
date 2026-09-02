@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from sequence_residual_transformer_model import (
-    ALPHABET_SIZE,
+    DEFAULT_QUALITY_ALPHABET_SIZE,
     DIRECT_LOGITS,
     Q_BOS_TOKEN,
     R_BOS_TOKEN,
@@ -42,7 +42,7 @@ def make_model() -> ResidualTransformer:
         feedforward_dim=16,
         context_length=4,
         dropout=0.0,
-        output_dim=ALPHABET_SIZE,
+        output_dim=DEFAULT_QUALITY_ALPHABET_SIZE,
         output_parameterization=DIRECT_LOGITS,
     )
 
@@ -58,7 +58,7 @@ def model_inputs() -> dict[str, torch.Tensor]:
 
 
 class QualityDistributionPriorTest(unittest.TestCase):
-    def test_add_one_distribution_uses_all_95_classes(self) -> None:
+    def test_add_one_distribution_uses_42_body_quality_classes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "qualities.h5"
             with h5py.File(path, "w") as handle:
@@ -70,17 +70,22 @@ class QualityDistributionPriorTest(unittest.TestCase):
             info = inspect_quality_distribution(path, chunk_rows=2)
 
             self.assertEqual(info.total_symbols, 3)
+            self.assertEqual(info.alphabet_size, DEFAULT_QUALITY_ALPHABET_SIZE)
+            self.assertEqual(info.counts.shape, (DEFAULT_QUALITY_ALPHABET_SIZE,))
             self.assertEqual(info.counts.tolist()[:3], [2, 1, 0])
-            self.assertAlmostEqual(float(info.probabilities[0]), 3.0 / 98.0)
-            self.assertAlmostEqual(float(info.probabilities[1]), 2.0 / 98.0)
-            self.assertAlmostEqual(float(info.probabilities[2]), 1.0 / 98.0)
+            denominator = 3.0 + DEFAULT_QUALITY_ALPHABET_SIZE
+            self.assertAlmostEqual(float(info.probabilities[0]), 3.0 / denominator)
+            self.assertAlmostEqual(float(info.probabilities[1]), 2.0 / denominator)
+            self.assertAlmostEqual(float(info.probabilities[2]), 1.0 / denominator)
             self.assertAlmostEqual(float(info.probabilities.sum()), 1.0)
 
             batch = SimpleNamespace(
                 targets=np.array([[0, 1, -100]], dtype=np.int64),
                 valid_mask=np.array([[True, True, False]]),
             )
-            expected_bits = -math.log2(3.0 / 98.0) - math.log2(2.0 / 98.0)
+            expected_bits = -math.log2(3.0 / denominator) - math.log2(
+                2.0 / denominator
+            )
             self.assertAlmostEqual(
                 quality_distribution_bits_for_batch(
                     batch,
@@ -96,10 +101,30 @@ class QualityDistributionPriorTest(unittest.TestCase):
         self.assertEqual(args.quality_distribution_embed_dim, 32)
         self.assertEqual(args.quality_distribution_hidden_dim, 64)
         self.assertEqual(args.quality_delta_limit, 4.0)
+        self.assertEqual(
+            args.quality_alphabet_size,
+            DEFAULT_QUALITY_ALPHABET_SIZE,
+        )
+
+    def test_distribution_rejects_quality_above_q41(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "qualities.h5"
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset(
+                    "observed",
+                    data=np.array([41, 42], dtype=np.uint8),
+                )
+
+            with self.assertRaisesRegex(ValueError, r"model range \[0, 41\]"):
+                inspect_quality_distribution(path)
 
     def test_zero_initialized_delta_reproduces_file_histogram(self) -> None:
         model = make_model().eval()
-        probabilities = torch.arange(1, ALPHABET_SIZE + 1, dtype=torch.float32)
+        probabilities = torch.arange(
+            1,
+            DEFAULT_QUALITY_ALPHABET_SIZE + 1,
+            dtype=torch.float32,
+        )
         probabilities /= probabilities.sum()
         log_probabilities = probabilities.log()
 
@@ -123,11 +148,15 @@ class QualityDistributionPriorTest(unittest.TestCase):
         model = make_model().eval()
         with torch.no_grad():
             model.output_head.bias.copy_(
-                torch.linspace(-100.0, 100.0, ALPHABET_SIZE)
+                torch.linspace(
+                    -100.0,
+                    100.0,
+                    DEFAULT_QUALITY_ALPHABET_SIZE,
+                )
             )
         log_probabilities = torch.full(
-            (ALPHABET_SIZE,),
-            -math.log(ALPHABET_SIZE),
+            (DEFAULT_QUALITY_ALPHABET_SIZE,),
+            -math.log(DEFAULT_QUALITY_ALPHABET_SIZE),
             dtype=torch.float32,
         )
 
