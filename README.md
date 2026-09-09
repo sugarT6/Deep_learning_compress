@@ -1,6 +1,74 @@
-# Q-hat-conditioned direct-quality Transformer
+# FASTQ quality compression experiments
 
-This repository now defaults to direct 42-class body-quality prediction
+## No-SeqArc direct-quality path
+
+The current production direction is the independent `codec/` package. It
+reads direct-quality training caches built from FASTQ, predicts all Q0..Q41
+symbols, and does not use SeqArc matrices, `q_hat`, residual features, file
+quality priors, platform embeddings, or accession ids. The historical
+Q-hat-conditioned experiments remain below for reproducibility.
+
+Stage B uses strictly shifted previous quality, causal Q-mer histories for
+`k=2,3,4`, complete decoder-known base reads, position/read length, and an
+active mask. `forward_full` performs causal teacher-forced prediction for
+training and encoding; `forward_step` recomputes the prefix for one decode
+cycle. Checkpoint selection uses only the held-out suffix of the ten training
+files. The nine unseen files never participate in selection.
+
+Formal training command (run by the user, not by automated smoke tests):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m codec.train \
+  --cache-dir data/2nd/training_cache \
+  --epochs 15 \
+  --steps-per-epoch 2000 \
+  --batch-reads 64 \
+  --train-fraction 0.9 \
+  --validation-max-reads-per-file 5000 \
+  --num-layers 4 \
+  --output-dir runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e15
+```
+
+The run directory contains `best.pt`, `last.pt`, `run_config.json`,
+`training_log.jsonl`, and `sampling_statistics.json`. The statistics file
+records the cumulative count and proportion of batches selected from every
+platform family and dataset.
+
+The 19-dataset evaluation uses direct-quality caches for the nine unseen files
+as well. Create the missing caches once if only the ten training caches exist:
+
+```bash
+python -m codec.training_cache \
+  data/2nd/CNR0066422_1.head2M.fastq.gz \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  data/2nd/CNR1261866_1.head2M.fastq.gz \
+  data/2nd/SRR3066199_1.head2M.fastq.gz \
+  data/2nd/SRR13114615_1.head2M.fastq.gz \
+  data/2nd/SRR10965088_1.head2M.fastq.gz \
+  data/2nd/SRR29287266_1.head2M.fastq.gz \
+  data/2nd/SRR835803_2.head2M.fastq.gz \
+  data/2nd/SRR1238539.head2M.fastq.gz
+```
+
+Then evaluate every read in the train, validation, unseen-dataset, and
+unseen-instrument groups:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m codec.evaluate \
+  runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e15/best.pt \
+  --cache-dir data/2nd/training_cache \
+  --batch-reads 64 \
+  --max-reads-per-split 0
+```
+
+The report contains per-file theoretical bits/Q, dataset macro average,
+symbol-weighted micro average, platform-family macro average, and the worst
+dataset for each requested group. Range coding and the final container are not
+implemented in this stage.
+
+## Historical Q-hat-conditioned pipeline
+
+The historical pipeline defaults to direct 42-class body-quality prediction
 (`Q0..Q41`) while retaining the fixed 95-column SeqArc H5 input and the
 feature set that produced the best qhat-only residual result. Unlike
 `../fastq_quality_direct`, this experiment still reads the quality-model H5,
