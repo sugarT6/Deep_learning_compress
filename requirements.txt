@@ -1,4 +1,5 @@
 h5py
 numpy
+openpyxl
 torch
 tqdm

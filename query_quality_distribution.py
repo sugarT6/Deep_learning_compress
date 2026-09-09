@@ -55,7 +55,7 @@ def count_quality_ids(
 def format_quality_distribution(
     counts: np.ndarray,
     *,
-    entries_per_line: int = 5,
+    entries_per_line: int = 7,
 ) -> str:
     """Format nonzero ``Q<id> percentage`` entries in id order."""
 

@@ -105,9 +105,143 @@ Generate and validate the registered base sidecars once:
 python prepare_base_sidecars.py --datasets mixed --data-root data
 ```
 
-The current eleven unique files each contain 250,000 reads. The existing sampler is
-unchanged: it selects files in proportion to their training-read counts, which
-is exactly uniform across equal-sized selected files.
+The legacy eleven unique files each contain 250,000 reads. The existing sampler
+is unchanged: it selects files in proportion to their training-read counts,
+which is exactly uniform across equal-sized selected files.
+
+### Five-platform matrix single-platform experiment
+
+The 30 files under `data/matrix/` are registered as fixed three-file training
+sets and six-file evaluation sets. Each `*_all` group expands to its three
+training files first and its three held-out files second:
+
+```text
+matrix_dnbseq_t7_train       -> ERR15766980, SRR30041373, SRR30917699
+matrix_dnbseq_t7_all         -> train + SRR31204453, SRR32293491, ERR15801889
+matrix_nextseq2000_train     -> ERR12916630, SRR38425641, ERR15158516
+matrix_nextseq2000_all       -> train + SRR27385067, SRR29436245, ERR16794678
+matrix_novaseq6000_train     -> ERR10746686, ERR11454184, ERR16748054
+matrix_novaseq6000_all       -> train + ERR16822574, SRR11411692, ERR3989434
+matrix_novaseq_x_plus_train  -> DRR917081, SRR36865461, SRR29727531
+matrix_novaseq_x_plus_all    -> train + SRR36237671, SRR30693652, SRR37380935
+matrix_mgiseq_g400_train     -> ERR13433159, SRR13142212, SRR31071044
+matrix_mgiseq_g400_all       -> train + SRR33170689, SRR31781315, SRR32083931
+```
+
+`matrix_mixed_train` is the union of the five fixed training sets, and
+`matrix_all` contains all 30 files for later mixed-platform experiments.
+Create all sidecars before starting any of the five runs:
+
+```bash
+python prepare_base_sidecars.py \
+  --datasets matrix_all \
+  --data-root data \
+  --output-dir data/matrix/base_sidecars
+```
+
+All five runs use direct `Q0..Q41` prediction and the file-quality-distribution
+prior. With three equal-read-count files, 1950 steps per epoch retains the
+previous target of 650 sampled batches per file per epoch. Prediction uses
+`--split all` so each output CSV contains all positions from the three training
+files and all three held-out files. Training-file rows are fitting diagnostics,
+not independent generalization results.
+
+```bash
+# GPU 0: DNBSEQ-T7
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  --datasets matrix_dnbseq_t7_train --data-root data \
+  --epochs 15 --steps-per-epoch 1950 \
+  --batch-reads 64 --eval-batch-reads 64 --eval-max-reads-per-file 5000 \
+  --num-layers 4 --prediction-target quality --quality-alphabet-size 42 \
+  --prior-feature-mode qhat_only --qmer-ks 2,3,4 --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/matrix/base_sidecars --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/matrix_single_qdistprior_q0_q41_20260903/dnbseq_t7
+
+CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
+  runs/matrix_single_qdistprior_q0_q41_20260903/dnbseq_t7/best.pt \
+  --datasets matrix_dnbseq_t7_all --data-root data --split all \
+  --batch-reads 64 --base-sidecar-dir data/matrix/base_sidecars \
+  --output-csv runs/matrix_single_qdistprior_q0_q41_20260903/dnbseq_t7/predict_all_six.csv
+
+# GPU 1: NextSeq 2000
+CUDA_VISIBLE_DEVICES=1 python train_sequence_residual_transformer.py \
+  --datasets matrix_nextseq2000_train --data-root data \
+  --epochs 15 --steps-per-epoch 1950 \
+  --batch-reads 64 --eval-batch-reads 64 --eval-max-reads-per-file 5000 \
+  --num-layers 4 --prediction-target quality --quality-alphabet-size 42 \
+  --prior-feature-mode qhat_only --qmer-ks 2,3,4 --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/matrix/base_sidecars --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/matrix_single_qdistprior_q0_q41_20260903/nextseq2000
+
+CUDA_VISIBLE_DEVICES=1 python predict_sequence_residual_transformer.py \
+  runs/matrix_single_qdistprior_q0_q41_20260903/nextseq2000/best.pt \
+  --datasets matrix_nextseq2000_all --data-root data --split all \
+  --batch-reads 64 --base-sidecar-dir data/matrix/base_sidecars \
+  --output-csv runs/matrix_single_qdistprior_q0_q41_20260903/nextseq2000/predict_all_six.csv
+
+# GPU 2: NovaSeq 6000
+CUDA_VISIBLE_DEVICES=2 python train_sequence_residual_transformer.py \
+  --datasets matrix_novaseq6000_train --data-root data \
+  --epochs 15 --steps-per-epoch 1950 \
+  --batch-reads 64 --eval-batch-reads 64 --eval-max-reads-per-file 5000 \
+  --num-layers 4 --prediction-target quality --quality-alphabet-size 42 \
+  --prior-feature-mode qhat_only --qmer-ks 2,3,4 --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/matrix/base_sidecars --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/matrix_single_qdistprior_q0_q41_20260903/novaseq6000
+
+CUDA_VISIBLE_DEVICES=2 python predict_sequence_residual_transformer.py \
+  runs/matrix_single_qdistprior_q0_q41_20260903/novaseq6000/best.pt \
+  --datasets matrix_novaseq6000_all --data-root data --split all \
+  --batch-reads 64 --base-sidecar-dir data/matrix/base_sidecars \
+  --output-csv runs/matrix_single_qdistprior_q0_q41_20260903/novaseq6000/predict_all_six.csv
+
+# GPU 3: NovaSeq X Plus
+CUDA_VISIBLE_DEVICES=3 python train_sequence_residual_transformer.py \
+  --datasets matrix_novaseq_x_plus_train --data-root data \
+  --epochs 15 --steps-per-epoch 1950 \
+  --batch-reads 64 --eval-batch-reads 64 --eval-max-reads-per-file 5000 \
+  --num-layers 4 --prediction-target quality --quality-alphabet-size 42 \
+  --prior-feature-mode qhat_only --qmer-ks 2,3,4 --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/matrix/base_sidecars --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/matrix_single_qdistprior_q0_q41_20260903/novaseq_x_plus
+
+CUDA_VISIBLE_DEVICES=3 python predict_sequence_residual_transformer.py \
+  runs/matrix_single_qdistprior_q0_q41_20260903/novaseq_x_plus/best.pt \
+  --datasets matrix_novaseq_x_plus_all --data-root data --split all \
+  --batch-reads 64 --base-sidecar-dir data/matrix/base_sidecars \
+  --output-csv runs/matrix_single_qdistprior_q0_q41_20260903/novaseq_x_plus/predict_all_six.csv
+
+# GPU 0, after the DNBSEQ-T7 run finishes: MGISEQ-2000 / DNBSEQ-G400 family
+CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
+  --datasets matrix_mgiseq_g400_train --data-root data \
+  --epochs 15 --steps-per-epoch 1950 \
+  --batch-reads 64 --eval-batch-reads 64 --eval-max-reads-per-file 5000 \
+  --num-layers 4 --prediction-target quality --quality-alphabet-size 42 \
+  --prior-feature-mode qhat_only --qmer-ks 2,3,4 --rmer-ks 2,3,4 \
+  --base-sidecar-dir data/matrix/base_sidecars --base-conv-kernels 3,5,7 \
+  --output-parameterization direct_logits --quality-distribution-prior \
+  --quality-distribution-embed-dim 32 --quality-distribution-hidden-dim 64 \
+  --quality-delta-limit 4 \
+  --output-dir runs/matrix_single_qdistprior_q0_q41_20260903/mgiseq_g400
+
+CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
+  runs/matrix_single_qdistprior_q0_q41_20260903/mgiseq_g400/best.pt \
+  --datasets matrix_mgiseq_g400_all --data-root data --split all \
+  --batch-reads 64 --base-sidecar-dir data/matrix/base_sidecars \
+  --output-csv runs/matrix_single_qdistprior_q0_q41_20260903/mgiseq_g400/predict_all_six.csv
+```
 
 ### Illumina versus BGI/MGI mixing experiment
 
@@ -311,12 +445,41 @@ Query the true-quality distribution of one or more explicit HDF5 files. Each
 file is reported separately under its basename, with a blank line between
 files. Only quality ids that occur are printed, in ascending order. Each entry
 is `Q<quality_id> <percentage>`, with four decimal places and a percent sign.
-Five entries are printed per line, separated by tabs:
+Seven entries are printed per line, separated by tabs:
 
 ```bash
 python query_quality_distribution.py \
   data/h5/subset_HG001_1.fq.gz.qual_model.h5 \
   data/h5/subset_HG002_1.fq.gz.qual_model.h5
+```
+
+Query quality-value distributions directly from the second-generation FASTQ
+collection. By default the script reads `data/2nd/sequencing_platform_details.xlsx`
+and reports every row whose species is `Homo sapiens`. The title of each section
+is the sequencing-platform label followed by the accession; nonzero quality ids
+are printed six per line. By default only the first 500,000 FASTQ records—and
+therefore the first 500,000 quality lines—of each dataset are counted. Progress
+goes to stderr, so stdout can be redirected to a report file without contamination:
+
+```bash
+python query_fastq_quality_distribution.py \
+  > data/2nd/homo_sapiens_quality_distribution.txt
+```
+
+Pass one or more accessions (or FASTQ filenames) to query those datasets. An
+explicit selection is not restricted by species:
+
+```bash
+python query_fastq_quality_distribution.py SRR10965088
+
+python query_fastq_quality_distribution.py \
+  SRR10965088 SRR545957 ERR038698
+```
+
+Use `--max-reads` only when a different sampling size is needed:
+
+```bash
+python query_fastq_quality_distribution.py SRR10965088 --max-reads 100000
 ```
 
 ### File-quality-distribution prior with bounded neural correction

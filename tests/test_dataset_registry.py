@@ -23,6 +23,12 @@ class DatasetRegistryTest(unittest.TestCase):
             expand_dataset_selection("mixed"),
             ("novaseq", "nextseq2000", "dnbseq_t7", "mgiseq2000"),
         )
+        self.assertEqual(
+            expand_dataset_selection("matrix_novaseq6000_all"),
+            ("matrix_novaseq6000_train", "matrix_novaseq6000_holdout"),
+        )
+        self.assertEqual(len(expand_dataset_selection("matrix_mixed_train")), 5)
+        self.assertEqual(len(expand_dataset_selection("matrix_all")), 10)
 
     def test_aliases_and_duplicates_are_normalized(self) -> None:
         self.assertEqual(
@@ -114,6 +120,74 @@ class DatasetRegistryTest(unittest.TestCase):
                 items[-1].h5_path.name,
                 "subset_SRR15731080_1.fq.gz.qual_model.h5",
             )
+
+    def test_matrix_novaseq6000_fixed_train_and_all_splits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            train_items = resolve_dataset_files(
+                "matrix_novaseq6000_train",
+                root,
+                require_h5=False,
+                require_fastq=False,
+            )
+            all_items = resolve_dataset_files(
+                "matrix_novaseq6000_all",
+                root,
+                require_h5=False,
+                require_fastq=False,
+            )
+            self.assertEqual(
+                [item.h5_path.name for item in train_items],
+                [
+                    "subset_ERR10746686_1.500k.fastq.gz.qual_model.h5",
+                    "subset_ERR11454184_1.500k.fastq.gz.qual_model.h5",
+                    "subset_ERR16748054_1.500k.fastq.gz.qual_model.h5",
+                ],
+            )
+            self.assertEqual(len(all_items), 6)
+            self.assertEqual(
+                all_items[-1].h5_path.name,
+                "subset_ERR3989434_1.500k.fastq.gz.qual_model.h5",
+            )
+            self.assertEqual(
+                all_items[0].h5_path,
+                root
+                / "matrix/NovaSeq_6000/"
+                "subset_ERR10746686_1.500k.fastq.gz.qual_model.h5",
+            )
+            self.assertEqual(
+                all_items[0].fastq_path,
+                root
+                / "matrix/sub_NovaSeq_6000/"
+                "subset_ERR10746686_1.500k.fastq.gz",
+            )
+
+    def test_every_matrix_group_resolves_three_train_and_six_all_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            platforms = (
+                "dnbseq_t7",
+                "nextseq2000",
+                "novaseq6000",
+                "novaseq_x_plus",
+                "mgiseq_g400",
+            )
+            for platform in platforms:
+                train_items = resolve_dataset_files(
+                    f"matrix_{platform}_train",
+                    root,
+                    require_h5=False,
+                    require_fastq=False,
+                )
+                all_items = resolve_dataset_files(
+                    f"matrix_{platform}_all",
+                    root,
+                    require_h5=False,
+                    require_fastq=False,
+                )
+                self.assertEqual(len(train_items), 3, platform)
+                self.assertEqual(len(all_items), 6, platform)
+                self.assertEqual(all_items[:3], train_items, platform)
 
 
 if __name__ == "__main__":
