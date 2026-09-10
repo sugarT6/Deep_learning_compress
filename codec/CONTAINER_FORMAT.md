@@ -16,7 +16,10 @@ the lossless boundary.
   reproduce the decompressed FASTQ byte for byte. Quality contents themselves
   are represented by the neural probability model and entropy stream.
 - The quality section will record probability-quantization version and total
-  frequency, range-coder version, stream framing, and checksums.
+  frequency, range-coder version, stream framing, and checksums. Stage C fixes
+  quantization version 1 at a default total frequency of `2^16` and range
+  stream version 1 at a 32-bit integer state; the exact standalone entropy
+  format is documented in `RANGE_CODER_FORMAT.md`.
 - An external model is identified by architecture version plus a cryptographic
   checkpoint hash. A decoder must reject a missing or mismatched model.
 - Read lengths or block-level offsets must be available before quality decode.

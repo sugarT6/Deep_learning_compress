@@ -20,13 +20,13 @@ Formal training command (run by the user, not by automated smoke tests):
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.train \
   --cache-dir data/2nd/training_cache \
-  --epochs 15 \
+  --epochs 20 \
   --steps-per-epoch 2000 \
   --batch-reads 64 \
   --train-fraction 0.9 \
   --validation-max-reads-per-file 5000 \
   --num-layers 4 \
-  --output-dir runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e15
+  --output-dir codec/runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e20_v2
 ```
 
 The run directory contains `best.pt`, `last.pt`, `run_config.json`,
@@ -55,7 +55,7 @@ unseen-instrument groups:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.evaluate \
-  runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e15/best.pt \
+  codec/runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e20_v2/best.pt \
   --cache-dir data/2nd/training_cache \
   --batch-reads 64 \
   --max-reads-per-split 0
@@ -63,8 +63,15 @@ CUDA_VISIBLE_DEVICES=0 python -m codec.evaluate \
 
 The report contains per-file theoretical bits/Q, dataset macro average,
 symbol-weighted micro average, platform-family macro average, and the worst
-dataset for each requested group. Range coding and the final container are not
-implemented in this stage.
+dataset for each requested group.
+
+Stage C implements deterministic 42-class probability quantization and an
+independent, single-stream 32-bit integer range coder. The default quantizer
+total is `2^16`; exact rounding, tie-breaking, stream framing, finalization,
+and termination rules are documented in `codec/RANGE_CODER_FORMAT.md`. A
+non-neural adaptive quality histogram has a tested encode/decode round trip.
+The Stage B neural model and the final FASTQ container are intentionally not
+connected to this coder yet.
 
 ## Historical Q-hat-conditioned pipeline
 
