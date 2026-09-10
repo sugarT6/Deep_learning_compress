@@ -10,6 +10,7 @@
 
 # Training artifacts and local caches.
 /runs/
+/codec/runs/
 *.pt
 *.pth
 *.log

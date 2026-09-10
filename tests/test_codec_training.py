@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -5,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+import codec.train as train_module
 from codec.checkpoint import load_training_checkpoint
 from codec.datasets import (
     DATASETS,
@@ -109,24 +112,35 @@ class DirectQualityTrainingTest(unittest.TestCase):
             for index, dataset in enumerate(train_datasets):
                 self._create_dataset_cache(root, dataset, read_count=8, offset=index)
             output_dir = root / "run"
-            best_path = run_training(
-                cache_dir=root,
-                output_dir=output_dir,
-                model_config=tiny_config(),
-                epochs=1,
-                steps_per_epoch=2,
-                batch_reads=2,
-                train_fraction=0.75,
-                validation_max_reads_per_file=2,
-                learning_rate=1e-3,
-                weight_decay=0.0,
-                grad_clip=1.0,
-                device=torch.device("cpu"),
-                seed=11,
-                train_datasets=train_datasets,
-                unseen_datasets=unseen,
-                progress=False,
-            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                best_path = run_training(
+                    cache_dir=root,
+                    output_dir=output_dir,
+                    model_config=tiny_config(),
+                    epochs=1,
+                    steps_per_epoch=2,
+                    batch_reads=2,
+                    train_fraction=0.75,
+                    validation_max_reads_per_file=2,
+                    learning_rate=1e-3,
+                    weight_decay=0.0,
+                    grad_clip=1.0,
+                    device=torch.device("cpu"),
+                    seed=11,
+                    train_datasets=train_datasets,
+                    unseen_datasets=unseen,
+                    progress=True,
+                )
+
+            display = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("epoch=1 loss=", display)
+            self.assertNotIn("dataset=", display)
+            self.assertNotIn("TRAIN_A", display)
+            self.assertNotIn("TRAIN_B", display)
+            if train_module.tqdm is not None:
+                self.assertIn("epoch 1/1", display)
 
             self.assertTrue(best_path.is_file())
             self.assertTrue((output_dir / "last.pt").is_file())

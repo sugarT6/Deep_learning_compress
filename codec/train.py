@@ -16,6 +16,11 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 import numpy as np
 import torch
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional
+    tqdm = None
+
 from .checkpoint import save_training_checkpoint
 from .datasets import (
     TRAIN_DATASETS,
@@ -349,7 +354,17 @@ def run_training(
             model.train()
             epoch_nats = 0.0
             epoch_symbols = 0
-            for step in range(1, steps_per_epoch + 1):
+            step_iter = range(1, steps_per_epoch + 1)
+            if progress and tqdm is not None:
+                step_iter = tqdm(
+                    step_iter,
+                    total=steps_per_epoch,
+                    desc=f"epoch {epoch}/{epochs}",
+                    unit="batch",
+                    leave=True,
+                )
+
+            for step in step_iter:
                 sample = sampler.sample_batch()
                 tensors = fastq_batch_to_tensors(sample.batch, device)
                 optimizer.zero_grad(set_to_none=True)
@@ -365,12 +380,15 @@ def run_training(
                 epoch_nats += float(loss.item()) * symbols
                 epoch_symbols += symbols
                 global_step += 1
-                if progress:
-                    print(
-                        f"epoch={epoch} step={step}/{steps_per_epoch} "
-                        f"dataset={sample.dataset.accession} "
-                        f"loss_bits/Q={loss.item() / math.log(2.0):.6f}",
-                        flush=True,
+                if (
+                    progress
+                    and tqdm is not None
+                    and (step % 10 == 0 or step == steps_per_epoch)
+                ):
+                    step_iter.set_postfix(
+                        train_bits=(
+                            f"{epoch_nats / (epoch_symbols * math.log(2.0)):.4f}"
+                        )
                     )
 
             _, validation_summary = evaluate_validation(
@@ -381,16 +399,14 @@ def run_training(
             )
             validation_bits = validation_summary["symbol_micro_bits_per_quality"]
             sampling_statistics = sampler.statistics_dict()
-            _write_json_atomic(
-                output_dir / "sampling_statistics.json", sampling_statistics
-            )
+            train_loss = epoch_nats / epoch_symbols
+            train_bits = train_loss / math.log(2.0)
             epoch_record = {
                 "epoch": epoch,
                 "global_step": global_step,
-                "train_bits_per_quality": epoch_nats
-                / (epoch_symbols * math.log(2.0)),
+                "train_loss": train_loss,
+                "train_bits_per_quality": train_bits,
                 "validation": validation_summary,
-                "sampling_statistics": sampling_statistics,
             }
             with (output_dir / "training_log.jsonl").open(
                 "a", encoding="utf-8"
@@ -416,12 +432,15 @@ def run_training(
                 save_training_checkpoint(best_path, **checkpoint_arguments)
             if progress:
                 print(
-                    f"epoch={epoch} train_bits/Q="
-                    f"{epoch_record['train_bits_per_quality']:.6f} "
-                    f"validation_bits/Q={validation_bits:.6f} "
-                    f"best={best_validation_bits:.6f}",
+                    f"epoch={epoch} loss={train_loss:.4f} "
+                    f"train_bits={train_bits:.4f} "
+                    f"val_bits={validation_bits:.4f} "
+                    f"best_val_bits={best_validation_bits:.4f}",
                     flush=True,
                 )
+        _write_json_atomic(
+            output_dir / "sampling_statistics.json", sampler.statistics_dict()
+        )
     return best_path
 
 
