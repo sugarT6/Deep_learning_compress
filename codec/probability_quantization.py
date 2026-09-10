@@ -46,6 +46,12 @@ def _validate_total(total: int) -> int:
     return normalized_total
 
 
+def validate_total(total: int) -> int:
+    """Return a validated version-1 quantization total."""
+
+    return _validate_total(total)
+
+
 def _as_quality_vector(values: Sequence[float], *, name: str) -> np.ndarray:
     try:
         vector = np.asarray(values, dtype=np.float64)
@@ -237,4 +243,5 @@ __all__ = [
     "probabilities_to_cdf",
     "probabilities_to_frequencies",
     "quantized_symbol_bits",
+    "validate_total",
 ]

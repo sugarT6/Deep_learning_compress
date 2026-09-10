@@ -2,9 +2,8 @@
 
 The package is intentionally independent of the historical SeqArc/HDF5
 probability-matrix pipeline.  It contains the direct FASTQ/cache contract,
-minimal causal model, deterministic probability quantizer, and integer range
-coder.  The entropy coder remains independent of the neural model until the
-container integration stage.
+minimal causal model, deterministic probability quantizer, integer range
+coder, and byte-exact FASTQ container contract.
 """
 
 from .fastq_stream import (
@@ -22,6 +21,14 @@ from ._range_common import (
     RangeCodingError,
     TruncatedRangeStreamError,
 )
+from .container import (
+    CONTAINER_FORMAT,
+    CONTAINER_VERSION,
+    ContainerError,
+    ContainerIntegrityError,
+    TruncatedContainerError,
+    read_container,
+)
 from .probability_quantization import (
     QUANTIZATION_VERSION,
     TOTAL,
@@ -32,6 +39,10 @@ from .range_decoder import RangeDecoder
 from .range_encoder import RangeEncoder
 
 __all__ = [
+    "CONTAINER_FORMAT",
+    "CONTAINER_VERSION",
+    "ContainerError",
+    "ContainerIntegrityError",
     "DEFAULT_BATCH_READS",
     "FastqBatch",
     "InvalidCDFError",
@@ -44,9 +55,11 @@ __all__ = [
     "RangeDecoder",
     "RangeEncoder",
     "TOTAL",
+    "TruncatedContainerError",
     "TruncatedRangeStreamError",
     "iter_fastq_batches",
     "iter_fastq_records",
     "logits_to_cdf",
     "probabilities_to_cdf",
+    "read_container",
 ]

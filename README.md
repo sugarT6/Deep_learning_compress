@@ -70,8 +70,36 @@ independent, single-stream 32-bit integer range coder. The default quantizer
 total is `2^16`; exact rounding, tie-breaking, stream framing, finalization,
 and termination rules are documented in `codec/RANGE_CODER_FORMAT.md`. A
 non-neural adaptive quality histogram has a tested encode/decode round trip.
-The Stage B neural model and the final FASTQ container are intentionally not
-connected to this coder yet.
+The Stage C modules themselves remain independent of the neural model.
+
+Stage D connects the trained model to the quantizer and single range stream,
+while keeping training caches out of the runtime codec. Encode a gzip FASTQ:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
+  data/2nd/ERR2755197_1.head2M.fastq.gz \
+  output/ERR2755197.fqdc \
+  codec/runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e20_v2/best.pt \
+  --device cuda \
+  --batch-reads 64
+```
+
+Decode either to plain FASTQ or to a new gzip member:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m codec.decode \
+  output/ERR2755197.fqdc \
+  output/ERR2755197.restored.fastq.gz \
+  codec/runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e20_v2/best.pt \
+  --device cuda \
+  --batch-reads 64
+```
+
+Both commands show progress on stderr and emit JSON statistics on stdout;
+`--no-progress` disables the progress bar. Decode requires the exact checkpoint
+SHA-256 and the batch size stored in the container. The decompressed output is
+verified against the source FASTQ SHA-256 before it is atomically published.
+The format and lossless boundary are specified in `codec/CONTAINER_FORMAT.md`.
 
 ## Historical Q-hat-conditioned pipeline
 
