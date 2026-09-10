@@ -10,7 +10,8 @@ from typing import BinaryIO, Iterable, Iterator, Optional, Sequence, Tuple, Unio
 import numpy as np
 
 
-DEFAULT_BATCH_READS = 64
+DEFAULT_BATCH_READS = 256
+MAX_BATCH_READS = 256
 SUPPORTED_FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 
 PHRED_OFFSET = 33
@@ -224,9 +225,9 @@ def make_fastq_batch(
     read_count = len(base_rows)
     if read_count == 0:
         raise ValueError("a FastqBatch must contain at least one read")
-    if read_count > DEFAULT_BATCH_READS:
+    if read_count > MAX_BATCH_READS:
         raise ValueError(
-            f"a FastqBatch may contain at most {DEFAULT_BATCH_READS} reads"
+            f"a FastqBatch may contain at most {MAX_BATCH_READS} reads"
         )
     if len(quality_rows) != read_count or len(read_indices) != read_count:
         raise ValueError("base, quality, and read-index counts must match")
@@ -297,10 +298,10 @@ def _batch_from_parsed_records(
 def iter_fastq_batches(
     path: Union[str, Path], *, batch_reads: int = DEFAULT_BATCH_READS
 ) -> Iterator[FastqBatch]:
-    """Stream validated FASTQ records in batches of at most 64 reads."""
+    """Stream validated FASTQ records in batches of at most 256 reads."""
 
-    if batch_reads <= 0 or batch_reads > DEFAULT_BATCH_READS:
-        raise ValueError(f"batch_reads must be in [1, {DEFAULT_BATCH_READS}]")
+    if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
+        raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
     path = Path(path)
     pending = []
     for parsed_record in _iter_fastq_records_with_ids(path):

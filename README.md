@@ -81,7 +81,7 @@ CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
   output/ERR2755197.fqdc \
   codec/runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e20_v2/best.pt \
   --device cuda \
-  --batch-reads 64
+  --batch-reads 256
 ```
 
 Decode either to plain FASTQ or to a new gzip member:
@@ -92,7 +92,7 @@ CUDA_VISIBLE_DEVICES=0 python -m codec.decode \
   output/ERR2755197.restored.fastq.gz \
   codec/runs/direct_quality_no_seqarc_qmer234_baseconv357_b64_e20_v2/best.pt \
   --device cuda \
-  --batch-reads 64
+  --batch-reads 256
 ```
 
 Both commands show progress on stderr and emit JSON statistics on stdout;
@@ -100,6 +100,10 @@ Both commands show progress on stderr and emit JSON statistics on stdout;
 SHA-256 and the batch size stored in the container. The decompressed output is
 verified against the source FASTQ SHA-256 before it is atomically published.
 The format and lossless boundary are specified in `codec/CONTAINER_FORMAT.md`.
+The runtime codec defaults to 256 reads per batch. This does not require a new
+checkpoint: training batch size is not part of the model architecture. Existing
+containers that store a 64-read grouping remain decodable by passing
+`--batch-reads 64`.
 
 ## Historical Q-hat-conditioned pipeline
 

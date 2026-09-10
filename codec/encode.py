@@ -33,6 +33,7 @@ from .container import (
 )
 from .fastq_stream import (
     DEFAULT_BATCH_READS,
+    MAX_BATCH_READS,
     PHRED_OFFSET,
     QUALITY_ALPHABET_SIZE,
     FastqBatch,
@@ -162,8 +163,8 @@ def encode_fastq(
     output_path = Path(output_path)
     checkpoint_path = Path(checkpoint_path)
     _validate_paths(input_path, output_path, checkpoint_path)
-    if batch_reads <= 0 or batch_reads > DEFAULT_BATCH_READS:
-        raise ValueError(f"batch_reads must be in [1, {DEFAULT_BATCH_READS}]")
+    if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
+        raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
     quantization_total = validate_total(quantization_total)
 
     checkpoint_sha256 = sha256_file(checkpoint_path)

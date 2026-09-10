@@ -8,6 +8,7 @@ coder, and byte-exact FASTQ container contract.
 
 from .fastq_stream import (
     DEFAULT_BATCH_READS,
+    MAX_BATCH_READS,
     FastqBatch,
     RawFastqRecord,
     iter_fastq_batches,
@@ -44,6 +45,7 @@ __all__ = [
     "ContainerError",
     "ContainerIntegrityError",
     "DEFAULT_BATCH_READS",
+    "MAX_BATCH_READS",
     "FastqBatch",
     "InvalidCDFError",
     "InvalidRangeStreamError",

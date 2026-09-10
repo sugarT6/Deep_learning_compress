@@ -22,6 +22,7 @@ import numpy as np
 from .fastq_stream import (
     BASE_OTHER_ID,
     DEFAULT_BATCH_READS,
+    MAX_BATCH_READS,
     PHRED_OFFSET,
     QUALITY_ALPHABET_SIZE,
     FastqBatch,
@@ -498,15 +499,15 @@ class TrainingCacheReader:
         return self._handle
 
     def read_indices(self, read_indices: Sequence[int]) -> FastqBatch:
-        """Read up to 64 reads by zero-based index in the requested order."""
+        """Read up to 256 reads by zero-based index in the requested order."""
 
         handle = self._require_open()
         requested = np.asarray(read_indices, dtype=np.int64)
         if requested.ndim != 1 or requested.size == 0:
             raise ValueError("read_indices must be a nonempty one-dimensional sequence")
-        if requested.size > DEFAULT_BATCH_READS:
+        if requested.size > MAX_BATCH_READS:
             raise ValueError(
-                f"a cache batch may contain at most {DEFAULT_BATCH_READS} reads"
+                f"a cache batch may contain at most {MAX_BATCH_READS} reads"
             )
         if int(requested.min()) < 0 or int(requested.max()) >= self.metadata.read_count:
             raise IndexError("cache read index out of range")
@@ -534,13 +535,13 @@ class TrainingCacheReader:
         )
 
     def read_range(self, start: int, stop: int) -> FastqBatch:
-        """Read a contiguous half-open read range containing at most 64 reads."""
+        """Read a contiguous half-open read range containing at most 256 reads."""
 
         if start < 0 or stop <= start or stop > self.metadata.read_count:
             raise IndexError("invalid cache read range")
-        if stop - start > DEFAULT_BATCH_READS:
+        if stop - start > MAX_BATCH_READS:
             raise ValueError(
-                f"a cache batch may contain at most {DEFAULT_BATCH_READS} reads"
+                f"a cache batch may contain at most {MAX_BATCH_READS} reads"
             )
         handle = self._require_open()
         offsets = handle["read_offsets"][start : stop + 1]
@@ -571,8 +572,8 @@ class TrainingCacheReader:
     def iter_batches(
         self, *, batch_reads: int = DEFAULT_BATCH_READS
     ) -> Iterator[FastqBatch]:
-        if batch_reads <= 0 or batch_reads > DEFAULT_BATCH_READS:
-            raise ValueError(f"batch_reads must be in [1, {DEFAULT_BATCH_READS}]")
+        if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
+            raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
         for start in range(0, self.metadata.read_count, batch_reads):
             stop = min(start + batch_reads, self.metadata.read_count)
             yield self.read_range(start, stop)
@@ -613,8 +614,8 @@ class BalancedTrainingCacheSampler:
     def sample_batch(
         self, *, batch_reads: int = DEFAULT_BATCH_READS
     ) -> SampledCacheBatch:
-        if batch_reads <= 0 or batch_reads > DEFAULT_BATCH_READS:
-            raise ValueError(f"batch_reads must be in [1, {DEFAULT_BATCH_READS}]")
+        if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
+            raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
         family = self._families[int(self._rng.integers(len(self._families)))]
         paths = self._paths[family]
         cache_path = paths[int(self._rng.integers(len(paths)))]

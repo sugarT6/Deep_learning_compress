@@ -82,7 +82,7 @@ class TrainingCacheTest(unittest.TestCase):
             root = Path(temporary_directory)
             fastq_path = root / "reads.fq.gz"
             with gzip.open(fastq_path, "wb") as handle:
-                handle.write(make_variable_fastq(70))
+                handle.write(make_variable_fastq(270))
             cache_path = root / "reads.direct_quality.h5"
             create_training_cache(fastq_path, cache_path, flush_symbols=7)
 
@@ -93,7 +93,9 @@ class TrainingCacheTest(unittest.TestCase):
                 cache_batches = list(reader.iter_batches())
 
             self.assertEqual(len(direct_batches), len(cache_batches))
-            self.assertEqual([batch.read_count for batch in cache_batches], [64, 6])
+            self.assertEqual(
+                [batch.read_count for batch in cache_batches], [256, 14]
+            )
             for direct, cached in zip(direct_batches, cache_batches):
                 np.testing.assert_array_equal(cached.bases, direct.bases)
                 np.testing.assert_array_equal(cached.qualities, direct.qualities)

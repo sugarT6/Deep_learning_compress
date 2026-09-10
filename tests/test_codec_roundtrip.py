@@ -16,9 +16,12 @@ from codec.container import (
     TruncatedContainerError,
     read_container,
 )
-from codec.decode import ModelMismatchError, decode_fastq
-from codec.encode import CodecDeterminismError, _quantize_verified_batch, encode_fastq
-from codec.fastq_stream import iter_fastq_batches
+from codec.decode import ModelMismatchError, build_parser as build_decode_parser
+from codec.decode import decode_fastq
+from codec.encode import CodecDeterminismError, _quantize_verified_batch
+from codec.encode import build_parser as build_encode_parser
+from codec.encode import encode_fastq
+from codec.fastq_stream import DEFAULT_BATCH_READS, iter_fastq_batches
 from codec.model import DirectQualityModelConfig, DirectQualityTransformer
 
 
@@ -104,7 +107,14 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
                 handle.write(contents)
         return path
 
-    def _round_trip(self, root, read_count, *, gzip_output=False):
+    def _round_trip(
+        self,
+        root,
+        read_count,
+        *,
+        gzip_output=False,
+        batch_reads=DEFAULT_BATCH_READS,
+    ):
         root = Path(root)
         checkpoint, _ = self._checkpoint(root)
         original = fastq_bytes(read_count)
@@ -116,7 +126,7 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
             container,
             checkpoint,
             device=torch.device("cpu"),
-            batch_reads=64,
+            batch_reads=batch_reads,
             progress=False,
         )
         decode_stats = decode_fastq(
@@ -124,7 +134,7 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
             output,
             checkpoint,
             device=torch.device("cpu"),
-            batch_reads=64,
+            batch_reads=batch_reads,
             progress=False,
         )
         if gzip_output:
@@ -135,8 +145,27 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
         self.assertEqual(restored, original)
         return container, encode_stats, decode_stats
 
-    def test_63_64_65_reads_variable_lengths_and_last_batch_round_trip(self):
-        for read_count in (63, 64, 65):
+    def test_codec_cli_defaults_to_256_reads(self):
+        encode_args = build_encode_parser().parse_args(
+            ["input.fq.gz", "output.fqdc", "model.pt"]
+        )
+        decode_args = build_decode_parser().parse_args(
+            ["input.fqdc", "output.fq", "model.pt"]
+        )
+        self.assertEqual(encode_args.batch_reads, 256)
+        self.assertEqual(decode_args.batch_reads, 256)
+
+    def test_existing_64_read_grouping_remains_supported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            container, encode_stats, decode_stats = self._round_trip(
+                temporary_directory, 65, batch_reads=64
+            )
+            self.assertEqual(encode_stats.batch_count, 2)
+            self.assertEqual(decode_stats.read_count, 65)
+            self.assertEqual(read_container(container).metadata["batch_reads"], 64)
+
+    def test_63_64_65_and_255_256_257_reads_round_trip(self):
+        for read_count in (63, 64, 65, 255, 256, 257):
             with self.subTest(read_count=read_count):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     container, encode_stats, decode_stats = self._round_trip(
@@ -146,7 +175,8 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
                     self.assertEqual(encode_stats.read_count, read_count)
                     self.assertEqual(encode_stats.quality_symbols, expected_symbols)
                     self.assertEqual(
-                        encode_stats.batch_count, math.ceil(read_count / 64)
+                        encode_stats.batch_count,
+                        math.ceil(read_count / DEFAULT_BATCH_READS),
                     )
                     self.assertEqual(decode_stats.quality_symbols, expected_symbols)
                     info = read_container(container)
@@ -154,10 +184,12 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
                         tuple(section.name for section in info.sections), SECTION_NAMES
                     )
                     self.assertEqual(info.metadata["read_count"], read_count)
-                    self.assertEqual(info.metadata["batch_reads"], 64)
+                    self.assertEqual(
+                        info.metadata["batch_reads"], DEFAULT_BATCH_READS
+                    )
                     self.assertEqual(
                         info.metadata["last_batch_read_count"],
-                        64 if read_count == 64 else read_count % 64,
+                        ((read_count - 1) % DEFAULT_BATCH_READS) + 1,
                     )
                     self.assertEqual(
                         info.file_size,
@@ -339,7 +371,7 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
                     root / "wrong_batch.fastq",
                     checkpoint,
                     device=torch.device("cpu"),
-                    batch_reads=64,
+                    batch_reads=DEFAULT_BATCH_READS,
                     progress=False,
                 )
 

@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
+from .fastq_stream import MAX_BATCH_READS
+
 
 CONTAINER_FORMAT = "fastq-direct-quality-container"
 CONTAINER_VERSION = 1
@@ -201,8 +203,8 @@ def _validate_metadata(metadata: Mapping[str, Any]) -> None:
     if _integer(metadata.get("format_version"), name="format_version") != CONTAINER_VERSION:
         raise ContainerError("unsupported container format version")
     batch_reads = _integer(metadata.get("batch_reads"), name="batch_reads", minimum=1)
-    if batch_reads > 64:
-        raise ContainerError("batch_reads must not exceed 64")
+    if batch_reads > MAX_BATCH_READS:
+        raise ContainerError(f"batch_reads must not exceed {MAX_BATCH_READS}")
     read_count = _integer(metadata.get("read_count"), name="read_count")
     expected_batches = (read_count + batch_reads - 1) // batch_reads
     if _integer(metadata.get("batch_count"), name="batch_count") != expected_batches:

@@ -39,6 +39,7 @@ from .encode import CodecDeterminismError, choose_device
 from .fastq_stream import (
     BASE_PAD_ID,
     DEFAULT_BATCH_READS,
+    MAX_BATCH_READS,
     PHRED_OFFSET,
     QUALITY_ALPHABET_SIZE,
     QUALITY_PAD_ID,
@@ -380,8 +381,8 @@ def decode_fastq(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
     _validate_output_path(output_path)
-    if batch_reads <= 0 or batch_reads > DEFAULT_BATCH_READS:
-        raise ValueError(f"batch_reads must be in [1, {DEFAULT_BATCH_READS}]")
+    if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
+        raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
 
     container_info = read_container(container_path, verify_checksums=True)
     quantization_total = _validate_codec_metadata(

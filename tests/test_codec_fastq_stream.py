@@ -14,6 +14,8 @@ from codec.fastq_stream import (
     BASE_OTHER_ID,
     BASE_PAD_ID,
     BASE_T_ID,
+    DEFAULT_BATCH_READS,
+    MAX_BATCH_READS,
     QUALITY_PAD_ID,
     iter_cycle_major_positions,
     iter_fastq_batches,
@@ -61,8 +63,11 @@ class FastqStreamTest(unittest.TestCase):
                 (1, [1]),
                 (17, [17]),
                 (64, [64]),
-                (65, [64, 1]),
-                (129, [64, 64, 1]),
+                (65, [65]),
+                (255, [255]),
+                (256, [256]),
+                (257, [256, 1]),
+                (513, [256, 256, 1]),
             ):
                 with self.subTest(read_count=read_count):
                     path = self._write(
@@ -80,6 +85,8 @@ class FastqStreamTest(unittest.TestCase):
                     np.testing.assert_array_equal(
                         observed_order, np.arange(read_count, dtype=np.int64)
                     )
+            self.assertEqual(DEFAULT_BATCH_READS, 256)
+            self.assertEqual(MAX_BATCH_READS, 256)
 
     def test_variable_lengths_padding_mask_and_cycle_major_order(self):
         data = (
@@ -181,7 +188,7 @@ class FastqStreamTest(unittest.TestCase):
                 temporary_directory, "reads.fq", b"@r\nA\n+\n!\n"
             )
             with self.assertRaisesRegex(ValueError, "batch_reads"):
-                list(iter_fastq_batches(valid, batch_reads=65))
+                list(iter_fastq_batches(valid, batch_reads=257))
 
     def test_corrupt_gzip_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -8,6 +8,7 @@
 *.fastq.gz
 *.h5
 *.fqdc
+*.fqdc.sections.*
 
 # Training artifacts and local caches.
 /runs/

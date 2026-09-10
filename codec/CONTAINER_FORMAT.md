@@ -41,7 +41,7 @@ Metadata records at least:
 - format magic/version and flags;
 - source basename, compressed size, decompressed size, and decompressed
   SHA-256;
-- read count, configured batch size (at most 64), batch count, last-batch read
+- read count, configured batch size (at most 256), batch count, last-batch read
   count, and quality symbol count;
 - gzip side-stream schema and compression level;
 - probability quantizer version, total frequency, Q0--Q41 alphabet, and
@@ -108,6 +108,14 @@ that batch, every active position is also recomputed with `forward_step` and
 the two integer CDFs must be identical. Decoding uses `forward_step` cycle by
 cycle and performs a post-batch `forward_full` integer-CDF check after all true
 qualities have been recovered.
+
+The current default and maximum are 256 reads. The batch dimension is not a
+trained model parameter, so checkpoints trained with 64-read batches remain
+valid. The exact batch size is stored because encoder and decoder must recreate
+the same tensor grouping. Early version-1 implementations limited this value
+to 64; current readers still accept those containers, while early readers will
+reject new version-1 containers whose stored value exceeds 64. The binary
+layout itself did not change.
 
 The encoder computes the SHA-256 of the decompressed source records during its
 single FASTQ pass. Decode writes to a temporary file, hashes the reconstructed
