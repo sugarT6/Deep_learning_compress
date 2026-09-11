@@ -35,7 +35,12 @@ from .container import (
     read_container,
     sha256_file,
 )
-from .encode import CodecDeterminismError, choose_device
+from .encode import (
+    CodecDeterminismError,
+    _add_timing,
+    _synchronize_device,
+    choose_device,
+)
 from .fastq_stream import (
     BASE_PAD_ID,
     DEFAULT_BATCH_READS,
@@ -70,6 +75,7 @@ class DecodeStatistics:
     quality_symbols: int
     decode_seconds: float
     reconstructed_sha256: str
+    timing_seconds: Dict[str, float]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -173,8 +179,12 @@ def _decode_quality_batch(
     device: torch.device,
     quantization_total: int,
     first_read_index: int,
+    timings: Dict[str, float],
 ) -> Tuple[np.ndarray, int]:
+    stage_started = time.perf_counter()
     bases, lengths, active_mask = _batch_tensors(base_records, device)
+    _synchronize_device(device)
+    _add_timing(timings, "tensor_transfer", stage_started)
     read_count, maximum_length = bases.shape
     decoded = torch.full(
         (read_count, maximum_length),
@@ -187,12 +197,18 @@ def _decode_quality_batch(
 
     with torch.inference_mode():
         for cycle in range(maximum_length):
+            _synchronize_device(device)
+            stage_started = time.perf_counter()
             step_logits = model.forward_step(
                 bases,
                 decoded[:, :cycle],
                 lengths,
                 active_mask,
             )
+            _synchronize_device(device)
+            _add_timing(timings, "model_forward_step", stage_started)
+            stage_started = time.perf_counter()
+            cycle_cdfs = []
             for row in range(read_count):
                 if not bool(active_mask[row, cycle].item()):
                     continue
@@ -200,12 +216,24 @@ def _decode_quality_batch(
                     step_logits[row].detach().cpu().numpy(),
                     total=quantization_total,
                 )
+                cycle_cdfs.append((row, cdf))
+            _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
+
+            stage_started = time.perf_counter()
+            for row, cdf in cycle_cdfs:
                 symbol = range_decoder.decode(cdf)
                 decoded[row, cycle] = symbol
                 step_cdfs.append((row, cycle, cdf))
                 decoded_symbols += 1
+            _synchronize_device(device)
+            _add_timing(timings, "range_decode_and_symbol_update", stage_started)
 
+        _synchronize_device(device)
+        stage_started = time.perf_counter()
         full_logits = model.forward_full(bases, decoded, lengths, active_mask)
+        _synchronize_device(device)
+        _add_timing(timings, "model_forward_full_verification", stage_started)
+        stage_started = time.perf_counter()
         for row, cycle, step_cdf in step_cdfs:
             full_cdf = logits_to_cdf(
                 full_logits[row, cycle].detach().cpu().numpy(),
@@ -216,7 +244,11 @@ def _decode_quality_batch(
                     "decoder forward_step/forward_full integer CDF mismatch at "
                     f"read {first_read_index + row}, cycle {cycle}"
                 )
-    return decoded.cpu().numpy(), decoded_symbols
+        _add_timing(timings, "cdf_verification_and_transfer", stage_started)
+    stage_started = time.perf_counter()
+    decoded_array = decoded.cpu().numpy()
+    _add_timing(timings, "decoded_tensor_to_cpu", stage_started)
+    return decoded_array, decoded_symbols
 
 
 def _validate_side_records(
@@ -274,6 +306,7 @@ def _decode_to_handle(
     batch_reads: int,
     quantization_total: int,
     progress_bar: Any,
+    timings: Dict[str, float],
 ) -> Tuple[int, int, str]:
     metadata = container_info.metadata
     read_count = int(metadata["read_count"])
@@ -317,6 +350,7 @@ def _decode_to_handle(
             headers = []
             bases = []
             pluses = []
+            stage_started = time.perf_counter()
             for batch_row in range(current_batch_reads):
                 read_index = batch_start + batch_row
                 header = header_reader.read_record()
@@ -332,6 +366,7 @@ def _decode_to_handle(
                 headers.append(header)
                 bases.append(base)
                 pluses.append(plus)
+            _add_timing(timings, "side_stream_read", stage_started)
 
             decoded, batch_symbols = _decode_quality_batch(
                 model,
@@ -340,8 +375,10 @@ def _decode_to_handle(
                 device=device,
                 quantization_total=quantization_total,
                 first_read_index=batch_start,
+                timings=timings,
             )
             decoded_symbols += batch_symbols
+            stage_started = time.perf_counter()
             for row, (header, base, plus) in enumerate(
                 zip(headers, bases, pluses)
             ):
@@ -350,14 +387,19 @@ def _decode_to_handle(
                 output.write(record)
                 reconstructed_digest.update(record)
                 reconstructed_size += len(record)
+            _add_timing(timings, "fastq_output_write", stage_started)
             if progress_bar is not None:
                 progress_bar.update(batch_symbols)
 
+        stage_started = time.perf_counter()
         header_reader.finish()
         base_reader.finish()
         plus_reader.finish()
+        _add_timing(timings, "side_stream_read", stage_started)
 
+    stage_started = time.perf_counter()
     range_decoder.finish()
+    _add_timing(timings, "range_decode_and_symbol_update", stage_started)
     return reconstructed_size, decoded_symbols, reconstructed_digest.hexdigest()
 
 
@@ -384,11 +426,32 @@ def decode_fastq(
     if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
         raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
 
+    timings = {
+        "container_validation": 0.0,
+        "checkpoint_hash_and_load": 0.0,
+        "quality_stream_read_and_init": 0.0,
+        "side_stream_read": 0.0,
+        "tensor_transfer": 0.0,
+        "model_forward_step": 0.0,
+        "cdf_quantization_and_transfer": 0.0,
+        "range_decode_and_symbol_update": 0.0,
+        "model_forward_full_verification": 0.0,
+        "cdf_verification_and_transfer": 0.0,
+        "decoded_tensor_to_cpu": 0.0,
+        "fastq_output_write": 0.0,
+        "output_finalize": 0.0,
+    }
+    stage_started = time.perf_counter()
     container_info = read_container(container_path, verify_checksums=True)
     quantization_total = _validate_codec_metadata(
         container_info.metadata, batch_reads=batch_reads
     )
+    _add_timing(timings, "container_validation", stage_started)
+    stage_started = time.perf_counter()
     model = _validate_checkpoint(checkpoint_path, container_info.metadata, device)
+    _synchronize_device(device)
+    _add_timing(timings, "checkpoint_hash_and_load", stage_started)
+    stage_started = time.perf_counter()
     quality_range_bytes = container_info.read_section("quality_range")
     range_decoder = RangeDecoder(quality_range_bytes)
     expected_symbols = int(container_info.metadata["quality_symbol_count"])
@@ -403,6 +466,7 @@ def decode_fastq(
         raise ContainerIntegrityError(
             "quality range payload length does not match container metadata"
         )
+    _add_timing(timings, "quality_stream_read_and_init", stage_started)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -438,6 +502,7 @@ def decode_fastq(
                             batch_reads=batch_reads,
                             quantization_total=quantization_total,
                             progress_bar=progress_bar,
+                            timings=timings,
                         )
                     )
             else:
@@ -451,10 +516,13 @@ def decode_fastq(
                         batch_reads=batch_reads,
                         quantization_total=quantization_total,
                         progress_bar=progress_bar,
+                        timings=timings,
                     )
                 )
+            stage_started = time.perf_counter()
             raw_output.flush()
             os.fsync(raw_output.fileno())
+            _add_timing(timings, "output_finalize", stage_started)
 
         if decoded_symbols != expected_symbols:
             raise ContainerIntegrityError(
@@ -466,7 +534,9 @@ def decode_fastq(
             raise ContainerIntegrityError("reconstructed FASTQ size mismatch")
         if reconstructed_hash != container_info.metadata["source_uncompressed_sha256"]:
             raise ContainerIntegrityError("reconstructed FASTQ SHA-256 mismatch")
+        stage_started = time.perf_counter()
         os.replace(str(temporary_path), str(output_path))
+        _add_timing(timings, "output_finalize", stage_started)
     except Exception:
         try:
             temporary_path.unlink()
@@ -477,14 +547,19 @@ def decode_fastq(
         if progress_bar is not None:
             progress_bar.close()
 
+    decode_seconds = time.perf_counter() - started
+    accounted_seconds = sum(timings.values())
+    timings["unattributed"] = max(0.0, decode_seconds - accounted_seconds)
+    timings["total"] = decode_seconds
     return DecodeStatistics(
         container_bytes=container_info.file_size,
         output_bytes=output_path.stat().st_size,
         output_uncompressed_bytes=reconstructed_size,
         read_count=int(container_info.metadata["read_count"]),
         quality_symbols=decoded_symbols,
-        decode_seconds=time.perf_counter() - started,
+        decode_seconds=decode_seconds,
         reconstructed_sha256=reconstructed_hash,
+        timing_seconds=timings,
     )
 
 

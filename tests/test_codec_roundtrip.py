@@ -164,6 +164,56 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
             self.assertEqual(decode_stats.read_count, 65)
             self.assertEqual(read_container(container).metadata["batch_reads"], 64)
 
+    def test_statistics_include_non_overlapping_stage_timings(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, encode_stats, decode_stats = self._round_trip(
+                temporary_directory, 3
+            )
+
+        encode_keys = {
+            "checkpoint_hash_and_load",
+            "fastq_parse",
+            "side_stream_record_write",
+            "tensor_transfer",
+            "model_forward_full",
+            "model_forward_step_verification",
+            "cdf_quantization_and_transfer",
+            "range_encode",
+            "range_finalize_and_stage",
+            "container_write",
+            "unattributed",
+            "total",
+        }
+        decode_keys = {
+            "container_validation",
+            "checkpoint_hash_and_load",
+            "quality_stream_read_and_init",
+            "side_stream_read",
+            "tensor_transfer",
+            "model_forward_step",
+            "cdf_quantization_and_transfer",
+            "range_decode_and_symbol_update",
+            "model_forward_full_verification",
+            "cdf_verification_and_transfer",
+            "decoded_tensor_to_cpu",
+            "fastq_output_write",
+            "output_finalize",
+            "unattributed",
+            "total",
+        }
+        self.assertEqual(set(encode_stats.timing_seconds), encode_keys)
+        self.assertEqual(set(decode_stats.timing_seconds), decode_keys)
+        for timings, total in (
+            (encode_stats.timing_seconds, encode_stats.encode_seconds),
+            (decode_stats.timing_seconds, decode_stats.decode_seconds),
+        ):
+            self.assertTrue(all(value >= 0.0 for value in timings.values()))
+            self.assertEqual(timings["total"], total)
+            accounted = sum(
+                value for name, value in timings.items() if name != "total"
+            )
+            self.assertAlmostEqual(accounted, total, places=6)
+
     def test_63_64_65_and_255_256_257_reads_round_trip(self):
         for read_count in (63, 64, 65, 255, 256, 257):
             with self.subTest(read_count=read_count):

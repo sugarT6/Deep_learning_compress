@@ -105,6 +105,17 @@ checkpoint: training batch size is not part of the model architecture. Existing
 containers that store a 64-read grouping remain decodable by passing
 `--batch-reads 64`.
 
+Both JSON reports include a nested `timing_seconds` breakdown. Encoder timing
+separates FASTQ parsing, gzip side-record writes, tensor transfer, parallel
+`forward_full`, autoregressive `forward_step` verification, logit transfer/CDF
+quantization, range encoding/finalization, and container writing. Decoder timing
+separates container/checkpoint validation, side-stream reads, tensor transfer,
+autoregressive model prediction, CDF quantization, range decoding/symbol update,
+post-batch `forward_full` verification, and FASTQ output. `unattributed` contains
+small orchestration and stream-close costs not assigned to another stage.
+CUDA is synchronized at model timing boundaries, so reported GPU prediction
+times represent completed device work rather than asynchronous launch time.
+
 ## Historical Q-hat-conditioned pipeline
 
 The historical pipeline defaults to direct 42-class body-quality prediction
