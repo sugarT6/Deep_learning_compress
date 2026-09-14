@@ -2,8 +2,8 @@
 
 The Stage D container reconstructs the decompressed FASTQ content byte for
 byte. It does not attempt to reproduce the original gzip member bytes. Encoding
-reads `.fastq.gz` or `.fq.gz` sequentially and never creates or reads a
-training cache.
+reads `.fastq`, `.fq`, `.fastq.gz`, or `.fq.gz` sequentially and never creates
+or reads a training cache.
 
 ## Top-level layout
 
@@ -39,8 +39,10 @@ are errors.
 Metadata records at least:
 
 - format magic/version and flags;
-- source basename, compressed size, decompressed size, and decompressed
-  SHA-256;
+- source basename, input-file size (stored in the legacy
+  `source_compressed_size` key), uncompressed FASTQ size, and uncompressed
+  FASTQ SHA-256; for a plain FASTQ the input-file and uncompressed sizes are
+  equal;
 - read count, configured batch size (at most 256), batch count, last-batch read
   count, and quality symbol count;
 - gzip side-stream schema and compression level;
@@ -103,11 +105,11 @@ section and by its own frame.
 
 Reads are grouped exactly by the stored `batch_reads`. Within each batch,
 quality symbols use cycle-major order and inactive variable-length positions
-are skipped. Encoding uses `forward_full`; before changing the range state for
-that batch, every active position is also recomputed with `forward_step` and
-the two integer CDFs must be identical. Decoding uses `forward_step` cycle by
-cycle and performs a post-batch `forward_full` integer-CDF check after all true
-qualities have been recovered.
+are skipped. Production encoding uses `forward_full`, while decoding uses
+`forward_step` cycle by cycle. A slow `--verify-cdf` debug mode additionally
+recomputes the opposite inference path and requires the two integer CDFs to be
+identical. This cross-check is covered by tests but is disabled during normal
+compression and decompression.
 
 The current default and maximum are 256 reads. The batch dimension is not a
 trained model parameter, so checkpoints trained with 64-read batches remain

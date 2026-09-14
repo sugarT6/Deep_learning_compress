@@ -75,7 +75,8 @@ class DecodeStatistics:
     quality_symbols: int
     decode_seconds: float
     reconstructed_sha256: str
-    timing_seconds: Dict[str, float]
+    quality_model_prediction_seconds: float
+    quality_entropy_decoding_seconds: float
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -180,6 +181,7 @@ def _decode_quality_batch(
     quantization_total: int,
     first_read_index: int,
     timings: Dict[str, float],
+    verify_cdf: bool,
 ) -> Tuple[np.ndarray, int]:
     stage_started = time.perf_counter()
     bases, lengths, active_mask = _batch_tensors(base_records, device)
@@ -223,28 +225,30 @@ def _decode_quality_batch(
             for row, cdf in cycle_cdfs:
                 symbol = range_decoder.decode(cdf)
                 decoded[row, cycle] = symbol
-                step_cdfs.append((row, cycle, cdf))
+                if verify_cdf:
+                    step_cdfs.append((row, cycle, cdf))
                 decoded_symbols += 1
             _synchronize_device(device)
             _add_timing(timings, "range_decode_and_symbol_update", stage_started)
 
-        _synchronize_device(device)
-        stage_started = time.perf_counter()
-        full_logits = model.forward_full(bases, decoded, lengths, active_mask)
-        _synchronize_device(device)
-        _add_timing(timings, "model_forward_full_verification", stage_started)
-        stage_started = time.perf_counter()
-        for row, cycle, step_cdf in step_cdfs:
-            full_cdf = logits_to_cdf(
-                full_logits[row, cycle].detach().cpu().numpy(),
-                total=quantization_total,
-            )
-            if full_cdf != step_cdf:
-                raise CodecDeterminismError(
-                    "decoder forward_step/forward_full integer CDF mismatch at "
-                    f"read {first_read_index + row}, cycle {cycle}"
+        if verify_cdf:
+            _synchronize_device(device)
+            stage_started = time.perf_counter()
+            full_logits = model.forward_full(bases, decoded, lengths, active_mask)
+            _synchronize_device(device)
+            _add_timing(timings, "model_forward_full_verification", stage_started)
+            stage_started = time.perf_counter()
+            for row, cycle, step_cdf in step_cdfs:
+                full_cdf = logits_to_cdf(
+                    full_logits[row, cycle].detach().cpu().numpy(),
+                    total=quantization_total,
                 )
-        _add_timing(timings, "cdf_verification_and_transfer", stage_started)
+                if full_cdf != step_cdf:
+                    raise CodecDeterminismError(
+                        "decoder forward_step/forward_full integer CDF mismatch at "
+                        f"read {first_read_index + row}, cycle {cycle}"
+                    )
+            _add_timing(timings, "cdf_verification_and_transfer", stage_started)
     stage_started = time.perf_counter()
     decoded_array = decoded.cpu().numpy()
     _add_timing(timings, "decoded_tensor_to_cpu", stage_started)
@@ -307,6 +311,7 @@ def _decode_to_handle(
     quantization_total: int,
     progress_bar: Any,
     timings: Dict[str, float],
+    verify_cdf: bool,
 ) -> Tuple[int, int, str]:
     metadata = container_info.metadata
     read_count = int(metadata["read_count"])
@@ -376,6 +381,7 @@ def _decode_to_handle(
                 quantization_total=quantization_total,
                 first_read_index=batch_start,
                 timings=timings,
+                verify_cdf=verify_cdf,
             )
             decoded_symbols += batch_symbols
             stage_started = time.perf_counter()
@@ -411,6 +417,7 @@ def decode_fastq(
     device: torch.device,
     batch_reads: int = DEFAULT_BATCH_READS,
     progress: bool = True,
+    verify_cdf: bool = False,
 ) -> DecodeStatistics:
     """Validate and atomically reconstruct the original uncompressed FASTQ bytes."""
 
@@ -503,6 +510,7 @@ def decode_fastq(
                             quantization_total=quantization_total,
                             progress_bar=progress_bar,
                             timings=timings,
+                            verify_cdf=verify_cdf,
                         )
                     )
             else:
@@ -517,6 +525,7 @@ def decode_fastq(
                         quantization_total=quantization_total,
                         progress_bar=progress_bar,
                         timings=timings,
+                        verify_cdf=verify_cdf,
                     )
                 )
             stage_started = time.perf_counter()
@@ -548,9 +557,11 @@ def decode_fastq(
             progress_bar.close()
 
     decode_seconds = time.perf_counter() - started
-    accounted_seconds = sum(timings.values())
-    timings["unattributed"] = max(0.0, decode_seconds - accounted_seconds)
-    timings["total"] = decode_seconds
+    quality_model_prediction_seconds = timings["model_forward_step"]
+    quality_entropy_decoding_seconds = (
+        timings["cdf_quantization_and_transfer"]
+        + timings["range_decode_and_symbol_update"]
+    )
     return DecodeStatistics(
         container_bytes=container_info.file_size,
         output_bytes=output_path.stat().st_size,
@@ -559,7 +570,8 @@ def decode_fastq(
         quality_symbols=decoded_symbols,
         decode_seconds=decode_seconds,
         reconstructed_sha256=reconstructed_hash,
-        timing_seconds=timings,
+        quality_model_prediction_seconds=quality_model_prediction_seconds,
+        quality_entropy_decoding_seconds=quality_entropy_decoding_seconds,
     )
 
 
@@ -572,6 +584,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-reads", type=int, default=DEFAULT_BATCH_READS)
+    parser.add_argument(
+        "--verify-cdf",
+        action="store_true",
+        help=(
+            "slow debug check: compare forward_step and forward_full integer "
+            "CDFs after every decoded batch"
+        ),
+    )
     parser.add_argument("--no-progress", action="store_true")
     return parser
 
@@ -586,6 +606,7 @@ def main() -> int:
             device=choose_device(args.device),
             batch_reads=args.batch_reads,
             progress=not args.no_progress,
+            verify_cdf=args.verify_cdf,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

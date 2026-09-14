@@ -81,6 +81,16 @@ class MismatchedStepModel(DirectQualityTransformer):
         return logits
 
 
+class ForbiddenStepModel(DirectQualityTransformer):
+    def forward_step(self, *args, **kwargs):
+        raise AssertionError("production encode must not call forward_step")
+
+
+class ForbiddenFullModel(DirectQualityTransformer):
+    def forward_full(self, *args, **kwargs):
+        raise AssertionError("production decode must not call forward_full")
+
+
 class NeuralCodecRoundTripTest(unittest.TestCase):
     def _checkpoint(self, root, name="model.pt", seed=17):
         torch.manual_seed(seed)
@@ -105,6 +115,11 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
         with path.open("wb") as raw:
             with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as handle:
                 handle.write(contents)
+        return path
+
+    def _plain_fastq(self, root, name, contents):
+        path = Path(root) / name
+        path.write_bytes(contents)
         return path
 
     def _round_trip(
@@ -154,6 +169,8 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
         )
         self.assertEqual(encode_args.batch_reads, 256)
         self.assertEqual(decode_args.batch_reads, 256)
+        self.assertFalse(encode_args.verify_cdf)
+        self.assertFalse(decode_args.verify_cdf)
 
     def test_existing_64_read_grouping_remains_supported(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -164,55 +181,26 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
             self.assertEqual(decode_stats.read_count, 65)
             self.assertEqual(read_container(container).metadata["batch_reads"], 64)
 
-    def test_statistics_include_non_overlapping_stage_timings(self):
+    def test_statistics_report_quality_model_and_entropy_timings(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             _, encode_stats, decode_stats = self._round_trip(
                 temporary_directory, 3
             )
 
-        encode_keys = {
-            "checkpoint_hash_and_load",
-            "fastq_parse",
-            "side_stream_record_write",
-            "tensor_transfer",
-            "model_forward_full",
-            "model_forward_step_verification",
-            "cdf_quantization_and_transfer",
-            "range_encode",
-            "range_finalize_and_stage",
-            "container_write",
-            "unattributed",
-            "total",
-        }
-        decode_keys = {
-            "container_validation",
-            "checkpoint_hash_and_load",
-            "quality_stream_read_and_init",
-            "side_stream_read",
-            "tensor_transfer",
-            "model_forward_step",
-            "cdf_quantization_and_transfer",
-            "range_decode_and_symbol_update",
-            "model_forward_full_verification",
-            "cdf_verification_and_transfer",
-            "decoded_tensor_to_cpu",
-            "fastq_output_write",
-            "output_finalize",
-            "unattributed",
-            "total",
-        }
-        self.assertEqual(set(encode_stats.timing_seconds), encode_keys)
-        self.assertEqual(set(decode_stats.timing_seconds), decode_keys)
-        for timings, total in (
-            (encode_stats.timing_seconds, encode_stats.encode_seconds),
-            (decode_stats.timing_seconds, decode_stats.decode_seconds),
-        ):
-            self.assertTrue(all(value >= 0.0 for value in timings.values()))
-            self.assertEqual(timings["total"], total)
-            accounted = sum(
-                value for name, value in timings.items() if name != "total"
-            )
-            self.assertAlmostEqual(accounted, total, places=6)
+        self.assertGreaterEqual(encode_stats.quality_model_prediction_seconds, 0.0)
+        self.assertGreaterEqual(encode_stats.quality_entropy_coding_seconds, 0.0)
+        self.assertGreaterEqual(decode_stats.quality_model_prediction_seconds, 0.0)
+        self.assertGreaterEqual(decode_stats.quality_entropy_decoding_seconds, 0.0)
+        self.assertLessEqual(
+            encode_stats.quality_model_prediction_seconds
+            + encode_stats.quality_entropy_coding_seconds,
+            encode_stats.encode_seconds,
+        )
+        self.assertLessEqual(
+            decode_stats.quality_model_prediction_seconds
+            + decode_stats.quality_entropy_decoding_seconds,
+            decode_stats.decode_seconds,
+        )
 
     def test_63_64_65_and_255_256_257_reads_round_trip(self):
         for read_count in (63, 64, 65, 255, 256, 257):
@@ -253,6 +241,47 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
     def test_gzip_output_decompresses_to_identical_fastq(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             self._round_trip(temporary_directory, 3, gzip_output=True)
+
+    def test_plain_fastq_and_fq_inputs_round_trip(self):
+        original = fastq_bytes(3)
+        for suffix in (".fastq", ".fq"):
+            with self.subTest(suffix=suffix):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    checkpoint, _ = self._checkpoint(root)
+                    source = self._plain_fastq(root, f"input{suffix}", original)
+                    container = root / "output.fqdc"
+                    restored = root / f"restored{suffix}"
+                    stats = encode_fastq(
+                        source,
+                        container,
+                        checkpoint,
+                        device=torch.device("cpu"),
+                        progress=False,
+                    )
+                    decode_fastq(
+                        container,
+                        restored,
+                        checkpoint,
+                        device=torch.device("cpu"),
+                        progress=False,
+                    )
+                    self.assertEqual(restored.read_bytes(), original)
+                    self.assertEqual(stats.input_bytes, len(original))
+
+    def test_encode_rejects_non_fastq_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkpoint, _ = self._checkpoint(root)
+            source = self._plain_fastq(root, "input.txt", fastq_bytes(1))
+            with self.assertRaisesRegex(ValueError, "input must end"):
+                encode_fastq(
+                    source,
+                    root / "output.fqdc",
+                    checkpoint,
+                    device=torch.device("cpu"),
+                    progress=False,
+                )
 
     def test_empty_gzip_fastq_round_trip_has_no_quality_rate(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -319,8 +348,55 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
                         checkpoint,
                         device=torch.device("cpu"),
                         progress=False,
+                        verify_cdf=True,
                     )
             self.assertFalse(output.exists())
+
+    def test_production_encode_skips_step_verification(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkpoint, model = self._checkpoint(root)
+            source = self._gzip_fastq(root, "input.fq.gz", fastq_bytes(3))
+            output = root / "output.fqdc"
+            fast_model = ForbiddenStepModel(tiny_config())
+            fast_model.load_state_dict(model.state_dict())
+            loaded = LoadedCheckpoint(model=fast_model, payload={})
+            with mock.patch("codec.encode.load_training_checkpoint", return_value=loaded):
+                encode_fastq(
+                    source,
+                    output,
+                    checkpoint,
+                    device=torch.device("cpu"),
+                    progress=False,
+                )
+            self.assertTrue(output.is_file())
+
+    def test_production_decode_skips_full_verification(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkpoint, model = self._checkpoint(root)
+            source = self._gzip_fastq(root, "input.fq.gz", fastq_bytes(3))
+            container = root / "output.fqdc"
+            restored = root / "restored.fq"
+            encode_fastq(
+                source,
+                container,
+                checkpoint,
+                device=torch.device("cpu"),
+                progress=False,
+            )
+            fast_model = ForbiddenFullModel(tiny_config())
+            fast_model.load_state_dict(model.state_dict())
+            with mock.patch("codec.decode._validate_checkpoint", return_value=fast_model):
+                decode_fastq(
+                    container,
+                    restored,
+                    checkpoint,
+                    device=torch.device("cpu"),
+                    progress=False,
+                )
+            with gzip.open(source, "rb") as handle:
+                self.assertEqual(restored.read_bytes(), handle.read())
 
     def test_wrong_model_hash_is_rejected_before_output(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

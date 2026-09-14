@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compress a gzip FASTQ into the version-1 direct-quality container."""
+"""Compress a plain or gzip FASTQ into the version-1 direct-quality container."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from .fastq_stream import (
     MAX_BATCH_READS,
     PHRED_OFFSET,
     QUALITY_ALPHABET_SIZE,
+    SUPPORTED_FASTQ_SUFFIXES,
     FastqBatch,
 )
 from .fastq_stream import iter_fastq_batches
@@ -50,7 +51,7 @@ from .probability_quantization import (
 from .range_encoder import RangeEncoder
 
 
-SUPPORTED_INPUT_SUFFIXES = (".fastq.gz", ".fq.gz")
+SUPPORTED_INPUT_SUFFIXES = SUPPORTED_FASTQ_SUFFIXES
 GZIP_COMPRESSLEVEL = 6
 
 
@@ -76,7 +77,8 @@ class EncodeStatistics:
     plus_gzip_bytes: int
     container_header_bytes: int
     encode_seconds: float
-    timing_seconds: Dict[str, float]
+    quality_model_prediction_seconds: float
+    quality_entropy_coding_seconds: float
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -108,7 +110,7 @@ def _validate_paths(input_path: Path, output_path: Path, checkpoint_path: Path) 
         raise FileNotFoundError(input_path)
     if not any(input_path.name.endswith(suffix) for suffix in SUPPORTED_INPUT_SUFFIXES):
         raise ValueError(
-            f"{input_path}: input must end in .fastq.gz or .fq.gz"
+            f"{input_path}: input must end in .fastq, .fq, .fastq.gz, or .fq.gz"
         )
     if output_path.exists():
         raise FileExistsError(f"{output_path}: output already exists")
@@ -123,8 +125,9 @@ def _quantize_verified_batch(
     *,
     total: int,
     timings: Optional[Dict[str, float]] = None,
+    verify_cdf: bool = True,
 ) -> Tuple[List[Tuple[int, Tuple[int, ...]]], float]:
-    """Return cycle-major symbols/CDFs after full-vs-step integer verification."""
+    """Return cycle-major symbols/CDFs, optionally cross-checking step inference."""
 
     stage_started = time.perf_counter()
     tensors = fastq_batch_to_tensors(batch, device)
@@ -139,16 +142,20 @@ def _quantize_verified_batch(
         _synchronize_device(device)
         _add_timing(timings, "model_forward_full", stage_started)
         for cycle in range(batch.max_read_length):
-            _synchronize_device(device)
-            stage_started = time.perf_counter()
-            step_logits = model.forward_step(
-                tensors["bases"],
-                tensors["qualities"][:, :cycle],
-                tensors["lengths"],
-                tensors["active_mask"],
-            )
-            _synchronize_device(device)
-            _add_timing(timings, "model_forward_step_verification", stage_started)
+            step_logits = None
+            if verify_cdf:
+                _synchronize_device(device)
+                stage_started = time.perf_counter()
+                step_logits = model.forward_step(
+                    tensors["bases"],
+                    tensors["qualities"][:, :cycle],
+                    tensors["lengths"],
+                    tensors["active_mask"],
+                )
+                _synchronize_device(device)
+                _add_timing(
+                    timings, "model_forward_step_verification", stage_started
+                )
             stage_started = time.perf_counter()
             active_rows = [
                 row for row in range(batch.read_count) if batch.active_mask[row, cycle]
@@ -157,15 +164,16 @@ def _quantize_verified_batch(
                 full_cdf = logits_to_cdf(
                     full_logits[row, cycle].detach().cpu().numpy(), total=total
                 )
-                step_cdf = logits_to_cdf(
-                    step_logits[row].detach().cpu().numpy(), total=total
-                )
-                if full_cdf != step_cdf:
-                    read_index = int(batch.read_indices[row])
-                    raise CodecDeterminismError(
-                        "forward_full/forward_step integer CDF mismatch at "
-                        f"read {read_index}, cycle {cycle}"
+                if step_logits is not None:
+                    step_cdf = logits_to_cdf(
+                        step_logits[row].detach().cpu().numpy(), total=total
                     )
+                    if full_cdf != step_cdf:
+                        read_index = int(batch.read_indices[row])
+                        raise CodecDeterminismError(
+                            "forward_full/forward_step integer CDF mismatch at "
+                            f"read {read_index}, cycle {cycle}"
+                        )
                 symbol = int(batch.qualities[row, cycle])
                 items.append((symbol, full_cdf))
                 theoretical_bits += quantized_symbol_bits(symbol, full_cdf)
@@ -182,6 +190,7 @@ def encode_fastq(
     batch_reads: int = DEFAULT_BATCH_READS,
     quantization_total: int = TOTAL,
     progress: bool = True,
+    verify_cdf: bool = False,
 ) -> EncodeStatistics:
     """Stream a gzip FASTQ through the neural model into one atomic container."""
 
@@ -280,6 +289,7 @@ def encode_fastq(
                         device,
                         total=quantization_total,
                         timings=timings,
+                        verify_cdf=verify_cdf,
                     )
                     stage_started = time.perf_counter()
                     for symbol, cdf in items:
@@ -368,9 +378,12 @@ def encode_fastq(
     output_bytes = container_info.file_size
     range_stream_bytes = container_info.section("quality_range").length
     encode_seconds = time.perf_counter() - started
-    accounted_seconds = sum(timings.values())
-    timings["unattributed"] = max(0.0, encode_seconds - accounted_seconds)
-    timings["total"] = encode_seconds
+    quality_model_prediction_seconds = timings["model_forward_full"]
+    quality_entropy_coding_seconds = (
+        timings["cdf_quantization_and_transfer"]
+        + timings["range_encode"]
+        + timings["range_finalize_and_stage"]
+    )
     return EncodeStatistics(
         input_bytes=input_bytes,
         output_bytes=output_bytes,
@@ -396,13 +409,14 @@ def encode_fastq(
         plus_gzip_bytes=container_info.section("plus_gzip").length,
         container_header_bytes=container_info.header_bytes,
         encode_seconds=encode_seconds,
-        timing_seconds=timings,
+        quality_model_prediction_seconds=quality_model_prediction_seconds,
+        quality_entropy_coding_seconds=quality_entropy_coding_seconds,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compress .fastq.gz/.fq.gz with the no-SeqArc neural codec"
+        description="Compress plain/gzip FASTQ with the no-SeqArc neural codec"
     )
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
@@ -410,6 +424,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-reads", type=int, default=DEFAULT_BATCH_READS)
     parser.add_argument("--quantization-total", type=int, default=TOTAL)
+    parser.add_argument(
+        "--verify-cdf",
+        action="store_true",
+        help=(
+            "slow debug check: compare forward_full and forward_step integer "
+            "CDFs for every active quality"
+        ),
+    )
     parser.add_argument("--no-progress", action="store_true")
     return parser
 
@@ -425,6 +447,7 @@ def main() -> int:
             batch_reads=args.batch_reads,
             quantization_total=args.quantization_total,
             progress=not args.no_progress,
+            verify_cdf=args.verify_cdf,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

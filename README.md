@@ -73,7 +73,8 @@ non-neural adaptive quality histogram has a tested encode/decode round trip.
 The Stage C modules themselves remain independent of the neural model.
 
 Stage D connects the trained model to the quantizer and single range stream,
-while keeping training caches out of the runtime codec. Encode a gzip FASTQ:
+while keeping training caches out of the runtime codec. The encoder accepts
+`.fastq`, `.fq`, `.fastq.gz`, and `.fq.gz`. Encode a FASTQ:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
@@ -105,16 +106,21 @@ checkpoint: training batch size is not part of the model architecture. Existing
 containers that store a 64-read grouping remain decodable by passing
 `--batch-reads 64`.
 
-Both JSON reports include a nested `timing_seconds` breakdown. Encoder timing
-separates FASTQ parsing, gzip side-record writes, tensor transfer, parallel
-`forward_full`, autoregressive `forward_step` verification, logit transfer/CDF
-quantization, range encoding/finalization, and container writing. Decoder timing
-separates container/checkpoint validation, side-stream reads, tensor transfer,
-autoregressive model prediction, CDF quantization, range decoding/symbol update,
-post-batch `forward_full` verification, and FASTQ output. `unattributed` contains
-small orchestration and stream-close costs not assigned to another stage.
-CUDA is synchronized at model timing boundaries, so reported GPU prediction
-times represent completed device work rather than asynchronous launch time.
+The JSON reports expose the two quality-path timings needed for optimization.
+`quality_model_prediction_seconds` measures completed neural forward work.
+`quality_entropy_coding_seconds` on encode and
+`quality_entropy_decoding_seconds` on decode include logit transfer, integer CDF
+quantization, and range-coder processing. `encode_seconds`/`decode_seconds`
+remain the whole-command wall times. CUDA is synchronized at model timing
+boundaries, so model timings represent completed device work rather than only
+asynchronous kernel launch time.
+
+Production encode uses one parallel `forward_full` call per batch. Decode uses
+one batched `forward_step` call per cycle, predicting that cycle for all active
+reads before the single range stream is consumed in cycle-major order. The
+expensive full/step CDF cross-check is disabled by default after being covered
+by tests. Pass `--verify-cdf` on a small input to run the old per-batch debug
+check when validating a new model or runtime environment.
 
 ## Historical Q-hat-conditioned pipeline
 
