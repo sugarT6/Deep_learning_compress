@@ -12,6 +12,7 @@ from codec import (
 )
 from codec.probability_quantization import (
     TOTAL,
+    logits_to_cdfs,
     probabilities_to_cdf,
     quantized_symbol_bits,
 )
@@ -71,6 +72,30 @@ class RangeCoderTest(unittest.TestCase):
         decoded, _, _ = round_trip(symbols, cdfs)
         self.assertEqual(decoded, symbols)
         self.assertGreater(len(set(cdfs[:50])), 45)
+
+    def test_prevalidated_batch_path_matches_public_bitstream(self):
+        rng = np.random.default_rng(20260914)
+        symbols = rng.integers(0, 42, size=2000, dtype=np.int64)
+        cdfs = logits_to_cdfs(rng.normal(size=(2000, 42)))
+
+        public_encoder = RangeEncoder()
+        for symbol, cdf in zip(symbols, cdfs):
+            public_encoder.encode(int(symbol), cdf)
+        public_stream = public_encoder.finish()
+
+        fast_encoder = RangeEncoder()
+        fast_encoder.encode_prevalidated_batch(
+            symbols, cdfs, total=TOTAL
+        )
+        fast_stream = fast_encoder.finish()
+        self.assertEqual(fast_stream, public_stream)
+
+        decoder = RangeDecoder(fast_stream)
+        decoded = decoder.decode_prevalidated_batch(
+            cdfs, total=TOTAL
+        )
+        decoder.finish()
+        self.assertEqual(decoded, symbols.tolist())
 
     def test_adaptive_non_neural_quality_context_closes_the_loop(self):
         rng = np.random.default_rng(915)

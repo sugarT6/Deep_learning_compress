@@ -10,7 +10,7 @@ physical byte length, zero padding, and CRC32 are validated before decoding.
 from __future__ import annotations
 
 from bisect import bisect_right
-from typing import Iterable
+from typing import Iterable, List, Sequence
 
 from ._range_common import (
     HALF_RANGE,
@@ -75,15 +75,28 @@ class RangeDecoder:
         if self.done:
             raise RangeCodingError("range stream has no undecoded symbols")
         normalized_cdf = normalize_cdf(cdf)
-        total = normalized_cdf[-1]
+        return self._decode_prevalidated(normalized_cdf, normalized_cdf[-1])
+
+    def decode_prevalidated_batch(
+        self, cdfs: Sequence[Sequence[int]], *, total: int
+    ) -> List[int]:
+        """Decode codec-internal CDFs without repeating public validation."""
+
+        if len(cdfs) > self._metadata.symbol_count - self._decoded_count:
+            raise RangeCodingError("range stream has too few undecoded symbols")
+        return [self._decode_prevalidated(cdf, total) for cdf in cdfs]
+
+    def _decode_prevalidated(self, cdf: Sequence[int], total: int) -> int:
+        """Decode one symbol from an already validated fixed-total CDF."""
+
         interval = self._high - self._low + 1
         scaled_value = ((self._code - self._low + 1) * total - 1) // interval
-        symbol = bisect_right(normalized_cdf, scaled_value) - 1
-        if symbol < 0 or symbol >= len(normalized_cdf) - 1:
+        symbol = bisect_right(cdf, scaled_value) - 1
+        if symbol < 0 or symbol >= len(cdf) - 1:
             raise RangeCodingError("decoded cumulative value is outside the CDF")
 
-        symbol_low = normalized_cdf[symbol]
-        symbol_high = normalized_cdf[symbol + 1]
+        symbol_low = int(cdf[symbol])
+        symbol_high = int(cdf[symbol + 1])
         new_low = self._low + (interval * symbol_low) // total
         new_high = self._low + (interval * symbol_high) // total - 1
         if new_low > new_high or not (new_low <= self._code <= new_high):

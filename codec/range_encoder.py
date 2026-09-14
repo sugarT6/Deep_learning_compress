@@ -11,7 +11,7 @@ the number of meaningful payload bits; CRC32 detects truncation/corruption.
 from __future__ import annotations
 
 import operator
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from ._range_common import (
     HALF_RANGE,
@@ -98,10 +98,40 @@ class RangeEncoder:
                 f"symbol {normalized_symbol} is outside [0, {symbol_limit})"
             )
 
-        total = normalized_cdf[-1]
+        self._encode_interval(
+            normalized_cdf[normalized_symbol],
+            normalized_cdf[normalized_symbol + 1],
+            normalized_cdf[-1],
+        )
+
+    def encode_prevalidated_batch(
+        self,
+        symbols: Sequence[int],
+        cdfs: Sequence[Sequence[int]],
+        *,
+        total: int,
+    ) -> None:
+        """Encode codec-internal CDFs without repeating public validation.
+
+        The probability quantizer owns the shape, integer, monotonicity, and
+        fixed-total checks.  This method is deliberately only used after that
+        batch-level validation; callers supplying arbitrary CDFs must use
+        :meth:`encode`.
+        """
+
+        if self._finished_stream is not None:
+            raise RangeCodingError("cannot encode after finalization")
+        for index in range(len(symbols)):
+            symbol = int(symbols[index])
+            cdf = cdfs[index]
+            self._encode_interval(
+                int(cdf[symbol]), int(cdf[symbol + 1]), total
+            )
+
+    def _encode_interval(self, symbol_low: int, symbol_high: int, total: int) -> None:
+        """Update the arithmetic state from one already validated interval."""
+
         interval = self._high - self._low + 1
-        symbol_low = normalized_cdf[normalized_symbol]
-        symbol_high = normalized_cdf[normalized_symbol + 1]
         new_low = self._low + (interval * symbol_low) // total
         new_high = self._low + (interval * symbol_high) // total - 1
         if new_low > new_high:

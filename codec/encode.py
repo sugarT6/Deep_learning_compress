@@ -11,8 +11,9 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 
 try:
@@ -44,8 +45,8 @@ from .model import DirectQualityTransformer, fastq_batch_to_tensors, feature_sch
 from .probability_quantization import (
     QUANTIZATION_VERSION,
     TOTAL,
-    logits_to_cdf,
-    quantized_symbol_bits,
+    logits_to_cdfs,
+    quantized_symbols_bits,
     validate_total,
 )
 from .range_encoder import RangeEncoder
@@ -126,24 +127,31 @@ def _quantize_verified_batch(
     total: int,
     timings: Optional[Dict[str, float]] = None,
     verify_cdf: bool = True,
-) -> Tuple[List[Tuple[int, Tuple[int, ...]]], float]:
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """Return cycle-major symbols/CDFs, optionally cross-checking step inference."""
 
     stage_started = time.perf_counter()
     tensors = fastq_batch_to_tensors(batch, device)
     _synchronize_device(device)
     _add_timing(timings, "tensor_transfer", stage_started)
-    items: List[Tuple[int, Tuple[int, ...]]] = []
-    theoretical_bits = 0.0
     with torch.inference_mode():
         _synchronize_device(device)
         stage_started = time.perf_counter()
         full_logits = model.forward_full(**tensors)
         _synchronize_device(device)
         _add_timing(timings, "model_forward_full", stage_started)
-        for cycle in range(batch.max_read_length):
-            step_logits = None
-            if verify_cdf:
+
+        stage_started = time.perf_counter()
+        full_logits_cpu = full_logits.detach().cpu().numpy()
+        cycles, rows = np.nonzero(batch.active_mask.T)
+        symbols = np.asarray(batch.qualities[rows, cycles], dtype=np.int64)
+        cdfs = logits_to_cdfs(full_logits_cpu[rows, cycles], total=total)
+        theoretical_bits = quantized_symbols_bits(symbols, cdfs, total=total)
+        _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
+
+        if verify_cdf:
+            offset = 0
+            for cycle in range(batch.max_read_length):
                 _synchronize_device(device)
                 stage_started = time.perf_counter()
                 step_logits = model.forward_step(
@@ -156,29 +164,26 @@ def _quantize_verified_batch(
                 _add_timing(
                     timings, "model_forward_step_verification", stage_started
                 )
-            stage_started = time.perf_counter()
-            active_rows = [
-                row for row in range(batch.read_count) if batch.active_mask[row, cycle]
-            ]
-            for row in active_rows:
-                full_cdf = logits_to_cdf(
-                    full_logits[row, cycle].detach().cpu().numpy(), total=total
+                stage_started = time.perf_counter()
+                active_rows = np.flatnonzero(batch.active_mask[:, cycle])
+                step_cdfs = logits_to_cdfs(
+                    step_logits.detach().cpu().numpy()[active_rows], total=total
                 )
-                if step_logits is not None:
-                    step_cdf = logits_to_cdf(
-                        step_logits[row].detach().cpu().numpy(), total=total
+                stop = offset + active_rows.size
+                full_cycle_cdfs = cdfs[offset:stop]
+                if not np.array_equal(full_cycle_cdfs, step_cdfs):
+                    mismatch = np.argwhere(full_cycle_cdfs != step_cdfs)[0]
+                    row = int(active_rows[int(mismatch[0])])
+                    read_index = int(batch.read_indices[row])
+                    raise CodecDeterminismError(
+                        "forward_full/forward_step integer CDF mismatch at "
+                        f"read {read_index}, cycle {cycle}"
                     )
-                    if full_cdf != step_cdf:
-                        read_index = int(batch.read_indices[row])
-                        raise CodecDeterminismError(
-                            "forward_full/forward_step integer CDF mismatch at "
-                            f"read {read_index}, cycle {cycle}"
-                        )
-                symbol = int(batch.qualities[row, cycle])
-                items.append((symbol, full_cdf))
-                theoretical_bits += quantized_symbol_bits(symbol, full_cdf)
-            _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
-    return items, theoretical_bits
+                offset = stop
+                _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
+            if offset != symbols.size:
+                raise ContainerError("CDF verification did not cover every quality")
+    return symbols, cdfs, theoretical_bits
 
 
 def encode_fastq(
@@ -283,7 +288,7 @@ def encode_fastq(
                         )
                     _add_timing(timings, "side_stream_record_write", stage_started)
 
-                    items, batch_theoretical_bits = _quantize_verified_batch(
+                    symbols, cdfs, batch_theoretical_bits = _quantize_verified_batch(
                         model,
                         batch,
                         device,
@@ -292,12 +297,13 @@ def encode_fastq(
                         verify_cdf=verify_cdf,
                     )
                     stage_started = time.perf_counter()
-                    for symbol, cdf in items:
-                        range_encoder.encode(symbol, cdf)
+                    range_encoder.encode_prevalidated_batch(
+                        symbols, cdfs, total=quantization_total
+                    )
                     _add_timing(timings, "range_encode", stage_started)
                     read_count += batch.read_count
                     batch_count += 1
-                    quality_symbols += len(items)
+                    quality_symbols += int(symbols.size)
                     quantized_theoretical_bits += batch_theoretical_bits
                     if progress_bar is not None:
                         progress_bar.update(batch.read_count)

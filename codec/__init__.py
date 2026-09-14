@@ -34,7 +34,9 @@ from .probability_quantization import (
     QUANTIZATION_VERSION,
     TOTAL,
     logits_to_cdf,
+    logits_to_cdfs,
     probabilities_to_cdf,
+    quantized_symbols_bits,
 )
 from .range_decoder import RangeDecoder
 from .range_encoder import RangeEncoder
@@ -62,6 +64,8 @@ __all__ = [
     "iter_fastq_batches",
     "iter_fastq_records",
     "logits_to_cdf",
+    "logits_to_cdfs",
     "probabilities_to_cdf",
+    "quantized_symbols_bits",
     "read_container",
 ]

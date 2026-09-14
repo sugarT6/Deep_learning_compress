@@ -122,6 +122,13 @@ expensive full/step CDF cross-check is disabled by default after being covered
 by tests. Pass `--verify-cdf` on a small input to run the old per-batch debug
 check when validating a new model or runtime environment.
 
+The production entropy path transfers logits to CPU once per encode batch (or
+once per decode cycle), applies the documented float64 largest-remainder
+quantizer to all active rows as one NumPy batch, computes theoretical bits in
+bulk, and passes prevalidated integer intervals to the range coder. Public
+standalone quantizer/range-coder calls retain strict input validation; the
+trusted codec path avoids repeating the same 43-entry CDF checks per symbol.
+
 ## Historical Q-hat-conditioned pipeline
 
 The historical pipeline defaults to direct 42-class body-quality prediction

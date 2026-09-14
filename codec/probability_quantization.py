@@ -206,6 +206,140 @@ def logits_to_cdf(
     return frequencies_to_cdf(logits_to_frequencies(logits, total=total), total=total)
 
 
+def logits_to_cdfs(
+    logits: Sequence[Sequence[float]], *, total: int = TOTAL
+) -> np.ndarray:
+    """Batch-quantize ``[N, 42]`` logits into an ``int64 [N, 43]`` CDF array.
+
+    This is the production equivalent of calling :func:`logits_to_cdf` for
+    every row.  Float64 softmax, largest-remainder allocation, stable quality-id
+    tie breaking, and the minimum frequency of one are applied along each row.
+    """
+
+    normalized_total = _validate_total(total)
+    try:
+        matrix = np.asarray(logits, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ProbabilityQuantizationError(
+            "logits must contain numeric values"
+        ) from exc
+    if matrix.ndim != 2 or matrix.shape[1] != QUALITY_ALPHABET_SIZE:
+        raise ProbabilityQuantizationError(
+            "logits must have shape [N, "
+            f"{QUALITY_ALPHABET_SIZE}], got {matrix.shape}"
+        )
+    if not np.isfinite(matrix).all():
+        raise ProbabilityQuantizationError("logits must not contain NaN or Inf")
+
+    row_count = matrix.shape[0]
+    cdfs = np.zeros(
+        (row_count, QUALITY_ALPHABET_SIZE + 1), dtype=np.int64
+    )
+    if row_count == 0:
+        return cdfs
+    if normalized_total == QUALITY_ALPHABET_SIZE:
+        cdfs[:, 1:] = np.arange(
+            1, QUALITY_ALPHABET_SIZE + 1, dtype=np.int64
+        )
+        return cdfs
+
+    shifted = matrix - matrix.max(axis=1, keepdims=True)
+    weights = np.exp(shifted)
+    denominators = weights.sum(axis=1, dtype=np.float64, keepdims=True)
+    if not np.isfinite(denominators).all() or np.any(denominators <= 0.0):
+        raise ProbabilityQuantizationError("logits produced an invalid softmax sum")
+
+    remaining = normalized_total - QUALITY_ALPHABET_SIZE
+    quotas = (weights / denominators) * float(remaining)
+    floors = np.floor(quotas).astype(np.int64)
+    fractions = quotas - floors
+    units_left = remaining - floors.sum(axis=1, dtype=np.int64)
+
+    positive_rows = np.flatnonzero(units_left > 0)
+    if positive_rows.size:
+        positive_fractions = fractions[positive_rows]
+        order = np.argsort(-positive_fractions, axis=1, kind="stable")
+        ranks = np.empty_like(order)
+        row_indices = np.arange(positive_rows.size, dtype=np.int64)[:, None]
+        ranks[row_indices, order] = np.arange(
+            QUALITY_ALPHABET_SIZE, dtype=np.int64
+        )[None, :]
+        floors[positive_rows] += ranks < units_left[positive_rows, None]
+
+    # This branch is only a defensive correction for an extreme float64 sum
+    # error.  Keep the scalar tie rule exact instead of complicating the common
+    # vectorized path.
+    for row in np.flatnonzero(units_left < 0):
+        eligible = np.flatnonzero(floors[row] > 0).tolist()
+        order = sorted(
+            eligible,
+            key=lambda quality_id: (
+                float(fractions[row, quality_id]),
+                -quality_id,
+            ),
+        )
+        correction = -int(units_left[row])
+        if correction > len(order):
+            raise ProbabilityQuantizationError(
+                "float64 apportionment produced an invalid remainder"
+            )
+        floors[row, order[:correction]] -= 1
+
+    frequencies = floors + 1
+    if np.any(frequencies < 1) or np.any(
+        frequencies.sum(axis=1, dtype=np.int64) != normalized_total
+    ):
+        raise ProbabilityQuantizationError(
+            "internal quantization error: frequencies violate the fixed-total contract"
+        )
+    cdfs[:, 1:] = np.cumsum(frequencies, axis=1, dtype=np.int64)
+    return cdfs
+
+
+def quantized_symbols_bits(
+    symbols: Sequence[int], cdfs: Sequence[Sequence[int]], *, total: int = TOTAL
+) -> float:
+    """Return the vectorized theoretical bit sum for precomputed quality CDFs."""
+
+    normalized_total = _validate_total(total)
+    symbol_array = np.asarray(symbols)
+    cdf_array = np.asarray(cdfs)
+    if symbol_array.ndim != 1:
+        raise ProbabilityQuantizationError("symbols must have shape [N]")
+    if cdf_array.shape != (
+        symbol_array.size,
+        QUALITY_ALPHABET_SIZE + 1,
+    ):
+        raise ProbabilityQuantizationError(
+            f"cdfs must have shape [N, {QUALITY_ALPHABET_SIZE + 1}]"
+        )
+    if symbol_array.dtype.kind not in "iu" or cdf_array.dtype.kind not in "iu":
+        raise ProbabilityQuantizationError("symbols and cdfs must be integers")
+    if np.any(symbol_array < 0) or np.any(symbol_array >= QUALITY_ALPHABET_SIZE):
+        raise ProbabilityQuantizationError("symbols must be in Q0..Q41")
+    if cdf_array.size:
+        if np.any(cdf_array[:, 0] != 0) or np.any(
+            cdf_array[:, -1] != normalized_total
+        ):
+            raise ProbabilityQuantizationError(
+                "every cdf must start at zero and end at TOTAL"
+            )
+        frequencies = np.diff(cdf_array, axis=1)
+        if np.any(frequencies <= 0):
+            raise ProbabilityQuantizationError(
+                "every cdf frequency must be at least one"
+            )
+        selected = frequencies[
+            np.arange(symbol_array.size), symbol_array.astype(np.int64, copy=False)
+        ]
+        return float(
+            -np.log2(selected.astype(np.float64) / normalized_total).sum(
+                dtype=np.float64
+            )
+        )
+    return 0.0
+
+
 def quantized_symbol_bits(symbol: int, cdf: Sequence[int]) -> float:
     """Return ``-log2(freq[symbol] / total)`` for a validated quality CDF."""
 
@@ -239,9 +373,11 @@ __all__ = [
     "TOTAL",
     "frequencies_to_cdf",
     "logits_to_cdf",
+    "logits_to_cdfs",
     "logits_to_frequencies",
     "probabilities_to_cdf",
     "probabilities_to_frequencies",
     "quantized_symbol_bits",
+    "quantized_symbols_bits",
     "validate_total",
 ]

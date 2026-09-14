@@ -9,10 +9,12 @@ from codec.probability_quantization import (
     ProbabilityQuantizationError,
     frequencies_to_cdf,
     logits_to_cdf,
+    logits_to_cdfs,
     logits_to_frequencies,
     probabilities_to_cdf,
     probabilities_to_frequencies,
     quantized_symbol_bits,
+    quantized_symbols_bits,
 )
 
 
@@ -60,6 +62,38 @@ class ProbabilityQuantizationTest(unittest.TestCase):
             self.assertEqual(probabilities_to_cdf(probabilities), expected_probabilities)
             self.assertEqual(logits_to_cdf(logits), expected_logits)
 
+    def test_batched_logits_match_scalar_rule_exactly(self):
+        rng = np.random.default_rng(20260914)
+        matrices = (
+            rng.normal(size=(4096, QUALITY_ALPHABET_SIZE)),
+            np.zeros((32, QUALITY_ALPHABET_SIZE), dtype=np.float64),
+            np.tile(
+                np.arange(QUALITY_ALPHABET_SIZE, dtype=np.float64), (32, 1)
+            ),
+        )
+        for total in (42, 43, 256, TOTAL, 1 << 30):
+            for matrix in matrices:
+                with self.subTest(total=total, rows=matrix.shape[0]):
+                    expected = np.asarray(
+                        [logits_to_cdf(row, total=total) for row in matrix],
+                        dtype=np.int64,
+                    )
+                    actual = logits_to_cdfs(matrix, total=total)
+                    np.testing.assert_array_equal(actual, expected)
+
+    def test_batched_theoretical_bits_match_scalar_sum(self):
+        rng = np.random.default_rng(814)
+        logits = rng.normal(size=(200, QUALITY_ALPHABET_SIZE))
+        symbols = rng.integers(0, QUALITY_ALPHABET_SIZE, size=200)
+        cdfs = logits_to_cdfs(logits)
+        expected = sum(
+            quantized_symbol_bits(int(symbol), tuple(cdf))
+            for symbol, cdf in zip(symbols, cdfs)
+        )
+        self.assertAlmostEqual(
+            quantized_symbols_bits(symbols, cdfs), expected, places=10
+        )
+
     def test_total_equal_to_alphabet_assigns_every_class_one(self):
         frequencies = probabilities_to_frequencies(np.arange(1, 43), total=42)
         self.assertEqual(frequencies, (1,) * 42)
@@ -80,6 +114,17 @@ class ProbabilityQuantizationTest(unittest.TestCase):
                     probabilities_to_frequencies(vector)
                 with self.assertRaises(ProbabilityQuantizationError):
                     logits_to_frequencies(vector)
+
+        for matrix in (
+            np.ones(42),
+            np.ones((2, 41)),
+            np.ones((2, 43)),
+            np.full((2, 42), np.nan),
+            np.full((2, 42), np.inf),
+        ):
+            with self.subTest(batch_shape=matrix.shape):
+                with self.assertRaises(ProbabilityQuantizationError):
+                    logits_to_cdfs(matrix)
 
         negative = valid.copy()
         negative[4] = -0.01

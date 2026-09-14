@@ -307,11 +307,11 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
             _, model = self._checkpoint(root)
             batch = next(iter_fastq_batches(source))
             model.eval()
-            items, _ = _quantize_verified_batch(
+            symbols, cdfs, _ = _quantize_verified_batch(
                 model, batch, torch.device("cpu"), total=1 << 16
             )
-        self.assertEqual([symbol for symbol, _ in items], [0, 3, 4, 1, 5, 2])
-        self.assertTrue(all(len(cdf) == 43 for _, cdf in items))
+        self.assertEqual(symbols.tolist(), [0, 3, 4, 1, 5, 2])
+        self.assertEqual(cdfs.shape, (6, 43))
 
     def test_q42_is_rejected_without_output(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

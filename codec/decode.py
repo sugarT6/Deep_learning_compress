@@ -53,7 +53,7 @@ from .fastq_stream import (
 from .model import DirectQualityModelConfig, DirectQualityTransformer, feature_schema
 from .probability_quantization import (
     QUANTIZATION_VERSION,
-    logits_to_cdf,
+    logits_to_cdfs,
     validate_total,
 )
 from .range_decoder import RangeDecoder
@@ -194,7 +194,12 @@ def _decode_quality_batch(
         dtype=torch.long,
         device=device,
     )
-    step_cdfs: List[Tuple[int, int, Tuple[int, ...]]] = []
+    lengths_cpu = np.fromiter(
+        (len(record.field) for record in base_records),
+        dtype=np.int64,
+        count=read_count,
+    )
+    verification_cdfs: List[np.ndarray] = []
     decoded_symbols = 0
 
     with torch.inference_mode():
@@ -210,24 +215,26 @@ def _decode_quality_batch(
             _synchronize_device(device)
             _add_timing(timings, "model_forward_step", stage_started)
             stage_started = time.perf_counter()
-            cycle_cdfs = []
-            for row in range(read_count):
-                if not bool(active_mask[row, cycle].item()):
-                    continue
-                cdf = logits_to_cdf(
-                    step_logits[row].detach().cpu().numpy(),
-                    total=quantization_total,
-                )
-                cycle_cdfs.append((row, cdf))
+            active_rows = np.flatnonzero(lengths_cpu > cycle)
+            cycle_cdfs = logits_to_cdfs(
+                step_logits.detach().cpu().numpy()[active_rows],
+                total=quantization_total,
+            )
             _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
 
             stage_started = time.perf_counter()
-            for row, cdf in cycle_cdfs:
-                symbol = range_decoder.decode(cdf)
-                decoded[row, cycle] = symbol
-                if verify_cdf:
-                    step_cdfs.append((row, cycle, cdf))
-                decoded_symbols += 1
+            cycle_symbols = range_decoder.decode_prevalidated_batch(
+                cycle_cdfs, total=quantization_total
+            )
+            active_rows_tensor = torch.as_tensor(
+                active_rows, dtype=torch.long, device=device
+            )
+            decoded[active_rows_tensor, cycle] = torch.as_tensor(
+                cycle_symbols, dtype=torch.long, device=device
+            )
+            if verify_cdf:
+                verification_cdfs.append(cycle_cdfs)
+            decoded_symbols += active_rows.size
             _synchronize_device(device)
             _add_timing(timings, "range_decode_and_symbol_update", stage_started)
 
@@ -238,16 +245,24 @@ def _decode_quality_batch(
             _synchronize_device(device)
             _add_timing(timings, "model_forward_full_verification", stage_started)
             stage_started = time.perf_counter()
-            for row, cycle, step_cdf in step_cdfs:
-                full_cdf = logits_to_cdf(
-                    full_logits[row, cycle].detach().cpu().numpy(),
-                    total=quantization_total,
+            cycles, rows = np.nonzero(active_mask.detach().cpu().numpy().T)
+            full_cdfs = logits_to_cdfs(
+                full_logits.detach().cpu().numpy()[rows, cycles],
+                total=quantization_total,
+            )
+            step_cdfs = (
+                np.concatenate(verification_cdfs, axis=0)
+                if verification_cdfs
+                else np.empty((0, QUALITY_ALPHABET_SIZE + 1), dtype=np.int64)
+            )
+            if not np.array_equal(full_cdfs, step_cdfs):
+                mismatch = np.argwhere(full_cdfs != step_cdfs)[0]
+                position = int(mismatch[0])
+                raise CodecDeterminismError(
+                    "decoder forward_step/forward_full integer CDF mismatch at "
+                    f"read {first_read_index + int(rows[position])}, "
+                    f"cycle {int(cycles[position])}"
                 )
-                if full_cdf != step_cdf:
-                    raise CodecDeterminismError(
-                        "decoder forward_step/forward_full integer CDF mismatch at "
-                        f"read {first_read_index + row}, cycle {cycle}"
-                    )
             _add_timing(timings, "cdf_verification_and_transfer", stage_started)
     stage_started = time.perf_counter()
     decoded_array = decoded.cpu().numpy()
