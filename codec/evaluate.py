@@ -64,8 +64,8 @@ def evaluate_reader_range(
 
     if category not in EVALUATION_CATEGORIES:
         raise ValueError(f"unknown evaluation category {category!r}")
-    if batch_reads <= 0 or batch_reads > 64:
-        raise ValueError("batch_reads must be in [1, 64]")
+    if batch_reads <= 0 or batch_reads > 256:
+        raise ValueError("batch_reads must be in [1, 256]")
     if max_reads < 0:
         raise ValueError("max_reads must be nonnegative")
     if start < 0 or stop <= start or stop > reader.metadata.read_count:
@@ -334,8 +334,8 @@ def main() -> int:
     )
     if not categories:
         raise SystemExit("--categories must not be empty")
-    if args.batch_reads <= 0 or args.batch_reads > 64:
-        raise SystemExit("--batch-reads must be in [1, 64]")
+    if args.batch_reads <= 0 or args.batch_reads > 256:
+        raise SystemExit("--batch-reads must be in [1, 256]")
     if args.max_reads_per_split < 0:
         raise SystemExit("--max-reads-per-split must be nonnegative")
     try:

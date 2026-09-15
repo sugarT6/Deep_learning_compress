@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
 import random
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -21,14 +23,16 @@ try:
 except ImportError:  # pragma: no cover - tqdm is optional
     tqdm = None
 
-from .checkpoint import save_training_checkpoint
+from .checkpoint import load_training_checkpoint, save_training_checkpoint
 from .datasets import (
     TRAIN_DATASETS,
     UNSEEN_DATASETS,
     DirectQualityDataset,
     datasets_by_family,
 )
-from .evaluate import DatasetMetrics, choose_device, evaluate_reader_range
+from .evaluate import (
+    DatasetMetrics, choose_device, evaluate_reader_range, summarize_metric_group,
+)
 from .model import (
     DirectQualityModelConfig,
     DirectQualityTransformer,
@@ -45,7 +49,9 @@ from .training_cache import (
 )
 
 
-DEFAULT_OUTPUT_DIR = Path("runs/direct_quality_no_seqarc_qmer234_baseconv357_b64")
+DEFAULT_OUTPUT_DIR = Path("codec/runs/direct_quality_dataset_balanced_b256")
+SELECTION_METRIC = "dataset_macro_bits_per_quality"
+SAMPLER_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -75,8 +81,15 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
         raise
 
 
+def _resume_contract(config: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value for key, value in config.items()
+        if key not in ("epochs", "resume_from")
+    }
+
+
 class BalancedTrainingSampler:
-    """Uniform family-then-file sampler restricted to each file's train split."""
+    """Exact dataset schedules with persistent shuffled, nonoverlapping blocks."""
 
     def __init__(
         self,
@@ -86,25 +99,39 @@ class BalancedTrainingSampler:
         train_fraction: float,
         batch_reads: int,
         seed: int,
+        steps_per_epoch: int = 2000,
     ) -> None:
         if not 0.0 < train_fraction < 1.0:
             raise ValueError("train_fraction must be between 0 and 1")
-        if batch_reads <= 0 or batch_reads > 64:
-            raise ValueError("batch_reads must be in [1, 64]")
+        if batch_reads <= 0 or batch_reads > 256:
+            raise ValueError("batch_reads must be in [1, 256]")
+        if steps_per_epoch <= 0:
+            raise ValueError("steps_per_epoch must be positive")
         if not datasets:
             raise ValueError("at least one training dataset is required")
         if any(not dataset.training_source for dataset in datasets):
             raise ValueError("training sampler may not include unseen datasets")
 
         grouped = datasets_by_family(datasets)
-        if not grouped:
+        if sum(len(members) for members in grouped.values()) != len(datasets):
             raise ValueError("training datasets have no recognized platform families")
         self.datasets = tuple(datasets)
         self.cache_dir = Path(cache_dir)
         self.train_fraction = float(train_fraction)
         self.batch_reads = int(batch_reads)
         self.seed = int(seed)
+        self.steps_per_epoch = int(steps_per_epoch)
+        if len({dataset.accession for dataset in datasets}) != len(datasets):
+            raise ValueError("training dataset accessions must be unique")
         self._rng = np.random.default_rng(seed)
+        self._schedule = []
+        self._schedule_cursor = 0
+        self._epoch = 0
+        self._extra_cursor = 0
+        self._block_orders = {}
+        self._block_cursors = {}
+        self._block_rounds = {}
+        self._read_counts = {dataset.accession: 0 for dataset in datasets}
         self._by_family = grouped
         self._families = tuple(grouped)
         self._readers = {}
@@ -132,6 +159,9 @@ class BalancedTrainingSampler:
                 train_stop = min(max(train_stop, 1), reader.metadata.read_count - 1)
                 self._readers[dataset.accession] = reader
                 self._train_stops[dataset.accession] = train_stop
+                self._block_rounds[dataset.accession] = 0
+                self._block_cursors[dataset.accession] = 0
+                self._block_orders[dataset.accession] = self._block_order(dataset, 0)
         except Exception:
             self.close()
             raise
@@ -155,29 +185,67 @@ class BalancedTrainingSampler:
     def train_stop_for(self, accession: str) -> int:
         return self._train_stops[accession]
 
+    def _block_order(self, dataset: DirectQualityDataset, round_index: int):
+        index = self.datasets.index(dataset)
+        rng = np.random.default_rng(
+            np.random.SeedSequence([self.seed, index, round_index])
+        )
+        blocks = (
+            self._train_stops[dataset.accession] + self.batch_reads - 1
+        ) // self.batch_reads
+        return rng.permutation(blocks).tolist()
+
+    def _next_epoch(self) -> None:
+        count = len(self.datasets)
+        quotient, remainder = divmod(self.steps_per_epoch, count)
+        schedule = list(range(count)) * quotient
+        schedule.extend((self._extra_cursor + i) % count for i in range(remainder))
+        self._extra_cursor = (self._extra_cursor + remainder) % count
+        self._rng.shuffle(schedule)
+        self._schedule = schedule
+        self._schedule_cursor = 0
+        self._epoch += 1
+
     def sample_batch(self) -> TrainingSample:
-        family = self._families[int(self._rng.integers(len(self._families)))]
-        candidates = self._by_family[family]
-        dataset = candidates[int(self._rng.integers(len(candidates)))]
+        if self._schedule_cursor == len(self._schedule):
+            self._next_epoch()
+        dataset = self.datasets[self._schedule[self._schedule_cursor]]
+        accession = dataset.accession
+        family = dataset.platform_family
         reader = self._readers[dataset.accession]
         train_stop = self._train_stops[dataset.accession]
-        count = min(self.batch_reads, train_stop)
-        maximum_start = train_stop - count
-        start = int(self._rng.integers(maximum_start + 1))
+        if self._block_cursors[accession] == len(self._block_orders[accession]):
+            self._block_rounds[accession] += 1
+            self._block_orders[accession] = self._block_order(
+                dataset, self._block_rounds[accession]
+            )
+            self._block_cursors[accession] = 0
+        block = self._block_orders[accession][self._block_cursors[accession]]
+        start = block * self.batch_reads
+        stop = min(start + self.batch_reads, train_stop)
+        batch = reader.read_range(start, stop)
+        self._block_cursors[accession] += 1
+        self._schedule_cursor += 1
+        self._read_counts[accession] += stop - start
 
         self._sample_counts[dataset.accession] += 1
         self._family_counts[family] += 1
         self._total_samples += 1
         return TrainingSample(
             dataset=dataset,
-            batch=reader.read_range(start, start + count),
+            batch=batch,
         )
 
     def config_dict(self) -> Dict[str, Any]:
         return {
-            "strategy": "uniform_platform_family_then_uniform_file",
+            "strategy": "strict_dataset_balanced_shuffled_blocks",
+            "version": SAMPLER_VERSION,
             "batch_source": "one_training_cache_file",
-            "read_sampling": "uniform_contiguous_start_within_training_prefix",
+            "read_sampling": "nonoverlapping_blocks_without_replacement_keep_tail",
+            "steps_per_epoch": self.steps_per_epoch,
+            "remainder_policy": "rotate_across_epochs",
+            "dataset_order": [d.accession for d in self.datasets],
+            "train_stops": dict(self._train_stops),
             "batch_reads": self.batch_reads,
             "seed": self.seed,
             "families": {
@@ -186,14 +254,75 @@ class BalancedTrainingSampler:
             },
         }
 
+    def state_dict(self) -> Dict[str, Any]:
+        return copy.deepcopy({
+            "config": self.config_dict(),
+            "rng_state": self._rng.bit_generator.state,
+            "schedule": self._schedule,
+            "schedule_cursor": self._schedule_cursor,
+            "epoch": self._epoch,
+            "extra_cursor": self._extra_cursor,
+            "block_orders": self._block_orders,
+            "block_cursors": self._block_cursors,
+            "block_rounds": self._block_rounds,
+            "sample_counts": self._sample_counts,
+            "family_counts": self._family_counts,
+            "read_counts": self._read_counts,
+            "total_samples": self._total_samples,
+        })
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if set(state) != set(self.state_dict()) or state["config"] != self.config_dict():
+            raise ValueError("sampler state/config mismatch")
+        state = copy.deepcopy(dict(state))
+        for dataset in self.datasets:
+            accession = dataset.accession
+            if state["block_rounds"][accession] < 0:
+                raise ValueError("invalid sampler block round")
+            expected = self._block_order(dataset, state["block_rounds"][accession])
+            if state["block_orders"][accession] != expected:
+                raise ValueError("invalid sampler block permutation")
+            if not 0 <= state["block_cursors"][accession] <= len(expected):
+                raise ValueError("invalid sampler block cursor")
+            if state["sample_counts"][accession] != (
+                state["block_rounds"][accession] * len(expected)
+                + state["block_cursors"][accession]
+            ):
+                raise ValueError("sampler selection count does not match block cursor")
+        if not 0 <= state["schedule_cursor"] <= len(state["schedule"]):
+            raise ValueError("invalid sampler schedule cursor")
+        if any(i not in range(len(self.datasets)) for i in state["schedule"]):
+            raise ValueError("invalid sampler dataset schedule")
+        if state["total_samples"] != sum(state["sample_counts"].values()):
+            raise ValueError("sampler total count mismatch")
+        self._rng.bit_generator.state = state.pop("rng_state")
+        state.pop("config")
+        for key, value in state.items():
+            setattr(self, "_" + key, value)
+
     def statistics_dict(self) -> Dict[str, Any]:
         denominator = max(self._total_samples, 1)
+        unique_reads = {
+            accession: min(self._read_counts[accession], stop)
+            for accession, stop in self._train_stops.items()
+        }
         return {
             "total_batches": self._total_samples,
+            "total_reads": sum(self._read_counts.values()),
+            "nominal_read_slots": self._total_samples * self.batch_reads,
+            "unique_reads": sum(unique_reads.values()),
+            "train_read_count": sum(self._train_stops.values()),
             "datasets": {
                 accession: {
                     "count": count,
                     "proportion": count / denominator,
+                    "reads": self._read_counts[accession],
+                    "unique_reads": unique_reads[accession],
+                    "coverage_fraction": (
+                        unique_reads[accession] / self._train_stops[accession]
+                    ),
+                    "block_round": self._block_rounds[accession],
+                    "block_cursor": self._block_cursors[accession],
                 }
                 for accession, count in self._sample_counts.items()
             },
@@ -258,14 +387,8 @@ def evaluate_validation(
                 device=device,
             )
         )
-    total_bits = sum(metric.total_bits for metric in metrics)
-    total_symbols = sum(metric.symbols for metric in metrics)
     return metrics, {
-        "symbol_micro_bits_per_quality": total_bits / total_symbols,
-        "dataset_macro_bits_per_quality": sum(
-            metric.bits_per_quality for metric in metrics
-        )
-        / len(metrics),
+        **summarize_metric_group(metrics),
         "per_dataset": {
             metric.accession: metric.to_dict() for metric in metrics
         },
@@ -290,6 +413,7 @@ def run_training(
     train_datasets: Sequence[DirectQualityDataset] = TRAIN_DATASETS,
     unseen_datasets: Sequence[DirectQualityDataset] = UNSEEN_DATASETS,
     progress: bool = True,
+    resume: Optional[Path] = None,
 ) -> Path:
     """Train and select checkpoints using only train-source validation reads."""
 
@@ -318,6 +442,7 @@ def run_training(
     best_validation_bits = float("inf")
     global_step = 0
     best_path = output_dir / "best.pt"
+    start_epoch = 1
 
     with BalancedTrainingSampler(
         train_datasets,
@@ -325,8 +450,19 @@ def run_training(
         train_fraction=train_fraction,
         batch_reads=batch_reads,
         seed=seed,
+        steps_per_epoch=steps_per_epoch,
     ) as sampler:
         split_manifest = sampler.data_split_manifest(unseen_datasets)
+        validation_counts = {}
+        for dataset in train_datasets:
+            available = (
+                sampler.reader_for(dataset.accession).metadata.read_count
+                - sampler.train_stop_for(dataset.accession)
+            )
+            validation_counts[dataset.accession] = (
+                min(validation_max_reads_per_file, available)
+                if validation_max_reads_per_file else available
+            )
         run_config = {
             "model_config": model_config.to_dict(),
             "feature_schema": feature_schema(),
@@ -345,12 +481,61 @@ def run_training(
             "epochs": epochs,
             "steps_per_epoch": steps_per_epoch,
             "validation_max_reads_per_file": validation_max_reads_per_file,
+            "validation_read_rule": "fixed_start_of_validation_suffix_contiguous",
+            "validation_read_counts": validation_counts,
+            "selection_metric": SELECTION_METRIC,
             "device": str(device),
             "seed": seed,
         }
+        if resume is not None:
+            loaded = load_training_checkpoint(resume, device=device)
+            payload = loaded.payload
+            saved_training = payload.get("training_state")
+            if not payload.get("sampler_state") or not saved_training:
+                raise ValueError("checkpoint lacks resumable training/sampler state")
+            previous_config = saved_training["run_config"]
+            if saved_training.get("version") != 1:
+                raise ValueError("unsupported training state version")
+            if _resume_contract(previous_config) != _resume_contract(run_config):
+                raise ValueError("resume run configuration does not match checkpoint")
+            if payload.get("selection_metric") != SELECTION_METRIC:
+                raise ValueError("resume checkpoint selection metric mismatch")
+            start_epoch = payload["epoch"] + 1
+            if epochs < start_epoch:
+                raise ValueError("epochs must exceed the restored completed epoch")
+            sampler.load_state_dict(payload["sampler_state"])
+            if (
+                sampler._epoch != payload["epoch"]
+                or sampler._schedule_cursor != steps_per_epoch
+                or sampler._total_samples != payload["global_step"]
+            ):
+                raise ValueError("resume requires a completed epoch checkpoint")
+            model.load_state_dict(loaded.model.state_dict())
+            optimizer.load_state_dict(payload["optimizer_state_dict"])
+            global_step = payload["global_step"]
+            best_validation_bits = payload["best_validation_bits_per_quality"]
+            # Preserve the prior best in the new, empty output directory.
+            best_source = Path(resume).parent / "best.pt"
+            best_payload = load_training_checkpoint(best_source).payload
+            best_config = (best_payload.get("training_state") or {}).get(
+                "run_config", {}
+            )
+            if (
+                best_payload.get("selection_metric") != SELECTION_METRIC
+                or best_payload["validation_metrics"][SELECTION_METRIC] != best_validation_bits
+                or _resume_contract(best_config) != _resume_contract(previous_config)
+            ):
+                raise ValueError("resume requires the matching best.pt beside its checkpoint")
+            shutil.copyfile(best_source, best_path)
+            random.setstate(saved_training["python_rng"])
+            np.random.set_state(saved_training["numpy_rng"])
+            torch.set_rng_state(saved_training["torch_rng"].cpu())
+            if device.type == "cuda":
+                torch.cuda.set_rng_state_all([s.cpu() for s in saved_training["cuda_rng"]])
+            run_config["resume_from"] = str(Path(resume).resolve())
         _write_json_atomic(output_dir / "run_config.json", run_config)
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch, epochs + 1):
             model.train()
             epoch_nats = 0.0
             epoch_symbols = 0
@@ -397,7 +582,9 @@ def run_training(
                 max_reads_per_file=validation_max_reads_per_file,
                 device=device,
             )
-            validation_bits = validation_summary["symbol_micro_bits_per_quality"]
+            validation_bits = validation_summary[SELECTION_METRIC]
+            if not math.isfinite(validation_bits):
+                raise ValueError("validation dataset macro must be finite")
             sampling_statistics = sampler.statistics_dict()
             train_loss = epoch_nats / epoch_symbols
             train_bits = train_loss / math.log(2.0)
@@ -426,6 +613,16 @@ def run_training(
                 "sampler_statistics": sampling_statistics,
                 "best_validation_bits_per_quality": best_validation_bits,
                 "validation_metrics": validation_summary,
+                "selection_metric": SELECTION_METRIC,
+                "sampler_state": sampler.state_dict(),
+                "training_state": {
+                    "version": 1,
+                    "run_config": run_config,
+                    "python_rng": random.getstate(),
+                    "numpy_rng": np.random.get_state(),
+                    "torch_rng": torch.get_rng_state(),
+                    "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
+                },
             }
             save_training_checkpoint(output_dir / "last.pt", **checkpoint_arguments)
             if improved:
@@ -434,7 +631,10 @@ def run_training(
                 print(
                     f"epoch={epoch} loss={train_loss:.4f} "
                     f"train_bits={train_bits:.4f} "
-                    f"val_bits={validation_bits:.4f} "
+                    f"val_dataset_macro={validation_bits:.4f} "
+                    f"val_micro={validation_summary['symbol_micro_bits_per_quality']:.4f} "
+                    f"val_family_macro={validation_summary['platform_family_macro_bits_per_quality']:.4f} "
+                    f"val_worst={validation_summary['worst_dataset']['bits_per_quality']:.4f} "
                     f"best_val_bits={best_validation_bits:.4f}",
                     flush=True,
                 )
@@ -455,7 +655,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--steps-per-epoch", type=int, default=2000)
-    parser.add_argument("--batch-reads", type=int, default=64)
+    parser.add_argument("--batch-reads", type=int, default=256)
+    parser.add_argument(
+        "--resume", type=Path,
+        help="epoch checkpoint; use a NEW empty output dir; epochs is total target",
+    )
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--validation-max-reads-per-file", type=int, default=5000)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -500,6 +704,7 @@ def main() -> int:
             device=device,
             seed=args.seed,
             progress=not args.no_progress,
+            resume=args.resume,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

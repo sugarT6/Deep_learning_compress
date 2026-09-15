@@ -39,6 +39,9 @@ def save_training_checkpoint(
     sampler_statistics: Mapping[str, Any],
     best_validation_bits_per_quality: float,
     validation_metrics: Mapping[str, Any],
+    sampler_state: Optional[Mapping[str, Any]] = None,
+    training_state: Optional[Mapping[str, Any]] = None,
+    selection_metric: str = "symbol_micro_bits_per_quality",
 ) -> None:
     """Atomically save everything needed to identify a training run."""
 
@@ -58,6 +61,9 @@ def save_training_checkpoint(
             best_validation_bits_per_quality
         ),
         "validation_metrics": dict(validation_metrics),
+        "selection_metric": selection_metric,
+        "sampler_state": dict(sampler_state) if sampler_state is not None else None,
+        "training_state": dict(training_state) if training_state is not None else None,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": (
             optimizer.state_dict() if optimizer is not None else None

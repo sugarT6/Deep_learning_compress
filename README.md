@@ -17,7 +17,15 @@ training and encoding; `forward_step` recomputes the prefix for one decode
 cycle. Checkpoint selection uses only the held-out suffix of the ten training
 files. The nine unseen files never participate in selection.
 
-Formal training command (run by the user, not by automated smoke tests):
+Current training defaults to batch 256, strictly equal per-dataset batch counts,
+and persistent shuffled blocks without replacement (including the final short
+block). `best.pt` uses validation dataset-macro bits/Q. Full sampler rules,
+coverage calculations, checkpoint resume instructions, and the **40,000-step
+and 70,320-step formal training commands** are in
+[codec/TRAINING_SAMPLER.md](codec/TRAINING_SAMPLER.md).
+
+Historical completed batch-64 run command (the old sampler behavior is retained
+in its original code commit, not selected by the current command):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.train \
