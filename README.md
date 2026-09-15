@@ -86,6 +86,13 @@ Stage D connects the trained model to the quantizer and single range stream,
 while keeping training caches out of the runtime codec. The encoder accepts
 `.fastq`, `.fq`, `.fastq.gz`, and `.fq.gz`. Encode a FASTQ:
 
+The encoder now reuses frozen prior contexts and has a faster bit-exact range
+batch loop. Neural-only diagnostic bits default to `null`; enable them with
+`--report-neural-only-bits` when needed. Final quantized bits remain enabled.
+See [encoder speed notes](codec/ENCODING_SPEED.md) for compatibility and timings.
+The command below uses the historical checkpoint; substitute your new `best.pt`
+and a new output filename when evaluating retraining.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
   data/2nd/ERR2755197_1.head2M.fastq.gz \

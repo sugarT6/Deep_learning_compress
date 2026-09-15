@@ -49,12 +49,12 @@ from .online_prior import (
     OnlinePriorConfig,
     OnlinePriorState,
 )
+from .encode_fastpath import fuse_batch_logits, selected_quantized_bits
 from .probability_quantization import (
     QUANTIZATION_VERSION,
     TOTAL,
     logits_symbols_bits,
     logits_to_cdfs,
-    quantized_symbols_bits,
     validate_total,
 )
 from .range_encoder import RangeEncoder
@@ -78,7 +78,7 @@ class EncodeStatistics:
     quality_symbols: int
     quantized_theoretical_bits: float
     quantized_theoretical_bits_per_quality: Optional[float]
-    neural_only_theoretical_bits: float
+    neural_only_theoretical_bits: Optional[float]
     neural_only_theoretical_bits_per_quality: Optional[float]
     range_payload_bits: int
     range_payload_bits_per_quality: Optional[float]
@@ -91,6 +91,7 @@ class EncodeStatistics:
     encode_seconds: float
     quality_model_prediction_seconds: float
     quality_entropy_coding_seconds: float
+    encoding_stage_seconds: Dict[str, float]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -139,6 +140,7 @@ def _quantize_verified_batch(
     online_prior: Optional[OnlinePriorState] = None,
     timings: Optional[Dict[str, float]] = None,
     verify_cdf: bool = True,
+    report_neural_only_bits: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """Return cycle-major symbols/CDFs, optionally cross-checking step inference."""
 
@@ -158,17 +160,27 @@ def _quantize_verified_batch(
         cycles, rows = np.nonzero(batch.active_mask.T)
         symbols = np.asarray(batch.qualities[rows, cycles], dtype=np.int64)
         active_logits = full_logits_cpu[rows, cycles]
-        neural_theoretical_bits = logits_symbols_bits(active_logits, symbols)
+        _add_timing(timings, "logits_transfer_and_context", stage_started)
+        stage_started = time.perf_counter()
+        neural_theoretical_bits = (
+            logits_symbols_bits(active_logits, symbols) if report_neural_only_bits else 0.0
+        )
+        _add_timing(timings, "neural_only_diagnostic", stage_started)
+        stage_started = time.perf_counter()
         if online_prior is None:
-            cdfs = logits_to_cdfs(active_logits, total=total)
+            fused_logits = active_logits
         else:
             previous = np.full(symbols.shape, BOS_QUALITY_ID, dtype=np.int64)
             later = cycles > 0
             previous[later] = batch.qualities[rows[later], cycles[later] - 1]
-            fused_logits = online_prior.fuse_logits(active_logits, previous, cycles)
-            cdfs = logits_to_cdfs(fused_logits, total=total)
-        theoretical_bits = quantized_symbols_bits(symbols, cdfs, total=total)
-        _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
+            fused_logits = fuse_batch_logits(online_prior, active_logits, previous, cycles)
+        _add_timing(timings, "prior_fusion", stage_started)
+        stage_started = time.perf_counter()
+        cdfs = logits_to_cdfs(fused_logits, total=total)
+        _add_timing(timings, "cdf_quantization", stage_started)
+        stage_started = time.perf_counter()
+        theoretical_bits = selected_quantized_bits(symbols, cdfs, total)
+        _add_timing(timings, "quantized_bits", stage_started)
 
         if verify_cdf:
             offset = 0
@@ -235,6 +247,7 @@ def encode_fastq(
     progress: bool = True,
     verify_cdf: bool = False,
     online_prior_config: Optional[OnlinePriorConfig] = DEFAULT_ONLINE_PRIOR_CONFIG,
+    report_neural_only_bits: bool = False,
 ) -> EncodeStatistics:
     """Stream a gzip FASTQ through the neural model into one atomic container."""
 
@@ -352,14 +365,17 @@ def encode_fastq(
                         online_prior=online_prior,
                         timings=timings,
                         verify_cdf=verify_cdf,
+                        report_neural_only_bits=report_neural_only_bits,
                     )
                     stage_started = time.perf_counter()
                     range_encoder.encode_prevalidated_batch(
                         symbols, cdfs, total=quantization_total
                     )
+                    _add_timing(timings, "range_encode", stage_started)
+                    stage_started = time.perf_counter()
                     if online_prior is not None:
                         online_prior.update_batch(batch.qualities, batch.active_mask)
-                    _add_timing(timings, "range_encode", stage_started)
+                    _add_timing(timings, "prior_update", stage_started)
                     read_count += batch.read_count
                     batch_count += 1
                     quality_symbols += int(symbols.size)
@@ -459,6 +475,10 @@ def encode_fastq(
         timings["cdf_quantization_and_transfer"]
         + timings["range_encode"]
         + timings["range_finalize_and_stage"]
+        + sum(timings.get(name, 0.0) for name in (
+            "logits_transfer_and_context", "neural_only_diagnostic", "prior_fusion",
+            "cdf_quantization", "quantized_bits", "prior_update",
+        ))
     )
     return EncodeStatistics(
         input_bytes=input_bytes,
@@ -473,10 +493,12 @@ def encode_fastq(
             if quality_symbols
             else None
         ),
-        neural_only_theoretical_bits=neural_only_theoretical_bits,
+        neural_only_theoretical_bits=(
+            neural_only_theoretical_bits if report_neural_only_bits else None
+        ),
         neural_only_theoretical_bits_per_quality=(
             neural_only_theoretical_bits / quality_symbols
-            if quality_symbols
+            if quality_symbols and report_neural_only_bits
             else None
         ),
         range_payload_bits=range_encoder.metadata.payload_bit_count,
@@ -498,6 +520,7 @@ def encode_fastq(
         encode_seconds=encode_seconds,
         quality_model_prediction_seconds=quality_model_prediction_seconds,
         quality_entropy_coding_seconds=quality_entropy_coding_seconds,
+        encoding_stage_seconds=dict(timings),
     )
 
 
@@ -545,6 +568,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument(
+        "--report-neural-only-bits", action="store_true",
+        help="extra diagnostic softmax pass; disabled by default for encoding speed",
+    )
     return parser
 
 
@@ -568,6 +595,7 @@ def main() -> int:
             progress=not args.no_progress,
             verify_cdf=args.verify_cdf,
             online_prior_config=prior_config,
+            report_neural_only_bits=args.report_neural_only_bits,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

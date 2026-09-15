@@ -396,11 +396,34 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
             encode_stats.quantized_theoretical_bits_per_quality,
             encode_stats.quantized_theoretical_bits / encode_stats.quality_symbols,
         )
-        self.assertAlmostEqual(
-            encode_stats.neural_only_theoretical_bits_per_quality,
-            encode_stats.neural_only_theoretical_bits
-            / encode_stats.quality_symbols,
-        )
+        self.assertIsNone(encode_stats.neural_only_theoretical_bits)
+        self.assertIsNone(encode_stats.neural_only_theoretical_bits_per_quality)
+        self.assertIn("prior_fusion", encode_stats.encoding_stage_seconds)
+
+    def test_diagnostic_and_reference_paths_produce_identical_container(self):
+        from codec.online_prior import OnlinePriorState
+        from codec.probability_quantization import quantized_symbols_bits
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkpoint, _ = self._checkpoint(root)
+            source = self._plain_fastq(root, "input.fastq", fastq_bytes(65))
+            paths = [root / name for name in ("fast.fqdc", "reference.fqdc")]
+            with mock.patch("codec.encode.logits_symbols_bits", side_effect=AssertionError):
+                fast = encode_fastq(source, paths[0], checkpoint,
+                    device=torch.device("cpu"), batch_reads=16, progress=False)
+            with mock.patch("codec.encode.fuse_batch_logits", OnlinePriorState.fuse_logits), mock.patch(
+                "codec.encode.selected_quantized_bits",
+                lambda symbols, cdfs, total: quantized_symbols_bits(symbols, cdfs, total=total),
+            ):
+                reference = encode_fastq(source, paths[1], checkpoint,
+                    device=torch.device("cpu"), batch_reads=16, progress=False,
+                    report_neural_only_bits=True, verify_cdf=True)
+            self.assertEqual(paths[0].read_bytes(), paths[1].read_bytes())
+            self.assertEqual(fast.quantized_theoretical_bits, reference.quantized_theoretical_bits)
+            self.assertGreater(reference.neural_only_theoretical_bits, 0)
+            self.assertAlmostEqual(reference.neural_only_theoretical_bits_per_quality,
+                reference.neural_only_theoretical_bits / reference.quality_symbols)
 
     def test_custom_prior_configuration_round_trips_through_metadata(self):
         config = OnlinePriorConfig(

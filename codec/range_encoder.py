@@ -121,12 +121,59 @@ class RangeEncoder:
 
         if self._finished_stream is not None:
             raise RangeCodingError("cannot encode after finalization")
+        # Keep the hot arithmetic/bit state in locals across the whole batch.
+        # The scalar public path remains the reference implementation.
+        low, high = self._low, self._high
+        pending = self._pending_underflow_bits
+        writer = self._writer
+        byte, used, bit_count = writer._current_byte, writer._bits_in_current_byte, writer.bit_count
+        append_byte = writer._bytes.append
         for index in range(len(symbols)):
             symbol = int(symbols[index])
             cdf = cdfs[index]
-            self._encode_interval(
-                int(cdf[symbol]), int(cdf[symbol + 1]), total
-            )
+            interval = high - low + 1
+            new_high = low + (interval * int(cdf[symbol + 1])) // total - 1
+            low += (interval * int(cdf[symbol])) // total
+            high = new_high
+            if low > high:
+                raise InvalidCDFError("cdf resolution collapsed the current range interval")
+            while True:
+                if high < HALF_RANGE:
+                    bit = 0
+                elif low >= HALF_RANGE:
+                    bit = 1
+                    low -= HALF_RANGE
+                    high -= HALF_RANGE
+                elif low >= QUARTER_RANGE and high < THREE_QUARTER_RANGE:
+                    pending += 1
+                    low = (low - QUARTER_RANGE) << 1
+                    high = ((high - QUARTER_RANGE) << 1) | 1
+                    continue
+                else:
+                    break
+                byte = (byte << 1) | bit
+                used += 1
+                bit_count += 1
+                if used == 8:
+                    append_byte(byte)
+                    byte, used = 0, 0
+                # Append deferred identical bits in byte-sized chunks.
+                bit_count += pending
+                while pending:
+                    take = min(pending, 8 - used)
+                    byte = (byte << take) | (((1 << take) - 1) if bit == 0 else 0)
+                    used += take
+                    pending -= take
+                    if used == 8:
+                        append_byte(byte)
+                        byte, used = 0, 0
+                low <<= 1
+                high = (high << 1) | 1
+        self._low, self._high = low, high
+        self._pending_underflow_bits = pending
+        writer._current_byte, writer._bits_in_current_byte = byte, used
+        writer.bit_count = bit_count
+        self._symbol_count += len(symbols)
 
     def _encode_interval(self, symbol_low: int, symbol_high: int, total: int) -> None:
         """Update the arithmetic state from one already validated interval."""

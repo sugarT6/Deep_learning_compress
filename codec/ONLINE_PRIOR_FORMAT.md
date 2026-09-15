@@ -96,3 +96,9 @@ fusion identifier, count dtype, and float contract.
 Legacy version-1 containers have no `probability_profile` field and decode
 with neural-only CDFs. Version 2 requires the complete online-prior profile;
 missing, extra, or unsupported fields are errors.
+
+Encoder optimization does not change this protocol: contexts may share a
+precomputed float64 adjustment within one frozen batch. Final quantized bits
+are always reported; neural-only softmax bits now require the optional
+`--report-neural-only-bits` diagnostic flag and otherwise report `null`.
+See `ENCODING_SPEED.md` for details.
