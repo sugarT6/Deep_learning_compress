@@ -296,6 +296,49 @@ def logits_to_cdfs(
     return cdfs
 
 
+def logits_symbols_bits(
+    logits: Sequence[Sequence[float]], symbols: Sequence[int]
+) -> float:
+    """Return stable float64 softmax cross-entropy bits for selected symbols.
+
+    Unlike :func:`quantized_symbols_bits`, this diagnostic does not construct
+    integer frequencies or CDFs.  It is used for the optional neural-only
+    baseline without duplicating the production largest-remainder quantizer.
+    """
+
+    try:
+        matrix = np.asarray(logits, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ProbabilityQuantizationError(
+            "logits must contain numeric values"
+        ) from exc
+    symbol_array = np.asarray(symbols)
+    if matrix.ndim != 2 or matrix.shape[1] != QUALITY_ALPHABET_SIZE:
+        raise ProbabilityQuantizationError(
+            "logits must have shape [N, "
+            f"{QUALITY_ALPHABET_SIZE}], got {matrix.shape}"
+        )
+    if symbol_array.shape != (matrix.shape[0],):
+        raise ProbabilityQuantizationError("symbols must have shape [N]")
+    if symbol_array.dtype.kind not in "iu":
+        raise ProbabilityQuantizationError("symbols must be integers")
+    if not np.isfinite(matrix).all():
+        raise ProbabilityQuantizationError("logits must not contain NaN or Inf")
+    if np.any(symbol_array < 0) or np.any(symbol_array >= QUALITY_ALPHABET_SIZE):
+        raise ProbabilityQuantizationError("symbols must be in Q0..Q41")
+    if matrix.shape[0] == 0:
+        return 0.0
+
+    maxima = matrix.max(axis=1)
+    log_normalizers = maxima + np.log(
+        np.exp(matrix - maxima[:, None]).sum(axis=1, dtype=np.float64)
+    )
+    selected = matrix[
+        np.arange(matrix.shape[0]), symbol_array.astype(np.int64, copy=False)
+    ]
+    return float(((log_normalizers - selected) / math.log(2.0)).sum(dtype=np.float64))
+
+
 def quantized_symbols_bits(
     symbols: Sequence[int], cdfs: Sequence[Sequence[int]], *, total: int = TOTAL
 ) -> float:
@@ -372,6 +415,7 @@ __all__ = [
     "QUANTIZATION_VERSION",
     "TOTAL",
     "frequencies_to_cdf",
+    "logits_symbols_bits",
     "logits_to_cdf",
     "logits_to_cdfs",
     "logits_to_frequencies",

@@ -26,6 +26,7 @@ from .checkpoint import CHECKPOINT_SCHEMA_VERSION, load_training_checkpoint
 from .container import (
     CONTAINER_FORMAT,
     CONTAINER_VERSION,
+    LEGACY_CONTAINER_VERSION,
     ContainerError,
     SectionSource,
     SideStreamWriter,
@@ -42,9 +43,16 @@ from .fastq_stream import (
 )
 from .fastq_stream import iter_fastq_batches
 from .model import DirectQualityTransformer, fastq_batch_to_tensors, feature_schema
+from .online_prior import (
+    BOS_QUALITY_ID,
+    DEFAULT_ONLINE_PRIOR_CONFIG,
+    OnlinePriorConfig,
+    OnlinePriorState,
+)
 from .probability_quantization import (
     QUANTIZATION_VERSION,
     TOTAL,
+    logits_symbols_bits,
     logits_to_cdfs,
     quantized_symbols_bits,
     validate_total,
@@ -69,6 +77,9 @@ class EncodeStatistics:
     batch_count: int
     quality_symbols: int
     quantized_theoretical_bits: float
+    quantized_theoretical_bits_per_quality: Optional[float]
+    neural_only_theoretical_bits: float
+    neural_only_theoretical_bits_per_quality: Optional[float]
     range_payload_bits: int
     range_payload_bits_per_quality: Optional[float]
     range_stream_bytes: int
@@ -125,9 +136,10 @@ def _quantize_verified_batch(
     device: torch.device,
     *,
     total: int,
+    online_prior: Optional[OnlinePriorState] = None,
     timings: Optional[Dict[str, float]] = None,
     verify_cdf: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, float]:
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """Return cycle-major symbols/CDFs, optionally cross-checking step inference."""
 
     stage_started = time.perf_counter()
@@ -145,7 +157,16 @@ def _quantize_verified_batch(
         full_logits_cpu = full_logits.detach().cpu().numpy()
         cycles, rows = np.nonzero(batch.active_mask.T)
         symbols = np.asarray(batch.qualities[rows, cycles], dtype=np.int64)
-        cdfs = logits_to_cdfs(full_logits_cpu[rows, cycles], total=total)
+        active_logits = full_logits_cpu[rows, cycles]
+        neural_theoretical_bits = logits_symbols_bits(active_logits, symbols)
+        if online_prior is None:
+            cdfs = logits_to_cdfs(active_logits, total=total)
+        else:
+            previous = np.full(symbols.shape, BOS_QUALITY_ID, dtype=np.int64)
+            later = cycles > 0
+            previous[later] = batch.qualities[rows[later], cycles[later] - 1]
+            fused_logits = online_prior.fuse_logits(active_logits, previous, cycles)
+            cdfs = logits_to_cdfs(fused_logits, total=total)
         theoretical_bits = quantized_symbols_bits(symbols, cdfs, total=total)
         _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
 
@@ -167,7 +188,24 @@ def _quantize_verified_batch(
                 stage_started = time.perf_counter()
                 active_rows = np.flatnonzero(batch.active_mask[:, cycle])
                 step_cdfs = logits_to_cdfs(
-                    step_logits.detach().cpu().numpy()[active_rows], total=total
+                    (
+                        step_logits.detach().cpu().numpy()[active_rows]
+                        if online_prior is None
+                        else online_prior.fuse_logits(
+                            step_logits.detach().cpu().numpy()[active_rows],
+                            (
+                                np.full(
+                                    active_rows.size,
+                                    BOS_QUALITY_ID,
+                                    dtype=np.int64,
+                                )
+                                if cycle == 0
+                                else batch.qualities[active_rows, cycle - 1]
+                            ),
+                            np.full(active_rows.size, cycle, dtype=np.int64),
+                        )
+                    ),
+                    total=total,
                 )
                 stop = offset + active_rows.size
                 full_cycle_cdfs = cdfs[offset:stop]
@@ -183,7 +221,7 @@ def _quantize_verified_batch(
                 _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
             if offset != symbols.size:
                 raise ContainerError("CDF verification did not cover every quality")
-    return symbols, cdfs, theoretical_bits
+    return symbols, cdfs, theoretical_bits, neural_theoretical_bits
 
 
 def encode_fastq(
@@ -196,6 +234,7 @@ def encode_fastq(
     quantization_total: int = TOTAL,
     progress: bool = True,
     verify_cdf: bool = False,
+    online_prior_config: Optional[OnlinePriorConfig] = DEFAULT_ONLINE_PRIOR_CONFIG,
 ) -> EncodeStatistics:
     """Stream a gzip FASTQ through the neural model into one atomic container."""
 
@@ -207,6 +246,10 @@ def encode_fastq(
     if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
         raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
     quantization_total = validate_total(quantization_total)
+    if online_prior_config is not None and not isinstance(
+        online_prior_config, OnlinePriorConfig
+    ):
+        raise ValueError("online_prior_config must be OnlinePriorConfig or None")
 
     timings = {
         "checkpoint_hash_and_load": 0.0,
@@ -235,7 +278,13 @@ def encode_fastq(
     batch_count = 0
     quality_symbols = 0
     quantized_theoretical_bits = 0.0
+    neural_only_theoretical_bits = 0.0
     range_encoder = RangeEncoder()
+    online_prior = (
+        OnlinePriorState(online_prior_config)
+        if online_prior_config is not None
+        else None
+    )
     progress_bar = None
     if progress and tqdm is not None:
         progress_bar = tqdm(desc="encode FASTQ", unit="read", leave=True)
@@ -269,7 +318,9 @@ def encode_fastq(
                         break
                     _add_timing(timings, "fastq_parse", stage_started)
                     if len(batch.raw_records) != batch.read_count:
-                        raise ContainerError("direct FASTQ batch is missing raw records")
+                        raise ContainerError(
+                            "direct FASTQ batch is missing raw records"
+                        )
                     stage_started = time.perf_counter()
                     for record in batch.raw_records:
                         raw_record = record.to_bytes()
@@ -288,11 +339,17 @@ def encode_fastq(
                         )
                     _add_timing(timings, "side_stream_record_write", stage_started)
 
-                    symbols, cdfs, batch_theoretical_bits = _quantize_verified_batch(
+                    (
+                        symbols,
+                        cdfs,
+                        batch_theoretical_bits,
+                        batch_neural_only_bits,
+                    ) = _quantize_verified_batch(
                         model,
                         batch,
                         device,
                         total=quantization_total,
+                        online_prior=online_prior,
                         timings=timings,
                         verify_cdf=verify_cdf,
                     )
@@ -300,11 +357,14 @@ def encode_fastq(
                     range_encoder.encode_prevalidated_batch(
                         symbols, cdfs, total=quantization_total
                     )
+                    if online_prior is not None:
+                        online_prior.update_batch(batch.qualities, batch.active_mask)
                     _add_timing(timings, "range_encode", stage_started)
                     read_count += batch.read_count
                     batch_count += 1
                     quality_symbols += int(symbols.size)
                     quantized_theoretical_bits += batch_theoretical_bits
+                    neural_only_theoretical_bits += batch_neural_only_bits
                     if progress_bar is not None:
                         progress_bar.update(batch.read_count)
 
@@ -313,11 +373,17 @@ def encode_fastq(
             quality_path.write_bytes(range_stream)
             _add_timing(timings, "range_finalize_and_stage", stage_started)
             if range_encoder.symbol_count != quality_symbols:
-                raise ContainerError("range symbol count does not match FASTQ qualities")
+                raise ContainerError(
+                    "range symbol count does not match FASTQ qualities"
+                )
 
             metadata = {
                 "format": CONTAINER_FORMAT,
-                "format_version": CONTAINER_VERSION,
+                "format_version": (
+                    CONTAINER_VERSION
+                    if online_prior_config is not None
+                    else LEGACY_CONTAINER_VERSION
+                ),
                 "source_basename": input_path.name,
                 "source_compressed_size": input_path.stat().st_size,
                 "source_uncompressed_size": source_uncompressed_size,
@@ -358,6 +424,10 @@ def encode_fastq(
                     "dtype": "float32",
                 },
             }
+            if online_prior_config is not None:
+                metadata["probability_profile"] = (
+                    online_prior_config.to_profile_metadata()
+                )
             stage_started = time.perf_counter()
             container_info = write_container(
                 output_path,
@@ -398,6 +468,17 @@ def encode_fastq(
         batch_count=batch_count,
         quality_symbols=quality_symbols,
         quantized_theoretical_bits=quantized_theoretical_bits,
+        quantized_theoretical_bits_per_quality=(
+            quantized_theoretical_bits / quality_symbols
+            if quality_symbols
+            else None
+        ),
+        neural_only_theoretical_bits=neural_only_theoretical_bits,
+        neural_only_theoretical_bits_per_quality=(
+            neural_only_theoretical_bits / quality_symbols
+            if quality_symbols
+            else None
+        ),
         range_payload_bits=range_encoder.metadata.payload_bit_count,
         range_payload_bits_per_quality=(
             range_encoder.metadata.payload_bit_count / quality_symbols
@@ -431,6 +512,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-reads", type=int, default=DEFAULT_BATCH_READS)
     parser.add_argument("--quantization-total", type=int, default=TOTAL)
     parser.add_argument(
+        "--prior-cycle-bin-width",
+        type=int,
+        default=DEFAULT_ONLINE_PRIOR_CONFIG.cycle_bin_width,
+    )
+    parser.add_argument(
+        "--prior-global-backoff-strength",
+        type=float,
+        default=DEFAULT_ONLINE_PRIOR_CONFIG.global_backoff_strength,
+    )
+    parser.add_argument(
+        "--prior-prev-q-backoff-strength",
+        type=float,
+        default=DEFAULT_ONLINE_PRIOR_CONFIG.prev_q_backoff_strength,
+    )
+    parser.add_argument(
+        "--prior-cycle-backoff-strength",
+        type=float,
+        default=DEFAULT_ONLINE_PRIOR_CONFIG.cycle_backoff_strength,
+    )
+    parser.add_argument(
+        "--prior-weight",
+        type=float,
+        default=DEFAULT_ONLINE_PRIOR_CONFIG.prior_weight,
+    )
+    parser.add_argument(
         "--verify-cdf",
         action="store_true",
         help=(
@@ -445,6 +551,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
+        prior_config = OnlinePriorConfig(
+            cycle_bin_width=args.prior_cycle_bin_width,
+            global_backoff_strength=args.prior_global_backoff_strength,
+            prev_q_backoff_strength=args.prior_prev_q_backoff_strength,
+            cycle_backoff_strength=args.prior_cycle_backoff_strength,
+            prior_weight=args.prior_weight,
+        )
         statistics = encode_fastq(
             args.input,
             args.output,
@@ -454,6 +567,7 @@ def main() -> int:
             quantization_total=args.quantization_total,
             progress=not args.no_progress,
             verify_cdf=args.verify_cdf,
+            online_prior_config=prior_config,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

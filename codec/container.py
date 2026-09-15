@@ -18,10 +18,13 @@ from pathlib import Path
 from typing import Any, BinaryIO, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 from .fastq_stream import MAX_BATCH_READS
+from .online_prior import OnlinePriorConfig, OnlinePriorError
 
 
 CONTAINER_FORMAT = "fastq-direct-quality-container"
-CONTAINER_VERSION = 1
+LEGACY_CONTAINER_VERSION = 1
+CONTAINER_VERSION = 2
+SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION)
 CONTAINER_MAGIC = b"FQDC0001"
 CONTAINER_FLAGS = 0
 SECTION_NAMES = ("header_gzip", "base_gzip", "plus_gzip", "quality_range")
@@ -197,11 +200,16 @@ def _validate_sha256(value: Any, *, name: str) -> str:
     return value.lower()
 
 
-def _validate_metadata(metadata: Mapping[str, Any]) -> None:
+def _validate_metadata(
+    metadata: Mapping[str, Any], *, physical_version: Optional[int] = None
+) -> None:
     if metadata.get("format") != CONTAINER_FORMAT:
         raise ContainerError("unsupported container format")
-    if _integer(metadata.get("format_version"), name="format_version") != CONTAINER_VERSION:
+    format_version = _integer(metadata.get("format_version"), name="format_version")
+    if format_version not in SUPPORTED_CONTAINER_VERSIONS:
         raise ContainerError("unsupported container format version")
+    if physical_version is not None and format_version != physical_version:
+        raise ContainerError("prefix and metadata format versions do not match")
     batch_reads = _integer(metadata.get("batch_reads"), name="batch_reads", minimum=1)
     if batch_reads > MAX_BATCH_READS:
         raise ContainerError(f"batch_reads must not exceed {MAX_BATCH_READS}")
@@ -272,6 +280,22 @@ def _validate_metadata(metadata: Mapping[str, Any]) -> None:
     )
     _integer(quantization.get("phred_offset"), name="phred_offset")
 
+    probability_profile = metadata.get("probability_profile")
+    if format_version == LEGACY_CONTAINER_VERSION:
+        if probability_profile is not None:
+            raise ContainerError(
+                "legacy version-1 containers cannot declare a probability profile"
+            )
+    else:
+        if probability_profile is None:
+            raise ContainerError("version-2 probability_profile metadata is missing")
+        try:
+            OnlinePriorConfig.from_profile_metadata(probability_profile)
+        except OnlinePriorError as exc:
+            raise ContainerError(
+                f"invalid probability_profile metadata: {exc}"
+            ) from exc
+
     range_coder = metadata.get("range_coder")
     if not isinstance(range_coder, dict):
         raise ContainerError("range_coder metadata is missing")
@@ -336,13 +360,16 @@ def write_container(
     sections = _section_infos(section_sources)
     complete_metadata = dict(metadata)
     complete_metadata["sections"] = [asdict(section) for section in sections]
-    _validate_metadata(complete_metadata)
+    container_version = _integer(
+        complete_metadata.get("format_version"), name="format_version"
+    )
+    _validate_metadata(complete_metadata, physical_version=container_version)
     metadata_bytes = _canonical_metadata(complete_metadata)
     if len(metadata_bytes) > MAX_METADATA_BYTES:
-        raise ContainerError("container metadata exceeds the version-1 size limit")
+        raise ContainerError("container metadata exceeds the size limit")
     prefix = _PREFIX.pack(
         CONTAINER_MAGIC,
-        CONTAINER_VERSION,
+        container_version,
         CONTAINER_FLAGS,
         len(metadata_bytes),
         zlib.crc32(metadata_bytes) & 0xFFFFFFFF,
@@ -419,12 +446,12 @@ def read_container(path: Path, *, verify_checksums: bool = True) -> ContainerInf
         if len(prefix) != _PREFIX.size:
             raise TruncatedContainerError("container is truncated before its prefix")
         magic, version, flags, metadata_length, metadata_crc32 = _PREFIX.unpack(prefix)
-        if magic != CONTAINER_MAGIC or version != CONTAINER_VERSION:
+        if magic != CONTAINER_MAGIC or version not in SUPPORTED_CONTAINER_VERSIONS:
             raise ContainerError("invalid container magic/version")
         if flags != CONTAINER_FLAGS:
             raise ContainerError("unsupported container flags")
         if metadata_length > MAX_METADATA_BYTES:
-            raise ContainerError("container metadata length exceeds the version-1 limit")
+            raise ContainerError("container metadata length exceeds the size limit")
         metadata_bytes = handle.read(metadata_length)
         if len(metadata_bytes) != metadata_length:
             raise TruncatedContainerError("container metadata is truncated")
@@ -438,7 +465,7 @@ def read_container(path: Path, *, verify_checksums: bool = True) -> ContainerInf
         raise ContainerError("container metadata must be a JSON object")
     if _canonical_metadata(metadata) != metadata_bytes:
         raise ContainerError("container metadata is not in canonical JSON form")
-    _validate_metadata(metadata)
+    _validate_metadata(metadata, physical_version=version)
     sections = _parse_section_infos(metadata.get("sections"))
     header_bytes = _PREFIX.size + metadata_length
     expected_size = header_bytes + sum(section.length for section in sections)
@@ -614,8 +641,10 @@ class SideStreamReader:
 __all__ = [
     "CONTAINER_FORMAT",
     "CONTAINER_MAGIC",
+    "LEGACY_CONTAINER_VERSION",
     "CONTAINER_PREFIX_BYTES",
     "CONTAINER_VERSION",
+    "SUPPORTED_CONTAINER_VERSIONS",
     "ContainerError",
     "ContainerInfo",
     "ContainerIntegrityError",

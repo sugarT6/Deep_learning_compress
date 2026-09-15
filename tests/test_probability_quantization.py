@@ -10,6 +10,7 @@ from codec.probability_quantization import (
     frequencies_to_cdf,
     logits_to_cdf,
     logits_to_cdfs,
+    logits_symbols_bits,
     logits_to_frequencies,
     probabilities_to_cdf,
     probabilities_to_frequencies,
@@ -93,6 +94,22 @@ class ProbabilityQuantizationTest(unittest.TestCase):
         self.assertAlmostEqual(
             quantized_symbols_bits(symbols, cdfs), expected, places=10
         )
+
+    def test_neural_only_logits_bits_match_scalar_log_softmax(self):
+        rng = np.random.default_rng(915)
+        logits = rng.normal(size=(200, QUALITY_ALPHABET_SIZE))
+        symbols = rng.integers(0, QUALITY_ALPHABET_SIZE, size=200)
+        expected = 0.0
+        for row, symbol in zip(logits, symbols):
+            shifted = row - row.max()
+            probability = np.exp(shifted[int(symbol)]) / np.exp(shifted).sum()
+            expected -= math.log2(probability)
+        self.assertAlmostEqual(
+            logits_symbols_bits(logits, symbols), expected, places=10
+        )
+
+        with self.assertRaises(ProbabilityQuantizationError):
+            logits_symbols_bits(logits, symbols[:-1])
 
     def test_total_equal_to_alphabet_assigns_every_class_one(self):
         frequencies = probabilities_to_frequencies(np.arange(1, 43), total=42)

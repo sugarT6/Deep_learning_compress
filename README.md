@@ -4,8 +4,10 @@
 
 The current production direction is the independent `codec/` package. It
 reads direct-quality training caches built from FASTQ, predicts all Q0..Q41
-symbols, and does not use SeqArc matrices, `q_hat`, residual features, file
-quality priors, platform embeddings, or accession ids. The historical
+symbols, and does not use SeqArc matrices, `q_hat`, residual features,
+platform embeddings, or accession ids. Runtime codec version 2 additionally
+calibrates the frozen neural probabilities with a causal online file prior;
+the prior is not a model input and does not affect training. The historical
 Q-hat-conditioned experiments remain below for reproducibility.
 
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
@@ -101,6 +103,9 @@ Both commands show progress on stderr and emit JSON statistics on stdout;
 SHA-256 and the batch size stored in the container. The decompressed output is
 verified against the source FASTQ SHA-256 before it is atomically published.
 The format and lossless boundary are specified in `codec/CONTAINER_FORMAT.md`.
+The online count tables, strict completed-batch update boundary, hierarchical
+backoff equations, neural fusion, defaults, and metadata contract are specified
+in `codec/ONLINE_PRIOR_FORMAT.md`.
 The runtime codec defaults to 256 reads per batch. This does not require a new
 checkpoint: training batch size is not part of the model architecture. Existing
 containers that store a 64-read grouping remain decodable by passing
@@ -128,6 +133,27 @@ quantizer to all active rows as one NumPy batch, computes theoretical bits in
 bulk, and passes prevalidated integer intervals to the range coder. Public
 standalone quantizer/range-coder calls retain strict input validation; the
 trusted codec path avoids repeating the same 43-entry CDF checks per symbol.
+
+New encodes default to probability profile `causal_online_hierarchical_v1`.
+It combines global Q counts, same-read previous-Q transition counts (with BOS
+at cycle 0), and cycle-bin/previous-Q transition counts. All tables are reset
+per file, accumulate across batches, and are updated only after the current
+batch has completely finished. The defaults are an 8-cycle bin, backoff
+strength 42.0 at each of the three levels, and prior-ratio logit-adjustment
+weight 0.25. A still-uniform prior leaves the neural CDF unchanged, so online
+calibration begins only after an earlier batch has supplied evidence.
+The encode CLI exposes all five parameters; decode obtains and strictly checks
+them from container metadata. No FASTQ prescan, training cache, or transmitted
+target-file histogram is involved.
+
+Encode JSON statistics report final fused quantized theoretical bits and
+bits/Q in `quantized_theoretical_bits` and
+`quantized_theoretical_bits_per_quality`. They also report the corresponding
+float64 stable-softmax neural-only CE in `neural_only_theoretical_bits` and
+`neural_only_theoretical_bits_per_quality`, avoiding a second expensive integer
+CDF construction. Version-1 containers without a probability profile remain decodable
+through the legacy neural-only path; new online-prior files use container
+version 2 so an old decoder cannot silently select incompatible CDFs.
 
 ## Historical Q-hat-conditioned pipeline
 

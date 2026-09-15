@@ -28,6 +28,7 @@ from .checkpoint import CHECKPOINT_SCHEMA_VERSION, load_training_checkpoint
 from .container import (
     CONTAINER_FORMAT,
     CONTAINER_VERSION,
+    LEGACY_CONTAINER_VERSION,
     ContainerError,
     ContainerIntegrityError,
     SideRecord,
@@ -51,6 +52,12 @@ from .fastq_stream import (
     encode_base_ids,
 )
 from .model import DirectQualityModelConfig, DirectQualityTransformer, feature_schema
+from .online_prior import (
+    BOS_QUALITY_ID,
+    OnlinePriorConfig,
+    OnlinePriorError,
+    OnlinePriorState,
+)
 from .probability_quantization import (
     QUANTIZATION_VERSION,
     logits_to_cdfs,
@@ -91,10 +98,13 @@ def _validate_output_path(output_path: Path) -> None:
         )
 
 
-def _validate_codec_metadata(metadata: Dict[str, Any], *, batch_reads: int) -> int:
+def _validate_codec_metadata(
+    metadata: Dict[str, Any], *, batch_reads: int
+) -> Tuple[int, OnlinePriorConfig | None]:
     if metadata["format"] != CONTAINER_FORMAT:
         raise ContainerError("unsupported container format")
-    if int(metadata["format_version"]) != CONTAINER_VERSION:
+    format_version = int(metadata["format_version"])
+    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION):
         raise ContainerError("unsupported container version")
     stored_batch_reads = int(metadata["batch_reads"])
     if batch_reads != stored_batch_reads:
@@ -122,7 +132,21 @@ def _validate_codec_metadata(metadata: Dict[str, Any], *, batch_reads: int) -> i
         raise ContainerError("version 1 requires one quality range stream")
     if metadata["inference_runtime"]["dtype"] != "float32":
         raise ContainerError("unsupported model inference dtype")
-    return total
+    probability_profile = metadata.get("probability_profile")
+    if format_version == LEGACY_CONTAINER_VERSION:
+        if probability_profile is not None:
+            raise ContainerError("legacy container unexpectedly declares a prior")
+        online_prior_config = None
+    else:
+        if probability_profile is None:
+            raise ContainerError("online-prior probability_profile is missing")
+        try:
+            online_prior_config = OnlinePriorConfig.from_profile_metadata(
+                probability_profile
+            )
+        except OnlinePriorError as exc:
+            raise ContainerError(f"invalid online-prior profile: {exc}") from exc
+    return total, online_prior_config
 
 
 def _validate_checkpoint(
@@ -182,6 +206,7 @@ def _decode_quality_batch(
     first_read_index: int,
     timings: Dict[str, float],
     verify_cdf: bool,
+    online_prior: OnlinePriorState | None,
 ) -> Tuple[np.ndarray, int]:
     stage_started = time.perf_counter()
     bases, lengths, active_mask = _batch_tensors(base_records, device)
@@ -193,6 +218,9 @@ def _decode_quality_batch(
         QUALITY_PAD_ID,
         dtype=torch.long,
         device=device,
+    )
+    decoded_cpu = np.full(
+        (read_count, maximum_length), QUALITY_PAD_ID, dtype=np.int64
     )
     lengths_cpu = np.fromiter(
         (len(record.field) for record in base_records),
@@ -216,8 +244,20 @@ def _decode_quality_batch(
             _add_timing(timings, "model_forward_step", stage_started)
             stage_started = time.perf_counter()
             active_rows = np.flatnonzero(lengths_cpu > cycle)
+            active_logits = step_logits.detach().cpu().numpy()[active_rows]
+            if online_prior is not None:
+                previous = (
+                    np.full(active_rows.size, BOS_QUALITY_ID, dtype=np.int64)
+                    if cycle == 0
+                    else decoded_cpu[active_rows, cycle - 1]
+                )
+                active_logits = online_prior.fuse_logits(
+                    active_logits,
+                    previous,
+                    np.full(active_rows.size, cycle, dtype=np.int64),
+                )
             cycle_cdfs = logits_to_cdfs(
-                step_logits.detach().cpu().numpy()[active_rows],
+                active_logits,
                 total=quantization_total,
             )
             _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
@@ -232,6 +272,7 @@ def _decode_quality_batch(
             decoded[active_rows_tensor, cycle] = torch.as_tensor(
                 cycle_symbols, dtype=torch.long, device=device
             )
+            decoded_cpu[active_rows, cycle] = cycle_symbols
             if verify_cdf:
                 verification_cdfs.append(cycle_cdfs)
             decoded_symbols += active_rows.size
@@ -245,9 +286,18 @@ def _decode_quality_batch(
             _synchronize_device(device)
             _add_timing(timings, "model_forward_full_verification", stage_started)
             stage_started = time.perf_counter()
-            cycles, rows = np.nonzero(active_mask.detach().cpu().numpy().T)
+            active_mask_cpu = active_mask.detach().cpu().numpy()
+            cycles, rows = np.nonzero(active_mask_cpu.T)
+            active_full_logits = full_logits.detach().cpu().numpy()[rows, cycles]
+            if online_prior is not None:
+                previous = np.full(cycles.shape, BOS_QUALITY_ID, dtype=np.int64)
+                later = cycles > 0
+                previous[later] = decoded_cpu[rows[later], cycles[later] - 1]
+                active_full_logits = online_prior.fuse_logits(
+                    active_full_logits, previous, cycles
+                )
             full_cdfs = logits_to_cdfs(
-                full_logits.detach().cpu().numpy()[rows, cycles],
+                active_full_logits,
                 total=quantization_total,
             )
             step_cdfs = (
@@ -264,10 +314,13 @@ def _decode_quality_batch(
                     f"cycle {int(cycles[position])}"
                 )
             _add_timing(timings, "cdf_verification_and_transfer", stage_started)
-    stage_started = time.perf_counter()
-    decoded_array = decoded.cpu().numpy()
-    _add_timing(timings, "decoded_tensor_to_cpu", stage_started)
-    return decoded_array, decoded_symbols
+    if online_prior is not None:
+        active_mask_cpu = (
+            np.arange(maximum_length, dtype=np.int64)[None, :]
+            < lengths_cpu[:, None]
+        )
+        online_prior.update_batch(decoded_cpu, active_mask_cpu)
+    return decoded_cpu, decoded_symbols
 
 
 def _validate_side_records(
@@ -327,12 +380,18 @@ def _decode_to_handle(
     progress_bar: Any,
     timings: Dict[str, float],
     verify_cdf: bool,
+    online_prior_config: OnlinePriorConfig | None,
 ) -> Tuple[int, int, str]:
     metadata = container_info.metadata
     read_count = int(metadata["read_count"])
     reconstructed_digest = hashlib.sha256()
     reconstructed_size = 0
     decoded_symbols = 0
+    online_prior = (
+        OnlinePriorState(online_prior_config)
+        if online_prior_config is not None
+        else None
+    )
 
     with ExitStack() as stack:
         header_compressed = stack.enter_context(
@@ -397,6 +456,7 @@ def _decode_to_handle(
                 first_read_index=batch_start,
                 timings=timings,
                 verify_cdf=verify_cdf,
+                online_prior=online_prior,
             )
             decoded_symbols += batch_symbols
             stage_started = time.perf_counter()
@@ -465,7 +525,7 @@ def decode_fastq(
     }
     stage_started = time.perf_counter()
     container_info = read_container(container_path, verify_checksums=True)
-    quantization_total = _validate_codec_metadata(
+    quantization_total, online_prior_config = _validate_codec_metadata(
         container_info.metadata, batch_reads=batch_reads
     )
     _add_timing(timings, "container_validation", stage_started)
@@ -526,6 +586,7 @@ def decode_fastq(
                             progress_bar=progress_bar,
                             timings=timings,
                             verify_cdf=verify_cdf,
+                            online_prior_config=online_prior_config,
                         )
                     )
             else:
@@ -541,6 +602,7 @@ def decode_fastq(
                         progress_bar=progress_bar,
                         timings=timings,
                         verify_cdf=verify_cdf,
+                        online_prior_config=online_prior_config,
                     )
                 )
             stage_started = time.perf_counter()

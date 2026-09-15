@@ -1,14 +1,20 @@
 import gzip
+import json
 import math
+import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import torch
 
 from codec.checkpoint import LoadedCheckpoint, save_training_checkpoint
 from codec.container import (
+    CONTAINER_VERSION,
+    LEGACY_CONTAINER_VERSION,
     CONTAINER_PREFIX_BYTES,
     SECTION_NAMES,
     ContainerError,
@@ -23,6 +29,14 @@ from codec.encode import build_parser as build_encode_parser
 from codec.encode import encode_fastq
 from codec.fastq_stream import DEFAULT_BATCH_READS, iter_fastq_batches
 from codec.model import DirectQualityModelConfig, DirectQualityTransformer
+from codec.online_prior import (
+    DEFAULT_ONLINE_PRIOR_CONFIG,
+    OnlinePriorConfig,
+    OnlinePriorState,
+)
+
+
+_CONTAINER_PREFIX = struct.Struct("<8sHHII")
 
 
 def tiny_config():
@@ -72,6 +86,31 @@ def fastq_bytes(read_count):
             + quality_ending
         )
     return b"".join(records)
+
+
+def rewrite_container_metadata(source, destination, mutate):
+    contents = Path(source).read_bytes()
+    magic, version, flags, metadata_length, _ = _CONTAINER_PREFIX.unpack(
+        contents[: _CONTAINER_PREFIX.size]
+    )
+    metadata_end = _CONTAINER_PREFIX.size + metadata_length
+    metadata = json.loads(contents[_CONTAINER_PREFIX.size : metadata_end])
+    mutate(metadata)
+    metadata_bytes = json.dumps(
+        metadata,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    prefix = _CONTAINER_PREFIX.pack(
+        magic,
+        version,
+        flags,
+        len(metadata_bytes),
+        zlib.crc32(metadata_bytes) & 0xFFFFFFFF,
+    )
+    Path(destination).write_bytes(prefix + metadata_bytes + contents[metadata_end:])
 
 
 class MismatchedStepModel(DirectQualityTransformer):
@@ -171,6 +210,10 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
         self.assertEqual(decode_args.batch_reads, 256)
         self.assertFalse(encode_args.verify_cdf)
         self.assertFalse(decode_args.verify_cdf)
+        self.assertEqual(
+            encode_args.prior_cycle_bin_width,
+            DEFAULT_ONLINE_PRIOR_CONFIG.cycle_bin_width,
+        )
 
     def test_existing_64_read_grouping_remains_supported(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -222,6 +265,11 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
                         tuple(section.name for section in info.sections), SECTION_NAMES
                     )
                     self.assertEqual(info.metadata["read_count"], read_count)
+                    self.assertEqual(info.metadata["format_version"], CONTAINER_VERSION)
+                    self.assertEqual(
+                        info.metadata["probability_profile"],
+                        DEFAULT_ONLINE_PRIOR_CONFIG.to_profile_metadata(),
+                    )
                     self.assertEqual(
                         info.metadata["batch_reads"], DEFAULT_BATCH_READS
                     )
@@ -292,6 +340,10 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
             self.assertEqual(encode_stats.quality_symbols, 0)
             self.assertIsNone(encode_stats.range_payload_bits_per_quality)
             self.assertIsNone(encode_stats.range_stream_bits_per_quality)
+            self.assertIsNone(encode_stats.quantized_theoretical_bits_per_quality)
+            self.assertIsNone(
+                encode_stats.neural_only_theoretical_bits_per_quality
+            )
             self.assertEqual(decode_stats.output_uncompressed_bytes, 0)
             self.assertEqual(read_container(container).metadata["batch_count"], 0)
 
@@ -307,11 +359,175 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
             _, model = self._checkpoint(root)
             batch = next(iter_fastq_batches(source))
             model.eval()
-            symbols, cdfs, _ = _quantize_verified_batch(
+            symbols, cdfs, _, _ = _quantize_verified_batch(
                 model, batch, torch.device("cpu"), total=1 << 16
             )
         self.assertEqual(symbols.tolist(), [0, 3, 4, 1, 5, 2])
         self.assertEqual(cdfs.shape, (6, 43))
+
+    def test_prior_fused_full_step_cdfs_are_identical(self):
+        original = fastq_bytes(5)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = self._gzip_fastq(root, "prior.fastq.gz", original)
+            _, model = self._checkpoint(root)
+            batch = next(iter_fastq_batches(source, batch_reads=5))
+            state = OnlinePriorState()
+            state.update_batch(batch.qualities, batch.active_mask)
+            model.eval()
+            symbols, cdfs, fused_bits, neural_bits = _quantize_verified_batch(
+                model,
+                batch,
+                torch.device("cpu"),
+                total=1 << 16,
+                online_prior=state,
+                verify_cdf=True,
+            )
+        self.assertEqual(cdfs.shape, (symbols.size, 43))
+        self.assertGreater(fused_bits, 0.0)
+        self.assertGreater(neural_bits, 0.0)
+
+    def test_statistics_include_fused_quantized_and_neural_only_rates(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, encode_stats, _ = self._round_trip(
+                temporary_directory, 5, batch_reads=2
+            )
+        self.assertAlmostEqual(
+            encode_stats.quantized_theoretical_bits_per_quality,
+            encode_stats.quantized_theoretical_bits / encode_stats.quality_symbols,
+        )
+        self.assertAlmostEqual(
+            encode_stats.neural_only_theoretical_bits_per_quality,
+            encode_stats.neural_only_theoretical_bits
+            / encode_stats.quality_symbols,
+        )
+
+    def test_custom_prior_configuration_round_trips_through_metadata(self):
+        config = OnlinePriorConfig(
+            cycle_bin_width=3,
+            global_backoff_strength=7.0,
+            prev_q_backoff_strength=11.0,
+            cycle_backoff_strength=13.0,
+            prior_weight=0.4,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkpoint, _ = self._checkpoint(root)
+            original = fastq_bytes(5)
+            source = self._gzip_fastq(root, "custom.fq.gz", original)
+            container = root / "custom.fqdc"
+            output = root / "custom-restored.fq"
+            encode_fastq(
+                source,
+                container,
+                checkpoint,
+                device=torch.device("cpu"),
+                batch_reads=2,
+                progress=False,
+                online_prior_config=config,
+            )
+            self.assertEqual(
+                read_container(container).metadata["probability_profile"],
+                config.to_profile_metadata(),
+            )
+            decode_fastq(
+                container,
+                output,
+                checkpoint,
+                device=torch.device("cpu"),
+                batch_reads=2,
+                progress=False,
+            )
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_legacy_neural_only_version_1_container_remains_decodable(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkpoint, _ = self._checkpoint(root)
+            original = fastq_bytes(5)
+            source = self._gzip_fastq(root, "legacy.fq.gz", original)
+            container = root / "legacy.fqdc"
+            output = root / "legacy-restored.fq"
+            encode_fastq(
+                source,
+                container,
+                checkpoint,
+                device=torch.device("cpu"),
+                batch_reads=2,
+                progress=False,
+                online_prior_config=None,
+            )
+            metadata = read_container(container).metadata
+            self.assertEqual(metadata["format_version"], LEGACY_CONTAINER_VERSION)
+            self.assertNotIn("probability_profile", metadata)
+            decode_fastq(
+                container,
+                output,
+                checkpoint,
+                device=torch.device("cpu"),
+                batch_reads=2,
+                progress=False,
+            )
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_missing_or_invalid_prior_profile_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkpoint, _ = self._checkpoint(root)
+            source = self._gzip_fastq(root, "input.fq.gz", fastq_bytes(3))
+            container = root / "valid.fqdc"
+            encode_fastq(
+                source,
+                container,
+                checkpoint,
+                device=torch.device("cpu"),
+                progress=False,
+            )
+
+            missing = root / "missing.fqdc"
+            rewrite_container_metadata(
+                container, missing, lambda metadata: metadata.pop("probability_profile")
+            )
+            with self.assertRaisesRegex(ContainerError, "probability_profile"):
+                decode_fastq(
+                    missing,
+                    root / "missing.fq",
+                    checkpoint,
+                    device=torch.device("cpu"),
+                    progress=False,
+                )
+
+            invalid = root / "invalid.fqdc"
+
+            def break_version(metadata):
+                metadata["probability_profile"]["version"] = 999
+
+            rewrite_container_metadata(container, invalid, break_version)
+            with self.assertRaisesRegex(ContainerError, "version"):
+                decode_fastq(
+                    invalid,
+                    root / "invalid.fq",
+                    checkpoint,
+                    device=torch.device("cpu"),
+                    progress=False,
+                )
+
+    def test_same_input_checkpoint_and_prior_produce_identical_container(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkpoint, _ = self._checkpoint(root)
+            source = self._gzip_fastq(root, "input.fq.gz", fastq_bytes(7))
+            outputs = [root / "first.fqdc", root / "second.fqdc"]
+            for output in outputs:
+                encode_fastq(
+                    source,
+                    output,
+                    checkpoint,
+                    device=torch.device("cpu"),
+                    batch_reads=2,
+                    progress=False,
+                )
+            self.assertEqual(outputs[0].read_bytes(), outputs[1].read_bytes())
 
     def test_q42_is_rejected_without_output(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

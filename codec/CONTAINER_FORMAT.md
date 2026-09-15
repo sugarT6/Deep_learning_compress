@@ -1,7 +1,7 @@
-# Direct-quality FASTQ container format, version 1
+# Direct-quality FASTQ container format, version 2
 
-The Stage D container reconstructs the decompressed FASTQ content byte for
-byte. It does not attempt to reproduce the original gzip member bytes. Encoding
+The direct-quality container reconstructs the decompressed FASTQ content byte
+for byte. It does not attempt to reproduce the original gzip member bytes. Encoding
 reads `.fastq`, `.fq`, `.fastq.gz`, or `.fq.gz` sequentially and never creates
 or reads a training cache.
 
@@ -23,7 +23,7 @@ The fixed prefix is:
 | Offset | Bytes | Meaning |
 |---:|---:|---|
 | 0 | 8 | magic `FQDC0001` |
-| 8 | 2 | format version, currently 1 |
+| 8 | 2 | format version, currently 2 |
 | 10 | 2 | flags, currently 0 |
 | 12 | 4 | canonical JSON metadata length |
 | 16 | 4 | CRC32 of the JSON metadata bytes |
@@ -48,6 +48,9 @@ Metadata records at least:
 - gzip side-stream schema and compression level;
 - probability quantizer version, total frequency, Q0--Q41 alphabet, and
   Phred+33 offset;
+- the complete causal-online-prior probability profile, including its version,
+  batch update rule, cycle bin, smoothing/backoff strengths, fusion rule and
+  weight, count dtype, and float contract;
 - one range stream, coder version, and meaningful arithmetic payload bit count;
 - complete model configuration, feature schema, checkpoint schema version, and
   SHA-256 of the exact checkpoint file;
@@ -57,6 +60,15 @@ Metadata records at least:
 The decoder hashes the supplied checkpoint before model inference and rejects
 a mismatch. The model configuration and feature schema loaded from that
 checkpoint must also match the container.
+
+Version 2 changes the probability protocol but not the four-section physical
+layout. Its prior is specified in `ONLINE_PRIOR_FORMAT.md`. Version-2 metadata
+must contain a complete, strictly validated `probability_profile`. Legacy
+version-1 containers contain no such field and remain decodable with the
+neural-only probability path. A version-1 file that declares a profile, or a
+version-2 file with a missing or invalid profile, is rejected before entropy
+decoding. Older decoders reject version 2 instead of silently applying the
+wrong CDF protocol.
 
 ## FASTQ gzip side streams
 
@@ -108,8 +120,10 @@ quality symbols use cycle-major order and inactive variable-length positions
 are skipped. Production encoding uses `forward_full`, while decoding uses
 `forward_step` cycle by cycle. A slow `--verify-cdf` debug mode additionally
 recomputes the opposite inference path and requires the two integer CDFs to be
-identical. This cross-check is covered by tests but is disabled during normal
-compression and decompression.
+identical. The online-prior tables remain frozen for a complete batch and are
+updated only after every quality in that batch has been processed. This
+cross-check is covered by tests but is disabled during normal compression and
+decompression.
 
 The current default and maximum are 256 reads. The batch dimension is not a
 trained model parameter, so checkpoints trained with 64-read batches remain
@@ -125,6 +139,6 @@ uncompressed records, and atomically publishes the output only after size and
 SHA-256 match. A `.gz` decode output is a new deterministic gzip member whose
 decompressed FASTQ bytes match; the gzip bytes need not match the source.
 
-Version 1 deliberately uses one serial quality stream and recomputes model
+Versions 1 and 2 deliberately use one serial quality stream and recompute model
 prefixes. In-memory range payload accumulation and incremental-model/KV-cache
 work belong to Stage E, after correctness measurements are established.
