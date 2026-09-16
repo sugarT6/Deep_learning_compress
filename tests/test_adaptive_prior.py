@@ -1,0 +1,155 @@
+import copy
+import contextlib
+import io
+import unittest
+
+import numpy as np
+
+from codec.adaptive_prior import (AdaptivePriorConfig, AdaptivePriorState,
+    RESPONSIBILITY_TOTAL, responsibility_units)
+from codec.mixture_prior import MixturePriorConfig, MixturePriorState, parse_probability_profile, make_prior_state
+from codec.online_prior import OnlinePriorError
+from codec.probability_quantization import logits_to_cdfs
+
+
+class AdaptivePriorTest(unittest.TestCase):
+    def test_cli_adaptive_is_opt_in_and_excludes_profile_file(self):
+        from codec.encode import build_parser
+        parser = build_parser()
+        self.assertFalse(parser.parse_args(["a.fq", "b.fqdc", "c.pt"]).adaptive_weights)
+        self.assertTrue(parser.parse_args(["a.fq", "b.fqdc", "c.pt", "--adaptive-weights"]).adaptive_weights)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["a.fq", "b.fqdc", "c.pt", "--adaptive-weights", "--probability-profile", "x.json"])
+
+    def test_manual_responsibility_and_completed_batch_update(self):
+        config = AdaptivePriorConfig(adaptation_rate=0.5)
+        state = AdaptivePriorState(config)
+        old = state.weights
+        experts = []
+        for p in (0.8, 0.1, 0.1):
+            row = np.full((1, 42), (1 - p) / 41)
+            row[0, 0] = p
+            experts.append(row)
+        state._pending = (tuple(experts), 1)
+        units = responsibility_units(np.array([[0.8, 0.1, 0.1]]), old)
+        self.assertEqual(int(units.sum()), RESPONSIBILITY_TOTAL)
+        np.testing.assert_allclose(units[0] / RESPONSIBILITY_TOTAL,
+            [8 / 9, 1 / 18, 1 / 18], atol=2 / RESPONSIBILITY_TOTAL, rtol=0)
+        state.observe_symbols(np.array([0]))
+        np.testing.assert_array_equal(state.weights, old)
+        self.assertEqual(state.observed_symbols, 0)
+        proposed = 0.5 * old + 0.5 * units[0] / RESPONSIBILITY_TOTAL
+        free = np.maximum(proposed - config.weight_floor, 0)
+        expected = config.weight_floor + (1 - 3 * config.weight_floor) * free / free.sum()
+        state.update_batch(np.array([[0]]), np.array([[True]]))
+        np.testing.assert_allclose(state.weights, expected, rtol=1e-15)
+        self.assertGreater(state.weights[0], old[0])
+        self.assertEqual(state.weight_updates, 1)
+
+    def test_integer_feedback_partition_and_ties(self):
+        rng = np.random.default_rng(6)
+        selected = rng.uniform(0.0001, 1, (1000, 3))
+        weights = np.array([0.5, 0.25, 0.25])
+        full = responsibility_units(selected, weights)
+        chunks = [responsibility_units(part, weights) for part in np.array_split(selected, 23)]
+        np.testing.assert_array_equal(full.sum(axis=0), sum(c.sum(axis=0) for c in chunks))
+        np.testing.assert_array_equal(full.sum(axis=1), np.full(1000, RESPONSIBILITY_TOTAL))
+        tie = responsibility_units(np.ones((1, 3)), np.ones(3) / 3)[0]
+        self.assertEqual(tie[0], tie[1] + 1)
+        self.assertEqual(tie[1], tie[2])
+
+    def test_cold_start_feedback_contract_and_reset(self):
+        config = AdaptivePriorConfig(temperature=0.85)
+        state = AdaptivePriorState(config)
+        q = np.array([[0, 41]])
+        rows, cycles = np.array([0, 0]), np.array([0, 1])
+        logits = np.arange(84).reshape(2, 42).astype(np.float64)
+        initial = state.weights
+        scores = state.fuse_positions(logits, q, rows, cycles, capture=True)
+        np.testing.assert_array_equal(scores, logits / 0.85)
+        with self.assertRaises(OnlinePriorError):
+            state.update_batch(q, np.ones_like(q, dtype=bool))
+        with self.assertRaises(OnlinePriorError):
+            state.fuse_positions(logits, q, rows, cycles, capture=True)
+        with self.assertRaises(OnlinePriorError):
+            state.observe_symbols(np.array([0, 42]))
+        state.observe_symbols(q[rows, cycles])
+        with self.assertRaises(OnlinePriorError):
+            state.observe_symbols(q[rows, cycles])
+        state.update_batch(q, np.ones_like(q, dtype=bool))
+        np.testing.assert_array_equal(state.weights, initial)
+        self.assertEqual(state.weight_updates, 0)
+        reset = AdaptivePriorState(config)
+        np.testing.assert_array_equal(reset.weights, initial)
+        self.assertEqual(reset.observed_symbols, 0)
+
+    def test_full_step_weights_cdfs_counts_and_verification_purity(self):
+        rng = np.random.default_rng(55)
+        config = AdaptivePriorConfig()
+        encoder, decoder = AdaptivePriorState(config), AdaptivePriorState(config)
+        reference = MixturePriorState(MixturePriorConfig())
+        for _ in range(5):
+            q = rng.integers(0, 42, (65, 19))
+            mask = np.arange(19)[None, :] < rng.integers(1, 20, (65, 1))
+            q[~mask] = 42
+            cycles, rows = np.nonzero(mask.T)
+            symbols = q[rows, cycles]
+            logits = rng.normal(size=(65, 19, 42)).astype(np.float32)
+            frozen = encoder.weights
+            cdfs = logits_to_cdfs(encoder.fuse_positions(logits[rows, cycles], q, rows, cycles, capture=True))
+            # Debug full/step predictions must never capture/consume feedback.
+            pure = logits_to_cdfs(encoder.fuse_positions(logits[rows, cycles], q, rows, cycles))
+            np.testing.assert_array_equal(cdfs, pure)
+            encoder.observe_symbols(symbols)
+            np.testing.assert_array_equal(encoder.weights, frozen)
+            decoded = np.full_like(q, 42)
+            per_cycle = []
+            for cycle in range(19):
+                active = np.flatnonzero(mask[:, cycle])
+                positions = np.full(active.size, cycle)
+                per_cycle.append(logits_to_cdfs(decoder.fuse_positions(logits[active, cycle], decoded,
+                    active, positions, capture=True)))
+                decoded[active, cycle] = q[active, cycle]
+                decoder.observe_symbols(q[active, cycle])
+                np.testing.assert_array_equal(decoder.weights, frozen)
+            np.testing.assert_array_equal(cdfs, np.concatenate(per_cycle))
+            np.testing.assert_array_equal(encoder._units, decoder._units)
+            encoder.update_batch(q, mask); decoder.update_batch(decoded, mask)
+            reference.update_batch(q, mask)
+            np.testing.assert_array_equal(encoder.weights, decoder.weights)
+            for name in ("order2_counts", "run_counts"):
+                np.testing.assert_array_equal(getattr(encoder, name), getattr(reference, name))
+            np.testing.assert_array_equal(encoder.base.cycle_prev_q_counts, reference.base.cycle_prev_q_counts)
+
+    def test_floor_and_stability(self):
+        state = AdaptivePriorState(AdaptivePriorConfig(adaptation_rate=1.0))
+        for _ in range(100):
+            state._pending = ((np.ones((1, 42)), np.full((1, 42), 1e-30), np.full((1, 42), 1e-30)), 1)
+            state.observe_symbols(np.array([0]))
+            state.update_batch(np.array([[0]]), np.array([[True]]))
+            self.assertTrue(np.isfinite(state.weights).all())
+            self.assertTrue((state.weights >= 0.01).all())
+            self.assertAlmostEqual(float(state.weights.sum()), 1.0)
+        np.testing.assert_allclose(state.weights, [0.98, 0.01, 0.01])
+
+    def test_strict_profile_validation_and_old_rejection(self):
+        config = AdaptivePriorConfig()
+        profile = config.to_profile_metadata()
+        self.assertEqual(parse_probability_profile(profile), config)
+        self.assertIsInstance(make_prior_state(config), AdaptivePriorState)
+        with self.assertRaises(OnlinePriorError):
+            MixturePriorConfig.from_profile_metadata(profile)
+        for key in profile:
+            broken = copy.deepcopy(profile); del broken[key]
+            with self.assertRaises(OnlinePriorError):
+                parse_probability_profile(broken)
+        for key, value in (("version", 2), ("version", True), ("responsibility_total", 65536),
+                           ("cold_start", "learn"), ("experts", ["run", "neural", "order2"])):
+            broken = copy.deepcopy(profile); broken[key] = value
+            with self.assertRaises(OnlinePriorError):
+                parse_probability_profile(broken)
+        for key, value in (("adaptation_rate", 0), ("adaptation_rate", float("nan")),
+                           ("weight_floor", 0.34), ("weight_floor", True), ("context_mode", "hierarchical")):
+            broken = copy.deepcopy(profile); broken["config"][key] = value
+            with self.assertRaises(OnlinePriorError):
+                parse_probability_profile(broken)

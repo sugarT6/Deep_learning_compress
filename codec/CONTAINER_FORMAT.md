@@ -64,6 +64,8 @@ checkpoint must also match the container.
 Version 2 changes the probability protocol but not the four-section physical
 layout. The default prior is specified in `ONLINE_PRIOR_FORMAT.md`; the optional
 `causal_quality_mixture_v1` profile is specified in `FUSION_VALIDATION.md`.
+The optional `causal_adaptive_mixture_v1` profile is specified in
+`ADAPTIVE_WEIGHTS.md`; readers without it reject its unknown name.
 Readers predating the mixture extension reject its unknown profile name.
 Version-2 metadata
 must contain a complete, strictly validated `probability_profile`. Legacy

@@ -97,6 +97,9 @@ For validation-only fusion diagnostics and opt-in calibrated mixtures with
 order-2/run-length online contexts, see [fusion evaluation](codec/FUSION_VALIDATION.md).
 The production default is unchanged; no training or unseen tuning is performed.
 
+For optional causal online weights over the same three experts, use
+`--adaptive-weights`; see [adaptive weights](codec/ADAPTIVE_WEIGHTS.md).
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
   data/2nd/ERR2755197_1.head2M.fastq.gz \

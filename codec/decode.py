@@ -63,6 +63,7 @@ from .probability_quantization import (
     validate_total,
 )
 from .range_decoder import RangeDecoder
+from .adaptive_prior import AdaptivePriorState
 from .mixture_prior import (MixturePriorConfig, MixturePriorState,
     make_prior_state, parse_probability_profile, fuse_profile_positions)
 
@@ -246,7 +247,10 @@ def _decode_quality_batch(
             stage_started = time.perf_counter()
             active_rows = np.flatnonzero(lengths_cpu > cycle)
             active_logits = step_logits.detach().cpu().numpy()[active_rows]
-            if online_prior is not None:
+            if isinstance(online_prior, AdaptivePriorState):
+                active_logits = online_prior.fuse_positions(active_logits, decoded_cpu,
+                    active_rows, np.full(active_rows.size, cycle, dtype=np.int64), capture=True)
+            elif online_prior is not None:
                 active_logits = fuse_profile_positions(online_prior, active_logits,
                     decoded_cpu, active_rows, np.full(active_rows.size, cycle, dtype=np.int64))
             cycle_cdfs = logits_to_cdfs(
@@ -259,6 +263,8 @@ def _decode_quality_batch(
             cycle_symbols = range_decoder.decode_prevalidated_batch(
                 cycle_cdfs, total=quantization_total
             )
+            if isinstance(online_prior, AdaptivePriorState):
+                online_prior.observe_symbols(np.asarray(cycle_symbols, dtype=np.int64))
             active_rows_tensor = torch.as_tensor(
                 active_rows, dtype=torch.long, device=device
             )

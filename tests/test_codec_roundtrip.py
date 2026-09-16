@@ -131,6 +131,34 @@ class ForbiddenFullModel(DirectQualityTransformer):
 
 
 class NeuralCodecRoundTripTest(unittest.TestCase):
+    def test_adaptive_profile_boundaries_roundtrip_and_determinism(self):
+        from codec.adaptive_prior import AdaptivePriorConfig
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, _ = self._checkpoint(root)
+            for count in (0, 1, 63, 64, 65, 255, 256, 257, 513):
+                source = self._plain_fastq(root, f"adaptive{count}.fq", fastq_bytes(count))
+                container, output = root / f"adaptive{count}.fqdc", root / f"decoded{count}.fq"
+                batch_reads = 64 if count <= 65 else 256
+                stats = encode_fastq(source, container, checkpoint, device=torch.device("cpu"),
+                    batch_reads=batch_reads, online_prior_config=AdaptivePriorConfig(), progress=False, verify_cdf=True)
+                decode_fastq(container, output, checkpoint, device=torch.device("cpu"),
+                    batch_reads=batch_reads, progress=False, verify_cdf=True)
+                self.assertEqual(source.read_bytes(), output.read_bytes())
+                self.assertEqual(stats.online_adaptation["weight_updates"], max(0, (count + batch_reads - 1) // batch_reads - 1))
+                self.assertAlmostEqual(sum(stats.online_adaptation["final_weights"]), 1)
+                if count == 65:
+                    repeated = root / "adaptive_repeat.fqdc"
+                    encode_fastq(source, repeated, checkpoint, device=torch.device("cpu"), batch_reads=64,
+                        online_prior_config=AdaptivePriorConfig(), progress=False)
+                    self.assertEqual(container.read_bytes(), repeated.read_bytes())
+                    corrupt = root / "adaptive_bad.fqdc"
+                    rewrite_container_metadata(container, corrupt,
+                        lambda metadata: metadata["probability_profile"]["config"].update(adaptation_rate=0))
+                    with self.assertRaises(ContainerError):
+                        decode_fastq(corrupt, root / "bad_adaptive.fq", checkpoint,
+                            device=torch.device("cpu"), batch_reads=64, progress=False)
+
     def test_mixture_profile_roundtrip_determinism_and_boundaries(self):
         from codec.mixture_prior import MixturePriorConfig
         with tempfile.TemporaryDirectory() as directory:

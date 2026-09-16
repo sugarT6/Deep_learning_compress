@@ -100,13 +100,14 @@ class MixturePriorState:
     def observed_symbols(self):
         return self.base.observed_symbols
 
-    def probabilities(self, qualities, rows, cycles):
+    def _context_probabilities(self, qualities, rows, cycles):
         previous, previous2, run_bin = history_contexts(qualities, rows, cycles)
         bins = cycles // self.config.cycle_bin_width
         # Group all contexts needed by the hierarchy and its two richer children.
         keys = ((bins * 43 + previous) * 43 + previous2) * 5 + run_bin
         _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
         parent = self.base.probabilities(previous[first], cycles[first])
+        order2 = runs = None
         if self.config.context_mode == "enriched":
             order2 = self.order2_counts[previous2[first], previous[first]].astype(np.float64)
             runs = np.zeros_like(order2)
@@ -117,7 +118,18 @@ class MixturePriorState:
             order2 = (order2 + strength * parent) / (order2.sum(axis=1, keepdims=True) + strength)
             runs = (runs + strength * parent) / (runs.sum(axis=1, keepdims=True) + strength)
             parent = (order2 + runs) * 0.5
+        return parent, order2, runs, inverse
+
+    def probabilities(self, qualities, rows, cycles):
+        parent, _, _, inverse = self._context_probabilities(qualities, rows, cycles)
         return parent[inverse]
+
+    def expert_probabilities(self, qualities, rows, cycles):
+        """Expose the existing two experts without adding or changing contexts."""
+        _, order2, runs, inverse = self._context_probabilities(qualities, rows, cycles)
+        if order2 is None:
+            raise OnlinePriorError("separate experts require enriched contexts")
+        return order2[inverse], runs[inverse]
 
     def fuse_positions(self, logits, qualities, rows, cycles):
         scores = np.asarray(logits, dtype=np.float64) / self.config.temperature
@@ -151,12 +163,18 @@ class MixturePriorState:
 
 
 def parse_probability_profile(values):
+    from .adaptive_prior import ADAPTIVE_PROFILE, AdaptivePriorConfig
+    if isinstance(values, dict) and values.get("name") == ADAPTIVE_PROFILE:
+        return AdaptivePriorConfig.from_profile_metadata(values)
     if isinstance(values, dict) and values.get("name") == MIXTURE_PROFILE:
         return MixturePriorConfig.from_profile_metadata(values)
     return OnlinePriorConfig.from_profile_metadata(values)
 
 
 def make_prior_state(config):
+    from .adaptive_prior import AdaptivePriorConfig, AdaptivePriorState
+    if isinstance(config, AdaptivePriorConfig):
+        return AdaptivePriorState(config)
     if config is None:
         return None
     return MixturePriorState(config) if isinstance(config, MixturePriorConfig) else OnlinePriorState(config)

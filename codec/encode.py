@@ -50,6 +50,7 @@ from .online_prior import (
     OnlinePriorState,
 )
 from .encode_fastpath import fuse_batch_logits, selected_quantized_bits
+from .adaptive_prior import AdaptivePriorConfig, AdaptivePriorState
 from .mixture_prior import (
     MixturePriorConfig, MixturePriorState, make_prior_state,
     parse_probability_profile, fuse_profile_positions,
@@ -96,6 +97,7 @@ class EncodeStatistics:
     quality_model_prediction_seconds: float
     quality_entropy_coding_seconds: float
     encoding_stage_seconds: Dict[str, float]
+    online_adaptation: Optional[Dict[str, Any]]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -173,6 +175,8 @@ def _quantize_verified_batch(
         stage_started = time.perf_counter()
         if online_prior is None:
             fused_logits = active_logits
+        elif isinstance(online_prior, AdaptivePriorState):
+            fused_logits = online_prior.fuse_positions(active_logits, batch.qualities, rows, cycles, capture=True)
         elif isinstance(online_prior, MixturePriorState):
             fused_logits = online_prior.fuse_positions(active_logits, batch.qualities, rows, cycles)
         else:
@@ -359,6 +363,10 @@ def encode_fastq(
                     )
                     _add_timing(timings, "range_encode", stage_started)
                     stage_started = time.perf_counter()
+                    if isinstance(online_prior, AdaptivePriorState):
+                        online_prior.observe_symbols(symbols)
+                    _add_timing(timings, "adaptive_weight_feedback", stage_started)
+                    stage_started = time.perf_counter()
                     if online_prior is not None:
                         online_prior.update_batch(batch.qualities, batch.active_mask)
                     _add_timing(timings, "prior_update", stage_started)
@@ -464,6 +472,7 @@ def encode_fastq(
         + sum(timings.get(name, 0.0) for name in (
             "logits_transfer_and_context", "neural_only_diagnostic", "prior_fusion",
             "cdf_quantization", "quantized_bits", "prior_update",
+            "adaptive_weight_feedback",
         ))
     )
     return EncodeStatistics(
@@ -507,6 +516,7 @@ def encode_fastq(
         quality_model_prediction_seconds=quality_model_prediction_seconds,
         quality_entropy_coding_seconds=quality_entropy_coding_seconds,
         encoding_stage_seconds=dict(timings),
+        online_adaptation=(online_prior.diagnostics() if isinstance(online_prior, AdaptivePriorState) else None),
     )
 
 
@@ -554,8 +564,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-progress", action="store_true")
-    parser.add_argument("--probability-profile", type=Path,
+    profile_options = parser.add_mutually_exclusive_group()
+    profile_options.add_argument("--probability-profile", type=Path,
         help="explicit validated profile JSON; cannot combine with nondefault --prior-* values")
+    profile_options.add_argument("--adaptive-weights", action="store_true",
+        help="opt-in completed-batch adaptive neural/order2/run mixture; initial weights 0.5/0.25/0.25")
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -573,7 +586,11 @@ def main() -> int:
             cycle_backoff_strength=args.prior_cycle_backoff_strength,
             prior_weight=args.prior_weight,
         )
-        if args.probability_profile is not None:
+        if args.adaptive_weights:
+            if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
+                raise ValueError("--adaptive-weights cannot be combined with nondefault --prior-* values")
+            prior_config = AdaptivePriorConfig()
+        elif args.probability_profile is not None:
             if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
                 raise ValueError("profile JSON cannot be combined with nondefault --prior-* values")
             values = json.loads(args.probability_profile.read_text())
