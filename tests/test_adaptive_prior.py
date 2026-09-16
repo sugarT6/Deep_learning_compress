@@ -162,7 +162,10 @@ class AdaptivePriorTest(unittest.TestCase):
         cases = ((MixturePriorConfig(), MixturePriorState,
             "28596821b552b8649677a2be9917d1527ed8d041a1bcbce95ff7f9d979a4c58f"),
             (AdaptivePriorConfig(context_mode="enriched"), AdaptivePriorState,
-            "f1c96d2cc843cbd04bb3e50735d1469a9695ad75412f0c8c8f9f1acb57e82116"))
+            "f1c96d2cc843cbd04bb3e50735d1469a9695ad75412f0c8c8f9f1acb57e82116"),
+            # Position v2 baseline generated from 880b595.
+            (AdaptivePriorConfig(), AdaptivePriorState,
+            "fbf0d5d2ff4538d8bcdc25e82cb07d67dccd5dcb54e6f1bf709e87361d5cc854"))
         for config, state_class, expected in cases:
             state = state_class(config); digest = hashlib.sha256()
             rng = np.random.default_rng(1729)

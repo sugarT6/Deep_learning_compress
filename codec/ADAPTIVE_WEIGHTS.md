@@ -1,6 +1,9 @@
 # Opt-in completed-batch adaptive mixture weights
 
-The current opt-in v2 profile uses neural, position-conditioned order-2, and
+The CLI now defaults to four-expert v3: see [running delta](RUNNING_DELTA.md).
+The following context and update details describe the retained three-expert v2.
+
+The v2 profile uses neural, position-conditioned order-2, and
 cycle/previous-Q/run-length experts with completed-batch adaptive weights.
 It adds position to order-2 without changing the neural architecture or training.
 Original v1 adaptive, fixed-alpha mixture and legacy profiles remain unchanged
@@ -14,7 +17,7 @@ From the repository root, using a new output filename:
 ```bash
 CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
   data/2nd/CNR0847462_1.head2M.fastq.gz \
-  codec/output/CNR0847462_1_adaptive_cycle_order2_v2.fqdc \
+  codec/output/CNR0847462_1_adaptive_running_delta_v3.fqdc \
   codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
   --device cuda --batch-reads 256 --adaptive-weights
 ```
@@ -28,7 +31,7 @@ Omitting the new flag preserves the old production default.
 The updated decoder automatically reads the profile from the container and
 requires the same checkpoint. No adaptive flag is needed for decoding.
 Containers remain physically v2 but carry the new, strictly validated
-`causal_adaptive_mixture_v2` profile. Older decoders reject the unknown name;
+`causal_adaptive_mixture_v3` profile. Older decoders reject the unknown name;
 they cannot silently decode it as the fixed-alpha profile.
 
 ## Initial configuration (not tuned on unseen files)

@@ -568,7 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile_options.add_argument("--probability-profile", type=Path,
         help="explicit validated profile JSON; cannot combine with nondefault --prior-* values")
     profile_options.add_argument("--adaptive-weights", action="store_true",
-        help="opt-in v2 completed-batch adaptive neural/cycle-order2/run mixture; initial weights 0.5/0.25/0.25")
+        help="opt-in v3 adaptive neural/cycle-order2/run/running-delta mixture; initial neural weight 0.5")
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -589,7 +589,8 @@ def main() -> int:
         if args.adaptive_weights:
             if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
                 raise ValueError("--adaptive-weights cannot be combined with nondefault --prior-* values")
-            prior_config = AdaptivePriorConfig()
+            from .running_delta import RunningDeltaPriorConfig
+            prior_config = RunningDeltaPriorConfig()
         elif args.probability_profile is not None:
             if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
                 raise ValueError("profile JSON cannot be combined with nondefault --prior-* values")

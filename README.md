@@ -97,8 +97,9 @@ For validation-only fusion diagnostics and opt-in calibrated mixtures with
 order-2/run-length online contexts, see [fusion evaluation](codec/FUSION_VALIDATION.md).
 The production default is unchanged; no training or unseen tuning is performed.
 
-For optional causal online weights with position-conditioned order-2 (v2), use
-`--adaptive-weights`; see [adaptive weights](codec/ADAPTIVE_WEIGHTS.md).
+For optional causal online weights with position-conditioned order-2 and a
+running-delta expert (v3), use `--adaptive-weights`;
+see [running delta](codec/RUNNING_DELTA.md) and [adaptive weights](codec/ADAPTIVE_WEIGHTS.md).
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.encode \

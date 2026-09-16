@@ -134,9 +134,11 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
     def test_position_and_legacy_profiles_cross_bin_roundtrip(self):
         from codec.adaptive_prior import AdaptivePriorConfig
         from codec.mixture_prior import MixturePriorConfig
+        from codec.running_delta import RunningDeltaPriorConfig
         configs = (AdaptivePriorConfig(cycle_bin_width=2),
             AdaptivePriorConfig(context_mode="enriched", cycle_bin_width=2),
-            MixturePriorConfig(context_mode="position_enriched", cycle_bin_width=2))
+            MixturePriorConfig(context_mode="position_enriched", cycle_bin_width=2),
+            RunningDeltaPriorConfig(cycle_bin_width=2))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkpoint, _ = self._checkpoint(root)
@@ -158,7 +160,7 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
                             device=torch.device("cpu"), batch_reads=64, progress=False)
 
     def test_adaptive_profile_boundaries_roundtrip_and_determinism(self):
-        from codec.adaptive_prior import AdaptivePriorConfig
+        from codec.running_delta import RunningDeltaPriorConfig as AdaptivePriorConfig
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkpoint, _ = self._checkpoint(root)

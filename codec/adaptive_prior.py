@@ -75,7 +75,7 @@ class AdaptivePriorConfig(MixturePriorConfig):
 
 
 def responsibility_units(selected_probabilities, weights):
-    """Quantize each symbol's 3 posterior responsibilities before any reduction."""
+    """Quantize each symbol's expert responsibilities before any reduction."""
     weighted = np.asarray(selected_probabilities, dtype=np.float64) * weights[None, :]
     denominator = weighted.sum(axis=1, keepdims=True, dtype=np.float64)
     if not np.isfinite(weighted).all() or np.any(weighted < 0) or np.any(denominator <= 0):
@@ -83,7 +83,7 @@ def responsibility_units(selected_probabilities, weights):
     responsibilities = weighted / denominator
     units = np.floor(responsibilities * RESPONSIBILITY_TOTAL).astype(np.int64)
     remainder = RESPONSIBILITY_TOTAL - units.sum(axis=1, dtype=np.int64)
-    if np.any(remainder < 0) or np.any(remainder > 3):
+    if np.any(remainder < 0) or np.any(remainder > weighted.shape[1]):
         raise OnlinePriorError("invalid responsibility rounding")
     units[np.arange(units.shape[0]), np.argmax(responsibilities, axis=1)] += remainder
     return units
@@ -92,9 +92,10 @@ def responsibility_units(selected_probabilities, weights):
 class AdaptivePriorState(MixturePriorState):
     def __init__(self, config):
         super().__init__(config)
-        self._weights = np.array([1 - config.alpha, config.alpha / 2, config.alpha / 2], dtype=np.float64)
+        count = len(config.to_profile_metadata()["experts"])
+        self._weights = np.array([1 - config.alpha] + [config.alpha / (count - 1)] * (count - 1), dtype=np.float64)
         self._pending = None
-        self._units = np.zeros(3, dtype=np.int64)
+        self._units = np.zeros(count, dtype=np.int64)
         self._recorded_positions = 0
         self._learned_positions = 0
         self.weight_updates = 0
@@ -102,6 +103,9 @@ class AdaptivePriorState(MixturePriorState):
     @property
     def weights(self):
         return self._weights.copy()
+
+    def _prediction_experts(self, qualities, rows, cycles):
+        return self.expert_probabilities(qualities, rows, cycles)
 
     def fuse_positions(self, logits, qualities, rows, cycles, *, capture=False):
         if capture and self._pending is not None:
@@ -115,10 +119,13 @@ class AdaptivePriorState(MixturePriorState):
             return scores
         neural = np.exp(scores - scores.max(axis=1, keepdims=True))
         neural /= neural.sum(axis=1, keepdims=True)
-        order2, runs = self.expert_probabilities(qualities, rows, cycles)
+        online = self._prediction_experts(qualities, rows, cycles)
+        order2, runs = online[:2]
         mixture = self._weights[0] * neural + self._weights[1] * order2 + self._weights[2] * runs
+        for index, expert in enumerate(online[2:], start=3):
+            mixture = mixture + self._weights[index] * expert
         if capture:
-            self._pending = ((neural, order2, runs), cycles.size)
+            self._pending = ((neural, *online), cycles.size)
         return np.log(mixture)
 
     def observe_symbols(self, symbols):
@@ -150,7 +157,7 @@ class AdaptivePriorState(MixturePriorState):
             rate, floor = self.config.adaptation_rate, self.config.weight_floor
             proposed = (1 - rate) * self._weights + rate * mean
             free = np.maximum(proposed - floor, 0.0)
-            self._weights = floor + (1 - 3 * floor) * (free / free.sum(dtype=np.float64))
+            self._weights = floor + (1 - len(self._weights) * floor) * (free / free.sum(dtype=np.float64))
             self.weight_updates += 1
         self._units[:] = 0
         self._recorded_positions = self._learned_positions = 0

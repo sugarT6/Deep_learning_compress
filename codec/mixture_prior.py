@@ -184,6 +184,9 @@ class MixturePriorState:
 
 
 def parse_probability_profile(values):
+    from .running_delta import RUNNING_DELTA_PROFILE, RunningDeltaPriorConfig
+    if isinstance(values, dict) and values.get("name") == RUNNING_DELTA_PROFILE:
+        return RunningDeltaPriorConfig.from_profile_metadata(values)
     from .adaptive_prior import ADAPTIVE_PROFILE, POSITION_ADAPTIVE_PROFILE, AdaptivePriorConfig
     if isinstance(values, dict) and values.get("name") in (ADAPTIVE_PROFILE, POSITION_ADAPTIVE_PROFILE):
         return AdaptivePriorConfig.from_profile_metadata(values)
@@ -193,6 +196,9 @@ def parse_probability_profile(values):
 
 
 def make_prior_state(config):
+    from .running_delta import RunningDeltaPriorConfig, RunningDeltaPriorState
+    if isinstance(config, RunningDeltaPriorConfig):
+        return RunningDeltaPriorState(config)
     from .adaptive_prior import AdaptivePriorConfig, AdaptivePriorState
     if isinstance(config, AdaptivePriorConfig):
         return AdaptivePriorState(config)
