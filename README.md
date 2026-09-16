@@ -93,6 +93,10 @@ See [encoder speed notes](codec/ENCODING_SPEED.md) for compatibility and timings
 The command below uses the historical checkpoint; substitute your new `best.pt`
 and a new output filename when evaluating retraining.
 
+For validation-only fusion diagnostics and opt-in calibrated mixtures with
+order-2/run-length online contexts, see [fusion evaluation](codec/FUSION_VALIDATION.md).
+The production default is unchanged; no training or unseen tuning is performed.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
   data/2nd/ERR2755197_1.head2M.fastq.gz \

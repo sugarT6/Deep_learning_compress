@@ -53,7 +53,6 @@ from .fastq_stream import (
 )
 from .model import DirectQualityModelConfig, DirectQualityTransformer, feature_schema
 from .online_prior import (
-    BOS_QUALITY_ID,
     OnlinePriorConfig,
     OnlinePriorError,
     OnlinePriorState,
@@ -64,6 +63,8 @@ from .probability_quantization import (
     validate_total,
 )
 from .range_decoder import RangeDecoder
+from .mixture_prior import (MixturePriorConfig, MixturePriorState,
+    make_prior_state, parse_probability_profile, fuse_profile_positions)
 
 
 SUPPORTED_OUTPUT_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
@@ -100,7 +101,7 @@ def _validate_output_path(output_path: Path) -> None:
 
 def _validate_codec_metadata(
     metadata: Dict[str, Any], *, batch_reads: int
-) -> Tuple[int, OnlinePriorConfig | None]:
+) -> Tuple[int, OnlinePriorConfig | MixturePriorConfig | None]:
     if metadata["format"] != CONTAINER_FORMAT:
         raise ContainerError("unsupported container format")
     format_version = int(metadata["format_version"])
@@ -141,7 +142,7 @@ def _validate_codec_metadata(
         if probability_profile is None:
             raise ContainerError("online-prior probability_profile is missing")
         try:
-            online_prior_config = OnlinePriorConfig.from_profile_metadata(
+            online_prior_config = parse_probability_profile(
                 probability_profile
             )
         except OnlinePriorError as exc:
@@ -206,7 +207,7 @@ def _decode_quality_batch(
     first_read_index: int,
     timings: Dict[str, float],
     verify_cdf: bool,
-    online_prior: OnlinePriorState | None,
+    online_prior: OnlinePriorState | MixturePriorState | None,
 ) -> Tuple[np.ndarray, int]:
     stage_started = time.perf_counter()
     bases, lengths, active_mask = _batch_tensors(base_records, device)
@@ -246,16 +247,8 @@ def _decode_quality_batch(
             active_rows = np.flatnonzero(lengths_cpu > cycle)
             active_logits = step_logits.detach().cpu().numpy()[active_rows]
             if online_prior is not None:
-                previous = (
-                    np.full(active_rows.size, BOS_QUALITY_ID, dtype=np.int64)
-                    if cycle == 0
-                    else decoded_cpu[active_rows, cycle - 1]
-                )
-                active_logits = online_prior.fuse_logits(
-                    active_logits,
-                    previous,
-                    np.full(active_rows.size, cycle, dtype=np.int64),
-                )
+                active_logits = fuse_profile_positions(online_prior, active_logits,
+                    decoded_cpu, active_rows, np.full(active_rows.size, cycle, dtype=np.int64))
             cycle_cdfs = logits_to_cdfs(
                 active_logits,
                 total=quantization_total,
@@ -290,12 +283,8 @@ def _decode_quality_batch(
             cycles, rows = np.nonzero(active_mask_cpu.T)
             active_full_logits = full_logits.detach().cpu().numpy()[rows, cycles]
             if online_prior is not None:
-                previous = np.full(cycles.shape, BOS_QUALITY_ID, dtype=np.int64)
-                later = cycles > 0
-                previous[later] = decoded_cpu[rows[later], cycles[later] - 1]
-                active_full_logits = online_prior.fuse_logits(
-                    active_full_logits, previous, cycles
-                )
+                active_full_logits = fuse_profile_positions(online_prior,
+                    active_full_logits, decoded_cpu, rows, cycles)
             full_cdfs = logits_to_cdfs(
                 active_full_logits,
                 total=quantization_total,
@@ -380,18 +369,14 @@ def _decode_to_handle(
     progress_bar: Any,
     timings: Dict[str, float],
     verify_cdf: bool,
-    online_prior_config: OnlinePriorConfig | None,
+    online_prior_config: OnlinePriorConfig | MixturePriorConfig | None,
 ) -> Tuple[int, int, str]:
     metadata = container_info.metadata
     read_count = int(metadata["read_count"])
     reconstructed_digest = hashlib.sha256()
     reconstructed_size = 0
     decoded_symbols = 0
-    online_prior = (
-        OnlinePriorState(online_prior_config)
-        if online_prior_config is not None
-        else None
-    )
+    online_prior = make_prior_state(online_prior_config)
 
     with ExitStack() as stack:
         header_compressed = stack.enter_context(

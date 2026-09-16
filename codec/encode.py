@@ -50,6 +50,10 @@ from .online_prior import (
     OnlinePriorState,
 )
 from .encode_fastpath import fuse_batch_logits, selected_quantized_bits
+from .mixture_prior import (
+    MixturePriorConfig, MixturePriorState, make_prior_state,
+    parse_probability_profile, fuse_profile_positions,
+)
 from .probability_quantization import (
     QUANTIZATION_VERSION,
     TOTAL,
@@ -137,7 +141,7 @@ def _quantize_verified_batch(
     device: torch.device,
     *,
     total: int,
-    online_prior: Optional[OnlinePriorState] = None,
+    online_prior: Optional[OnlinePriorState | MixturePriorState] = None,
     timings: Optional[Dict[str, float]] = None,
     verify_cdf: bool = True,
     report_neural_only_bits: bool = True,
@@ -169,6 +173,8 @@ def _quantize_verified_batch(
         stage_started = time.perf_counter()
         if online_prior is None:
             fused_logits = active_logits
+        elif isinstance(online_prior, MixturePriorState):
+            fused_logits = online_prior.fuse_positions(active_logits, batch.qualities, rows, cycles)
         else:
             previous = np.full(symbols.shape, BOS_QUALITY_ID, dtype=np.int64)
             later = cycles > 0
@@ -199,26 +205,10 @@ def _quantize_verified_batch(
                 )
                 stage_started = time.perf_counter()
                 active_rows = np.flatnonzero(batch.active_mask[:, cycle])
-                step_cdfs = logits_to_cdfs(
-                    (
-                        step_logits.detach().cpu().numpy()[active_rows]
-                        if online_prior is None
-                        else online_prior.fuse_logits(
-                            step_logits.detach().cpu().numpy()[active_rows],
-                            (
-                                np.full(
-                                    active_rows.size,
-                                    BOS_QUALITY_ID,
-                                    dtype=np.int64,
-                                )
-                                if cycle == 0
-                                else batch.qualities[active_rows, cycle - 1]
-                            ),
-                            np.full(active_rows.size, cycle, dtype=np.int64),
-                        )
-                    ),
-                    total=total,
-                )
+                step_scores = fuse_profile_positions(online_prior,
+                    step_logits.detach().cpu().numpy()[active_rows], batch.qualities,
+                    active_rows, np.full(active_rows.size, cycle, dtype=np.int64))
+                step_cdfs = logits_to_cdfs(step_scores, total=total)
                 stop = offset + active_rows.size
                 full_cycle_cdfs = cdfs[offset:stop]
                 if not np.array_equal(full_cycle_cdfs, step_cdfs):
@@ -246,7 +236,7 @@ def encode_fastq(
     quantization_total: int = TOTAL,
     progress: bool = True,
     verify_cdf: bool = False,
-    online_prior_config: Optional[OnlinePriorConfig] = DEFAULT_ONLINE_PRIOR_CONFIG,
+    online_prior_config: Optional[OnlinePriorConfig | MixturePriorConfig] = DEFAULT_ONLINE_PRIOR_CONFIG,
     report_neural_only_bits: bool = False,
 ) -> EncodeStatistics:
     """Stream a gzip FASTQ through the neural model into one atomic container."""
@@ -260,9 +250,9 @@ def encode_fastq(
         raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
     quantization_total = validate_total(quantization_total)
     if online_prior_config is not None and not isinstance(
-        online_prior_config, OnlinePriorConfig
+        online_prior_config, (OnlinePriorConfig, MixturePriorConfig)
     ):
-        raise ValueError("online_prior_config must be OnlinePriorConfig or None")
+        raise ValueError("online_prior_config must be a supported prior config or None")
 
     timings = {
         "checkpoint_hash_and_load": 0.0,
@@ -293,11 +283,7 @@ def encode_fastq(
     quantized_theoretical_bits = 0.0
     neural_only_theoretical_bits = 0.0
     range_encoder = RangeEncoder()
-    online_prior = (
-        OnlinePriorState(online_prior_config)
-        if online_prior_config is not None
-        else None
-    )
+    online_prior = make_prior_state(online_prior_config)
     progress_bar = None
     if progress and tqdm is not None:
         progress_bar = tqdm(desc="encode FASTQ", unit="read", leave=True)
@@ -568,6 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--probability-profile", type=Path,
+        help="explicit validated profile JSON; cannot combine with nondefault --prior-* values")
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -585,6 +573,12 @@ def main() -> int:
             cycle_backoff_strength=args.prior_cycle_backoff_strength,
             prior_weight=args.prior_weight,
         )
+        if args.probability_profile is not None:
+            if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
+                raise ValueError("profile JSON cannot be combined with nondefault --prior-* values")
+            values = json.loads(args.probability_profile.read_text())
+            # JSON null explicitly requests the already supported legacy neural-only path.
+            prior_config = None if values is None else parse_probability_profile(values)
         statistics = encode_fastq(
             args.input,
             args.output,

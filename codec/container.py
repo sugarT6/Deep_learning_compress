@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 from .fastq_stream import MAX_BATCH_READS
-from .online_prior import OnlinePriorConfig, OnlinePriorError
+from .online_prior import OnlinePriorError
 
 
 CONTAINER_FORMAT = "fastq-direct-quality-container"
@@ -290,7 +290,8 @@ def _validate_metadata(
         if probability_profile is None:
             raise ContainerError("version-2 probability_profile metadata is missing")
         try:
-            OnlinePriorConfig.from_profile_metadata(probability_profile)
+            from .mixture_prior import parse_probability_profile
+            parse_probability_profile(probability_profile)
         except OnlinePriorError as exc:
             raise ContainerError(
                 f"invalid probability_profile metadata: {exc}"

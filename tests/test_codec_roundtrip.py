@@ -131,6 +131,34 @@ class ForbiddenFullModel(DirectQualityTransformer):
 
 
 class NeuralCodecRoundTripTest(unittest.TestCase):
+    def test_mixture_profile_roundtrip_determinism_and_boundaries(self):
+        from codec.mixture_prior import MixturePriorConfig
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, _ = self._checkpoint(root)
+            for count in (0, 1, 63, 64, 65, 255, 256, 257):
+                source = self._plain_fastq(root, f"mix{count}.fq", fastq_bytes(count))
+                config = MixturePriorConfig(temperature=0.85)
+                container = root / f"mix{count}.fqdc"
+                output = root / f"restored{count}.fq"
+                encode_fastq(source, container, checkpoint, device=torch.device("cpu"),
+                    batch_reads=64, online_prior_config=config, progress=False, verify_cdf=True)
+                decode_fastq(container, output, checkpoint, device=torch.device("cpu"),
+                    batch_reads=64, progress=False, verify_cdf=True)
+                self.assertEqual(source.read_bytes(), output.read_bytes())
+                self.assertEqual(read_container(container).metadata["probability_profile"], config.to_profile_metadata())
+                if count == 65:
+                    repeated = root / "repeat.fqdc"
+                    encode_fastq(source, repeated, checkpoint, device=torch.device("cpu"),
+                        batch_reads=64, online_prior_config=config, progress=False)
+                    self.assertEqual(container.read_bytes(), repeated.read_bytes())
+                    corrupt = root / "bad_mixture.fqdc"
+                    rewrite_container_metadata(container, corrupt,
+                        lambda metadata: metadata["probability_profile"]["config"].update(temperature=0))
+                    with self.assertRaises(ContainerError):
+                        decode_fastq(corrupt, root / "bad_output.fq", checkpoint,
+                            device=torch.device("cpu"), batch_reads=64, progress=False)
+
     def _checkpoint(self, root, name="model.pt", seed=17):
         torch.manual_seed(seed)
         model = DirectQualityTransformer(tiny_config())
