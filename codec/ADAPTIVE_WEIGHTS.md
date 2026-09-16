@@ -1,10 +1,11 @@
 # Opt-in completed-batch adaptive mixture weights
 
-This profile changes **only the weights** of the three existing experts:
-neural, smoothed exact order-2, and smoothed cycle/previous-Q/run-length.
-There are no new contexts, neural architecture changes, training steps or
-unseen-data parameter searches. Original fixed-alpha mixture and legacy
-profiles remain unchanged and decodable.
+The current opt-in v2 profile uses neural, position-conditioned order-2, and
+cycle/previous-Q/run-length experts with completed-batch adaptive weights.
+It adds position to order-2 without changing the neural architecture or training.
+Original v1 adaptive, fixed-alpha mixture and legacy profiles remain unchanged
+and decodable with the original checkpoint. No unseen-data parameter search
+has been performed; improvement is not guaranteed.
 
 ## Compression command
 
@@ -13,7 +14,7 @@ From the repository root, using a new output filename:
 ```bash
 CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
   data/2nd/CNR0847462_1.head2M.fastq.gz \
-  codec/output/CNR0847462_1_adaptive_weights_v1.fqdc \
+  codec/output/CNR0847462_1_adaptive_cycle_order2_v2.fqdc \
   codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
   --device cuda --batch-reads 256 --adaptive-weights
 ```
@@ -27,30 +28,60 @@ Omitting the new flag preserves the old production default.
 The updated decoder automatically reads the profile from the container and
 requires the same checkpoint. No adaptive flag is needed for decoding.
 Containers remain physically v2 but carry the new, strictly validated
-`causal_adaptive_mixture_v1` profile. Older decoders reject the unknown name;
+`causal_adaptive_mixture_v2` profile. Older decoders reject the unknown name;
 they cannot silently decode it as the fixed-alpha profile.
 
 ## Initial configuration (not tuned on unseen files)
 
 | Setting | Default |
 |---|---|
-| Initial weights: neural / order2 / run | 0.50 / 0.25 / 0.25 |
+| Initial weights: neural / cycle_order2 / run | 0.50 / 0.25 / 0.25 |
 | Neural temperature | 1.0 |
 | Adaptation rate eta | 0.1 per completed batch |
 | Minimum expert weight f | 0.01 |
 | Responsibility integer total U | 2^24 |
-| Cycle bin / context smoothing | unchanged: 8 / 42 |
+| Cycle bin / smoothing at both order-2 levels | 8 / 42 (context_strength) |
 | Original three hierarchy strengths | unchanged: 42 / 42 / 42 |
 | Run bins, BOS, padding, count updates | unchanged |
 
 `AdaptivePriorConfig` extends `MixturePriorConfig`; its `alpha` specifies
 initial weights `(1-alpha, alpha/2, alpha/2)`, **not a fixed subsequent alpha**.
-The context mode must be enriched. Advanced configuration can be serialized
+The default context mode is `position_enriched`. Advanced configuration can be serialized
 with `to_profile_metadata()` and supplied through `--probability-profile`.
 All configuration, expert order, rounding, cold-start and update rules are
 stored in metadata and validated. Rate must be in (0,1], floor in (0,1/3), and
 initial weights must respect the floor. These defaults are implementation
 choices, not a claim of optimal compression or guaranteed improvement.
+
+## Position-conditioned order-2 (v2)
+
+Keep the original `count[prev2, prev, q]` and add
+`count[cycle_bin, prev2, prev, q]`, where `cycle_bin = cycle // cycle_bin_width`
+and cycle is zero-based. Width 8 groups positions 1..8, 9..16, etc. Both missing
+history qualities use BOS=42; only active Q0..Q41 positions enter either table.
+
+Let H be the original smoothed cycle/prev -> prev -> global -> uniform hierarchy,
+C the nonposition order-2 count vector, D the matching position count vector,
+and s=`context_strength` (default 42). The second expert is:
+
+```
+O(q) = (C(q) + s*H(q)) / (sum(C) + s)
+P_O(q) = (D(q) + s*O(q)) / (sum(D) + s)
+```
+
+Thus the backoff is position order-2 -> nonposition order-2 -> original
+hierarchy. Empty/unseen contexts borrow their parent; smoothing avoids zero
+probabilities. The run expert and adaptive weight rule are unchanged. All
+operations remain CPU float64 with int64 counts and the same 42-class integer
+CDF quantization. Every table stays frozen until the entire batch completes.
+
+Metadata explicitly records the v2 name/version, `order2_rule`, context mode,
+bin width and smoothing strength. Name/version/mode/rule mismatches are rejected.
+Fixed mixtures can also request `position_enriched`, generating
+`causal_quality_mixture_v2`; default fixed-mixture profiles stay v1.
+For the old adaptive protocol, serialize
+`AdaptivePriorConfig(context_mode="enriched").to_profile_metadata()` and use
+`--probability-profile`; decoding selects the old protocol automatically.
 
 ## Update rule
 
@@ -103,11 +134,16 @@ duplicates observations. Missing/duplicate feedback is rejected.
 
 There is still one `forward_full` per encode batch and one `forward_step` per
 decode cycle. No extra per-expert CDFs, 42-class softmaxes, or neural-only
-diagnostic passes are added. The existing order2/run probabilities are exposed
+diagnostic passes are added. The order2/run probabilities are exposed
 separately and reused. Feedback works on just three selected probabilities per
 symbol. Encoding retains the three probability matrices until range encoding
 finishes; decoding retains only one cycle's matrices. This adds memory traffic
 and some CPU work; it is not guaranteed to be free or faster.
+
+Position counts add about 0.59 MiB per allocated cycle bin (43*43*42 int64
+counters), plus one smoothed context lookup. Counts allocate only through the
+highest observed bin and are not written into the container. No pre-scan or
+training-cache access is added to compression.
 
 JSON reports `online_adaptation.final_weights`, expert order and update count.
 `encoding_stage_seconds.adaptive_weight_feedback` isolates feedback collection;
@@ -117,7 +153,16 @@ container. Final quantized theoretical bits remain enabled.
 
 ## Bounded verification
 
-The complete repository suite passes 155 tests; `git diff --check` passes.
+The original v1 implementation passed 155 repository tests. The v2 tests also
+cover hand-counted position/BOS/mask tables, two-level smoothing and missing
+bins, cross-bin separation, full/step state agreement, strict rule rejection,
+and legacy CDF digests frozen from commit e41165a.
+
+V2 verification: all 161 repository tests passed (19.437 s with CPU numerical
+threads limited to one), as did `git diff --check`. The real trained checkpoint
+passed a 5-read/91-quality, three-batch CPU byte-exact round-trip with full/step
+CDF verification and reads crossing bins 0/1/2. No training, full FASTQ
+compression, unseen-data evaluation or parameter tuning was performed.
 
 Tests cover hand-calculated responsibilities/updates, exact integer feedback
 partitioning and ties, frozen current-batch weights, full/step CDF and next-batch

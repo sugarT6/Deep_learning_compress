@@ -1,4 +1,4 @@
-"""Completed-batch online EM weights for the three existing prediction experts.
+"""Completed-batch online EM weights for versioned neural/order-2/run experts.
 
 Prediction is pure unless capture=True. Captured probabilities are consumed
 only after their symbols have been encoded/decoded. Integer responsibilities
@@ -15,18 +15,20 @@ from .online_prior import OnlinePriorError
 
 
 ADAPTIVE_PROFILE = "causal_adaptive_mixture_v1"
+POSITION_ADAPTIVE_PROFILE = "causal_adaptive_mixture_v2"
 RESPONSIBILITY_TOTAL = 1 << 24
 
 
 @dataclass(frozen=True)
 class AdaptivePriorConfig(MixturePriorConfig):
+    context_mode: str = "position_enriched"
     adaptation_rate: float = 0.1
     weight_floor: float = 0.01
 
     def __post_init__(self):
         super().__post_init__()
-        if self.context_mode != "enriched":
-            raise OnlinePriorError("adaptive weights require the existing enriched contexts")
+        if self.context_mode not in ("enriched", "position_enriched"):
+            raise OnlinePriorError("adaptive weights require enriched contexts")
         for name in ("adaptation_rate", "weight_floor"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -37,16 +39,21 @@ class AdaptivePriorConfig(MixturePriorConfig):
             raise OnlinePriorError("initial weights must respect weight_floor")
 
     def to_profile_metadata(self):
-        return {"name": ADAPTIVE_PROFILE, "version": 1,
+        positioned = self.context_mode == "position_enriched"
+        metadata = {"name": POSITION_ADAPTIVE_PROFILE if positioned else ADAPTIVE_PROFILE,
+            "version": 2 if positioned else 1,
             "update_granularity": "completed_batch", "float_contract": "finite_cpu_float64",
             "count_dtype": "int64", "fusion": "three_expert_arithmetic_mixture_temperature",
             "cold_start": "temperature_neural_only_skip_weight_learning",
-            "run_length_cap": 16, "experts": ["neural", "order2", "cycle_prev_run"],
+            "run_length_cap": 16, "experts": ["neural", "cycle_order2" if positioned else "order2", "cycle_prev_run"],
             "initial_weights": "1-alpha,alpha/2,alpha/2",
             "weight_update": "damped_mean_responsibility_floor_projection_v1",
             "responsibility_total": RESPONSIBILITY_TOTAL,
             "responsibility_rounding": "floor_then_remainder_to_largest_responsibility_first_tie",
             "config": asdict(self)}
+        if positioned:
+            metadata["order2_rule"] = "cycle_bin_prev2_prev_backoff_to_order2_backoff_to_hierarchy_context_strength"
+        return metadata
 
     @classmethod
     def from_profile_metadata(cls, values):
@@ -149,6 +156,6 @@ class AdaptivePriorState(MixturePriorState):
         self._recorded_positions = self._learned_positions = 0
 
     def diagnostics(self):
-        return {"experts": ["neural", "order2", "cycle_prev_run"],
+        return {"experts": self.config.to_profile_metadata()["experts"],
             "final_weights": self.weights.tolist(), "weight_updates": self.weight_updates,
             "adaptation_rate": self.config.adaptation_rate, "weight_floor": self.config.weight_floor}

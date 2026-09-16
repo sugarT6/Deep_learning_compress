@@ -9,6 +9,7 @@ from .online_prior import OnlinePriorConfig, OnlinePriorError, OnlinePriorState
 
 
 MIXTURE_PROFILE = "causal_quality_mixture_v1"
+POSITION_MIXTURE_PROFILE = "causal_quality_mixture_v2"
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,7 @@ class MixturePriorConfig:
                 raise OnlinePriorError(f"invalid mixture {name}")
         if not 0 < self.alpha < 1 or not 0.25 <= self.temperature <= 4 or self.context_strength <= 0:
             raise OnlinePriorError("invalid mixture alpha, temperature or context strength")
-        if self.context_mode not in ("hierarchical", "enriched"):
+        if self.context_mode not in ("hierarchical", "enriched", "position_enriched"):
             raise OnlinePriorError("unsupported mixture context mode")
         base = self.base_config()
         for name in ("cycle_bin_width", "global_backoff_strength", "prev_q_backoff_strength", "cycle_backoff_strength"):
@@ -42,12 +43,18 @@ class MixturePriorConfig:
             cycle_backoff_strength=self.cycle_backoff_strength)
 
     def to_profile_metadata(self):
-        return {"name": MIXTURE_PROFILE, "version": 1,
+        positioned = self.context_mode == "position_enriched"
+        metadata = {"name": POSITION_MIXTURE_PROFILE if positioned else MIXTURE_PROFILE,
+            "version": 2 if positioned else 1,
             "update_granularity": "completed_batch", "float_contract": "finite_cpu_float64",
             "count_dtype": "int64", "fusion": "arithmetic_mixture_temperature",
             "cold_start": "temperature_neural_only", "run_length_cap": 16,
-            "enriched_rule": "mean_order2_and_cycle_prev_run_backoff_to_hierarchy",
+            "enriched_rule": ("mean_cycle_order2_and_cycle_prev_run" if positioned
+                else "mean_order2_and_cycle_prev_run_backoff_to_hierarchy"),
             "config": asdict(self)}
+        if positioned:
+            metadata["order2_rule"] = "cycle_bin_prev2_prev_backoff_to_order2_backoff_to_hierarchy_context_strength"
+        return metadata
 
     @classmethod
     def from_profile_metadata(cls, values):
@@ -94,6 +101,7 @@ class MixturePriorState:
         self.config = config
         self.base = OnlinePriorState(config.base_config())
         self.order2_counts = np.zeros((43, 43, 42), dtype=np.int64)
+        self.cycle_order2_counts = np.zeros((0, 43, 43, 42), dtype=np.int64)
         self.run_counts = np.zeros((0, 43, 5, 42), dtype=np.int64)
 
     @property
@@ -108,7 +116,7 @@ class MixturePriorState:
         _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
         parent = self.base.probabilities(previous[first], cycles[first])
         order2 = runs = None
-        if self.config.context_mode == "enriched":
+        if self.config.context_mode != "hierarchical":
             order2 = self.order2_counts[previous2[first], previous[first]].astype(np.float64)
             runs = np.zeros_like(order2)
             available = bins[first] < len(self.run_counts)
@@ -116,6 +124,14 @@ class MixturePriorState:
             runs[available] = self.run_counts[bins[ix], previous[ix], run_bin[ix]]
             strength = self.config.context_strength
             order2 = (order2 + strength * parent) / (order2.sum(axis=1, keepdims=True) + strength)
+            if self.config.context_mode == "position_enriched":
+                positioned = np.zeros_like(order2)
+                available_order2 = bins[first] < len(self.cycle_order2_counts)
+                ix_order2 = first[available_order2]
+                positioned[available_order2] = self.cycle_order2_counts[
+                    bins[ix_order2], previous2[ix_order2], previous[ix_order2]]
+                order2 = (positioned + strength * order2) / (
+                    positioned.sum(axis=1, keepdims=True) + strength)
             runs = (runs + strength * parent) / (runs.sum(axis=1, keepdims=True) + strength)
             parent = (order2 + runs) * 0.5
         return parent, order2, runs, inverse
@@ -125,7 +141,7 @@ class MixturePriorState:
         return parent[inverse]
 
     def expert_probabilities(self, qualities, rows, cycles):
-        """Expose the existing two experts without adding or changing contexts."""
+        """Expose the order-2 and run experts selected by the versioned profile."""
         _, order2, runs, inverse = self._context_probabilities(qualities, rows, cycles)
         if order2 is None:
             raise OnlinePriorError("separate experts require enriched contexts")
@@ -144,9 +160,9 @@ class MixturePriorState:
         return np.log(mixture)
 
     def update_batch(self, qualities, active_mask):
-        # Reference validator runs before either enriched table can change.
+        # Reference validator runs before any enriched table can change.
         self.base.update_batch(qualities, active_mask)
-        if self.config.context_mode != "enriched":
+        if self.config.context_mode == "hierarchical":
             return
         cycles, rows = np.nonzero(np.asarray(active_mask).T)
         previous, previous2, run_bin = history_contexts(qualities, rows, cycles)
@@ -160,13 +176,18 @@ class MixturePriorState:
         symbols = np.asarray(qualities)[rows, cycles]
         np.add.at(self.order2_counts, (previous2, previous, symbols), 1)
         np.add.at(self.run_counts, (bins, previous, run_bin, symbols), 1)
+        if self.config.context_mode == "position_enriched":
+            if required > len(self.cycle_order2_counts):
+                self.cycle_order2_counts = np.concatenate((self.cycle_order2_counts,
+                    np.zeros((required - len(self.cycle_order2_counts), 43, 43, 42), dtype=np.int64)))
+            np.add.at(self.cycle_order2_counts, (bins, previous2, previous, symbols), 1)
 
 
 def parse_probability_profile(values):
-    from .adaptive_prior import ADAPTIVE_PROFILE, AdaptivePriorConfig
-    if isinstance(values, dict) and values.get("name") == ADAPTIVE_PROFILE:
+    from .adaptive_prior import ADAPTIVE_PROFILE, POSITION_ADAPTIVE_PROFILE, AdaptivePriorConfig
+    if isinstance(values, dict) and values.get("name") in (ADAPTIVE_PROFILE, POSITION_ADAPTIVE_PROFILE):
         return AdaptivePriorConfig.from_profile_metadata(values)
-    if isinstance(values, dict) and values.get("name") == MIXTURE_PROFILE:
+    if isinstance(values, dict) and values.get("name") in (MIXTURE_PROFILE, POSITION_MIXTURE_PROFILE):
         return MixturePriorConfig.from_profile_metadata(values)
     return OnlinePriorConfig.from_profile_metadata(values)
 

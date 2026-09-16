@@ -131,6 +131,32 @@ class ForbiddenFullModel(DirectQualityTransformer):
 
 
 class NeuralCodecRoundTripTest(unittest.TestCase):
+    def test_position_and_legacy_profiles_cross_bin_roundtrip(self):
+        from codec.adaptive_prior import AdaptivePriorConfig
+        from codec.mixture_prior import MixturePriorConfig
+        configs = (AdaptivePriorConfig(cycle_bin_width=2),
+            AdaptivePriorConfig(context_mode="enriched", cycle_bin_width=2),
+            MixturePriorConfig(context_mode="position_enriched", cycle_bin_width=2))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, _ = self._checkpoint(root)
+            source = self._plain_fastq(root, "cross_bin.fq", fastq_bytes(257))
+            for index, config in enumerate(configs):
+                container, output = root / f"profile{index}.fqdc", root / f"profile{index}.fq"
+                encode_fastq(source, container, checkpoint, device=torch.device("cpu"),
+                    batch_reads=64, online_prior_config=config, progress=False, verify_cdf=True)
+                decode_fastq(container, output, checkpoint, device=torch.device("cpu"),
+                    batch_reads=64, progress=False, verify_cdf=True)
+                self.assertEqual(source.read_bytes(), output.read_bytes())
+                self.assertEqual(read_container(container).metadata["probability_profile"], config.to_profile_metadata())
+                if config.context_mode == "position_enriched":
+                    corrupt = root / f"profile{index}_bad.fqdc"
+                    rewrite_container_metadata(container, corrupt,
+                        lambda metadata: metadata["probability_profile"].update(order2_rule="wrong"))
+                    with self.assertRaises(ContainerError):
+                        decode_fastq(corrupt, root / "bad_position.fq", checkpoint,
+                            device=torch.device("cpu"), batch_reads=64, progress=False)
+
     def test_adaptive_profile_boundaries_roundtrip_and_determinism(self):
         from codec.adaptive_prior import AdaptivePriorConfig
         with tempfile.TemporaryDirectory() as directory:

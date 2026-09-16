@@ -1,6 +1,7 @@
 import copy
 import contextlib
 import io
+import hashlib
 import unittest
 
 import numpy as np
@@ -87,7 +88,7 @@ class AdaptivePriorTest(unittest.TestCase):
         rng = np.random.default_rng(55)
         config = AdaptivePriorConfig()
         encoder, decoder = AdaptivePriorState(config), AdaptivePriorState(config)
-        reference = MixturePriorState(MixturePriorConfig())
+        reference = MixturePriorState(MixturePriorConfig(context_mode=config.context_mode))
         for _ in range(5):
             q = rng.integers(0, 42, (65, 19))
             mask = np.arange(19)[None, :] < rng.integers(1, 20, (65, 1))
@@ -117,8 +118,9 @@ class AdaptivePriorTest(unittest.TestCase):
             encoder.update_batch(q, mask); decoder.update_batch(decoded, mask)
             reference.update_batch(q, mask)
             np.testing.assert_array_equal(encoder.weights, decoder.weights)
-            for name in ("order2_counts", "run_counts"):
+            for name in ("order2_counts", "run_counts", "cycle_order2_counts"):
                 np.testing.assert_array_equal(getattr(encoder, name), getattr(reference, name))
+                np.testing.assert_array_equal(getattr(encoder, name), getattr(decoder, name))
             np.testing.assert_array_equal(encoder.base.cycle_prev_q_counts, reference.base.cycle_prev_q_counts)
 
     def test_floor_and_stability(self):
@@ -143,11 +145,59 @@ class AdaptivePriorTest(unittest.TestCase):
             broken = copy.deepcopy(profile); del broken[key]
             with self.assertRaises(OnlinePriorError):
                 parse_probability_profile(broken)
-        for key, value in (("version", 2), ("version", True), ("responsibility_total", 65536),
+        self.assertEqual(profile["name"], "causal_adaptive_mixture_v2")
+        for key, value in (("version", 1), ("version", True), ("responsibility_total", 65536),
+                           ("name", "causal_adaptive_mixture_v1"), ("order2_rule", "wrong"),
                            ("cold_start", "learn"), ("experts", ["run", "neural", "order2"])):
             broken = copy.deepcopy(profile); broken[key] = value
             with self.assertRaises(OnlinePriorError):
                 parse_probability_profile(broken)
+        for key, value in (("adaptation_rate", 0), ("weight_floor", True), ("context_mode", "enriched")):
+            broken = copy.deepcopy(profile); broken["config"][key] = value
+            with self.assertRaises(OnlinePriorError):
+                parse_probability_profile(broken)
+
+    def test_legacy_cdfs_match_pre_position_commit(self):
+        # Frozen digests generated from e41165a, not from the implementation under test.
+        cases = ((MixturePriorConfig(), MixturePriorState,
+            "28596821b552b8649677a2be9917d1527ed8d041a1bcbce95ff7f9d979a4c58f"),
+            (AdaptivePriorConfig(context_mode="enriched"), AdaptivePriorState,
+            "f1c96d2cc843cbd04bb3e50735d1469a9695ad75412f0c8c8f9f1acb57e82116"))
+        for config, state_class, expected in cases:
+            state = state_class(config); digest = hashlib.sha256()
+            rng = np.random.default_rng(1729)
+            for _ in range(3):
+                q = rng.integers(0, 42, (5, 19))
+                mask = np.arange(19)[None, :] < np.array([1, 8, 9, 17, 19])[:, None]
+                q[~mask] = 42
+                cycles, rows = np.nonzero(mask.T)
+                logits = rng.normal(size=(cycles.size, 42)).astype(np.float32)
+                if isinstance(state, AdaptivePriorState):
+                    scores = state.fuse_positions(logits, q, rows, cycles, capture=True)
+                    state.observe_symbols(q[rows, cycles])
+                else:
+                    scores = state.fuse_positions(logits, q, rows, cycles)
+                digest.update(logits_to_cdfs(scores).astype("<i8").tobytes())
+                state.update_batch(q, mask)
+            self.assertEqual(digest.hexdigest(), expected)
+
+    def test_legacy_adaptive_profile_preserves_nonposition_expert(self):
+        config = AdaptivePriorConfig(context_mode="enriched")
+        profile = config.to_profile_metadata()
+        self.assertEqual(profile["name"], "causal_adaptive_mixture_v1")
+        self.assertEqual(profile["version"], 1)
+        self.assertNotIn("order2_rule", profile)
+        self.assertEqual(parse_probability_profile(profile), config)
+        state = AdaptivePriorState(parse_probability_profile(profile))
+        q = np.array([[0, 0, 41]])
+        state.fuse_positions(np.zeros((3, 42)), q, np.array([0, 0, 0]), np.arange(3), capture=True)
+        state.observe_symbols(q[0]); state.update_batch(q, q != 42)
+        self.assertEqual(state.cycle_order2_counts.size, 0)
+        reference = MixturePriorState(MixturePriorConfig())
+        reference.update_batch(q, q != 42)
+        args = (q, np.array([0]), np.array([2]))
+        for actual, expected in zip(state.expert_probabilities(*args), reference.expert_probabilities(*args)):
+            np.testing.assert_array_equal(actual, expected)
         for key, value in (("adaptation_rate", 0), ("adaptation_rate", float("nan")),
                            ("weight_floor", 0.34), ("weight_floor", True), ("context_mode", "hierarchical")):
             broken = copy.deepcopy(profile); broken["config"][key] = value

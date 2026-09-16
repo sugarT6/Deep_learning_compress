@@ -49,7 +49,7 @@ class MixturePriorTest(unittest.TestCase):
 
     def test_full_step_cdfs_causality_and_batch_state(self):
         rng = np.random.default_rng(444)
-        for mode in ("hierarchical", "enriched"):
+        for mode in ("hierarchical", "enriched", "position_enriched"):
             config = MixturePriorConfig(context_mode=mode, temperature=0.85)
             encoder, decoder = MixturePriorState(config), MixturePriorState(config)
             for _ in range(3):
@@ -71,9 +71,65 @@ class MixturePriorTest(unittest.TestCase):
                 encoder.fuse_positions(logits[rows, cycles], q, rows, cycles)
                 np.testing.assert_array_equal(before, encoder.base.global_counts)
                 encoder.update_batch(q, mask); decoder.update_batch(decoded, mask)
-                for attr in ("order2_counts", "run_counts"):
+                for attr in ("order2_counts", "run_counts", "cycle_order2_counts"):
                     np.testing.assert_array_equal(getattr(encoder, attr), getattr(decoder, attr))
                 np.testing.assert_array_equal(encoder.base.cycle_prev_q_counts, decoder.base.cycle_prev_q_counts)
+
+    def test_position_order2_hand_counts_smoothing_and_unseen_bin(self):
+        config = MixturePriorConfig(context_mode="position_enriched", cycle_bin_width=2,
+            context_strength=2)
+        state = MixturePriorState(config)
+        q = np.array([[0, 0, 41, 0], [41, 42, 42, 42]])
+        mask = q != 42
+        state.update_batch(q, mask)
+        self.assertEqual(int(state.cycle_order2_counts.sum()), 5)
+        self.assertEqual(state.cycle_order2_counts[0, 42, 42, 0], 1)
+        self.assertEqual(state.cycle_order2_counts[0, 42, 42, 41], 1)
+        self.assertEqual(state.cycle_order2_counts[0, 42, 0, 0], 1)
+        self.assertEqual(state.cycle_order2_counts[1, 0, 0, 41], 1)
+        self.assertEqual(state.cycle_order2_counts[1, 0, 41, 0], 1)
+        query = np.array([[0, 0, 41, 0, 0, 0, 0]])
+        for cycle in (2, 6):
+            parent = state.base.probabilities([0], [cycle])[0]
+            counts = state.order2_counts[0, 0].astype(np.float64)
+            fallback = (counts + 2 * parent) / (counts.sum() + 2)
+            local = state.cycle_order2_counts[cycle // 2, 0, 0].astype(np.float64) if cycle == 2 else np.zeros(42)
+            expected = (local + 2 * fallback) / (local.sum() + 2)
+            actual, _ = state.expert_probabilities(query, np.array([0]), np.array([cycle]))
+            np.testing.assert_array_equal(actual[0], expected)
+            self.assertTrue((actual > 0).all())
+            self.assertAlmostEqual(float(actual.sum()), 1)
+
+    def test_position_order2_frozen_batch_and_position_separation(self):
+        state = MixturePriorState(MixturePriorConfig(context_mode="position_enriched",
+            cycle_bin_width=2, context_strength=2))
+        # Same history (0,0), but Q41 at cycle 2 and Q0 at cycle 6.
+        q = np.array([[0, 0, 41, 0, 0, 0, 0]])
+        mask = np.ones_like(q, dtype=bool)
+        rows, cycles = np.array([0, 0]), np.array([2, 6])
+        before = state.expert_probabilities(q, rows, cycles)[0]
+        changed = q.copy(); changed[0, 2] = 0
+        np.testing.assert_array_equal(before, state.expert_probabilities(changed, rows, cycles)[0])
+        self.assertEqual(state.cycle_order2_counts.size, 0)
+        state.update_batch(q, mask)
+        after = state.expert_probabilities(q, rows, cycles)[0]
+        self.assertGreater(after[0, 41], after[1, 41])
+        self.assertGreater(after[1, 0], after[0, 0])
+        self.assertFalse(np.array_equal(before, after))
+
+    def test_position_mixture_profile_strict_validation(self):
+        config = MixturePriorConfig(context_mode="position_enriched")
+        profile = config.to_profile_metadata()
+        self.assertEqual(profile["name"], "causal_quality_mixture_v2")
+        self.assertEqual(parse_probability_profile(profile), config)
+        for key in profile:
+            broken = copy.deepcopy(profile); del broken[key]
+            with self.assertRaises(OnlinePriorError):
+                parse_probability_profile(broken)
+        for key, value in (("name", "causal_quality_mixture_v1"), ("version", 1), ("order2_rule", "wrong")):
+            broken = copy.deepcopy(profile); broken[key] = value
+            with self.assertRaises(OnlinePriorError):
+                parse_probability_profile(broken)
 
     def test_evaluation_candidates_match_deployed_profiles(self):
         configs = candidate_configs()

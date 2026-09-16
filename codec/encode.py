@@ -568,7 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile_options.add_argument("--probability-profile", type=Path,
         help="explicit validated profile JSON; cannot combine with nondefault --prior-* values")
     profile_options.add_argument("--adaptive-weights", action="store_true",
-        help="opt-in completed-batch adaptive neural/order2/run mixture; initial weights 0.5/0.25/0.25")
+        help="opt-in v2 completed-batch adaptive neural/cycle-order2/run mixture; initial weights 0.5/0.25/0.25")
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
