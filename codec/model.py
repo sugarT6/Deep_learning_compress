@@ -393,7 +393,7 @@ class DirectQualityTransformer(nn.Module):
         distance = query - key
         return (distance < 0) | (distance >= self.config.context_length)
 
-    def _forward_impl(
+    def _hidden_impl(
         self,
         bases: torch.Tensor,
         qualities: torch.Tensor,
@@ -403,7 +403,7 @@ class DirectQualityTransformer(nn.Module):
         sequence_length = bases.shape[1]
         if sequence_length == 0:
             return self.output_head.weight.new_empty(
-                (bases.shape[0], 0, QUALITY_ALPHABET_SIZE)
+                (bases.shape[0], 0, self.config.d_model)
             )
         prev_q, qmer_tokens = build_quality_history_tokens(qualities)
         pieces = [self.prev_q_embedding(prev_q)]
@@ -428,8 +428,20 @@ class DirectQualityTransformer(nn.Module):
                 hidden,
                 mask=self._attention_mask(sequence_length, bases.device),
             )
+        return hidden
+
+    def _forward_impl(self, bases, qualities, lengths, active_mask):
+        hidden = self._hidden_impl(bases, qualities, lengths, active_mask)
         logits = self.output_head(hidden)
         return logits * active_mask.unsqueeze(-1).to(logits.dtype)
+
+    def forward_features(self, bases, qualities, lengths, active_mask):
+        """Return causal output-head inputs, for frozen-feature adaptation only."""
+        self._validate_common_inputs(bases, lengths, active_mask)
+        if qualities.shape != bases.shape:
+            raise ValueError("qualities must have the same shape as bases")
+        _validate_target_values(qualities, active_mask, name="qualities")
+        return self._hidden_impl(bases, qualities, lengths, active_mask)
 
     def forward_full(
         self,

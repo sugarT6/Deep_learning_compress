@@ -1,9 +1,15 @@
-# Direct-quality FASTQ container format, version 2
+# Direct-quality FASTQ container format, versions 1–3
 
 The direct-quality container reconstructs the decompressed FASTQ content byte
 for byte. It does not attempt to reproduce the original gzip member bytes. Encoding
 reads `.fastq`, `.fq`, `.fastq.gz`, or `.fq.gz` sequentially and never creates
 or reads a training cache.
+
+The optional output-head adaptation path pre-reads a bounded prefix before
+formal encoding. Accepted adapters use version 3; see
+[HEAD_ADAPTATION.md](HEAD_ADAPTATION.md) for the strict head wire format, fitting
+budget and read-disjoint admission procedure. The base checkpoint stays external
+and hash-checked; fitted head bytes are embedded in metadata and counted in size.
 
 ## Top-level layout
 
@@ -23,7 +29,7 @@ The fixed prefix is:
 | Offset | Bytes | Meaning |
 |---:|---:|---|
 | 0 | 8 | magic `FQDC0001` |
-| 8 | 2 | format version, currently 2 |
+| 8 | 2 | format version: 1 legacy, 2 prior, 3 transmitted head |
 | 10 | 2 | flags, currently 0 |
 | 12 | 4 | canonical JSON metadata length |
 | 16 | 4 | CRC32 of the JSON metadata bytes |
@@ -60,6 +66,14 @@ Metadata records at least:
 The decoder hashes the supplied checkpoint before model inference and rejects
 a mismatch. The model configuration and feature schema loaded from that
 checkpoint must also match the container.
+
+Version 3 requires `head_adapter` with finite little-endian FP32 weight/bias,
+base64 data, shape/length and SHA-256 checks, bound to the same base checkpoint.
+It also requires `probability_profile`: null means adapted neural-only, otherwise
+the complete existing prior profile is validated. Versions 1 and 2 reject any
+`head_adapter` field. Old readers reject physical version 3. The section layout
+is unchanged. After loading the base checkpoint, both codec ends replace its
+output head with the exact stored parameters. The decoder never fits a model.
 
 Version 2 changes the probability protocol but not the four-section physical
 layout. The default prior is specified in `ONLINE_PRIOR_FORMAT.md`; the optional

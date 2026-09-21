@@ -28,6 +28,7 @@ from .checkpoint import CHECKPOINT_SCHEMA_VERSION, load_training_checkpoint
 from .container import (
     CONTAINER_FORMAT,
     CONTAINER_VERSION,
+    ADAPTED_CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
     ContainerError,
     ContainerIntegrityError,
@@ -106,7 +107,7 @@ def _validate_codec_metadata(
     if metadata["format"] != CONTAINER_FORMAT:
         raise ContainerError("unsupported container format")
     format_version = int(metadata["format_version"])
-    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION):
+    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION):
         raise ContainerError("unsupported container version")
     stored_batch_reads = int(metadata["batch_reads"])
     if batch_reads != stored_batch_reads:
@@ -135,7 +136,7 @@ def _validate_codec_metadata(
     if metadata["inference_runtime"]["dtype"] != "float32":
         raise ContainerError("unsupported model inference dtype")
     probability_profile = metadata.get("probability_profile")
-    if format_version == LEGACY_CONTAINER_VERSION:
+    if format_version == LEGACY_CONTAINER_VERSION or (format_version == ADAPTED_CONTAINER_VERSION and probability_profile is None):
         if probability_profile is not None:
             raise ContainerError("legacy container unexpectedly declares a prior")
         online_prior_config = None
@@ -173,6 +174,9 @@ def _validate_checkpoint(
     if feature_schema() != checkpoint_metadata["feature_schema"]:
         raise ModelMismatchError("checkpoint feature schema does not match container")
     loaded.model.eval()
+    if metadata["format_version"] == ADAPTED_CONTAINER_VERSION:
+        from .head_adapter import apply_head_adapter
+        apply_head_adapter(loaded.model, metadata["head_adapter"], observed_hash)
     return loaded.model
 
 

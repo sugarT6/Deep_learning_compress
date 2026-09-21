@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -26,6 +27,7 @@ from .checkpoint import CHECKPOINT_SCHEMA_VERSION, load_training_checkpoint
 from .container import (
     CONTAINER_FORMAT,
     CONTAINER_VERSION,
+    ADAPTED_CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
     ContainerError,
     SectionSource,
@@ -63,6 +65,7 @@ from .probability_quantization import (
     validate_total,
 )
 from .range_encoder import RangeEncoder
+from .head_adapter import HeadAdaptationConfig, adapt_output_head, apply_head_adapter
 
 
 SUPPORTED_INPUT_SUFFIXES = SUPPORTED_FASTQ_SUFFIXES
@@ -98,6 +101,8 @@ class EncodeStatistics:
     quality_entropy_coding_seconds: float
     encoding_stage_seconds: Dict[str, float]
     online_adaptation: Optional[Dict[str, Any]]
+    head_adaptation: Optional[Dict[str, Any]]
+    quality_and_adapter_bytes: int
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -242,6 +247,9 @@ def encode_fastq(
     verify_cdf: bool = False,
     online_prior_config: Optional[OnlinePriorConfig | MixturePriorConfig] = DEFAULT_ONLINE_PRIOR_CONFIG,
     report_neural_only_bits: bool = False,
+    head_adaptation_config: Optional[HeadAdaptationConfig] = None,
+    head_adapter_path: Optional[Path] = None,
+    save_head_adapter_path: Optional[Path] = None,
 ) -> EncodeStatistics:
     """Stream a gzip FASTQ through the neural model into one atomic container."""
 
@@ -250,6 +258,18 @@ def encode_fastq(
     output_path = Path(output_path)
     checkpoint_path = Path(checkpoint_path)
     _validate_paths(input_path, output_path, checkpoint_path)
+    if head_adaptation_config is not None and not isinstance(head_adaptation_config, HeadAdaptationConfig):
+        raise ValueError("invalid head_adaptation_config")
+    if head_adaptation_config is not None and head_adapter_path is not None:
+        raise ValueError("cannot train and load an adapter together")
+    if save_head_adapter_path is not None:
+        save_head_adapter_path = Path(save_head_adapter_path)
+        if head_adaptation_config is None:
+            raise ValueError("saving an adapter requires head adaptation")
+        if save_head_adapter_path.exists() or save_head_adapter_path.resolve() in {
+            input_path.resolve(), output_path.resolve(), checkpoint_path.resolve()
+        }:
+            raise FileExistsError("adapter export path must be new and distinct")
     if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
         raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
     quantization_total = validate_total(quantization_total)
@@ -277,6 +297,45 @@ def encode_fastq(
     model.eval()
     _synchronize_device(device)
     _add_timing(timings, "checkpoint_hash_and_load", stage_started)
+    adapter = None
+    adaptation_report = None
+    if head_adaptation_config is not None or head_adapter_path is not None:
+        stage_started = time.perf_counter()
+        if head_adaptation_config is not None:
+            print("Adapting output head on a bounded prefix (experts disabled)...", file=sys.stderr)
+            adapter, adaptation_report = adapt_output_head(model, input_path, device=device,
+                batch_reads=batch_reads, total=quantization_total, base_sha256=checkpoint_sha256,
+                config=head_adaptation_config)
+            if save_head_adapter_path is not None:
+                artifact = {"format": "direct-quality-head-adaptation-artifact", "version": 1,
+                            "base_checkpoint_sha256": checkpoint_sha256, "adapter": adapter,
+                            "report": adaptation_report, "source": str(input_path.resolve())}
+                save_head_adapter_path.parent.mkdir(parents=True, exist_ok=True)
+                with save_head_adapter_path.open("x", encoding="utf-8") as handle:
+                    json.dump(artifact, handle, sort_keys=True, allow_nan=False)
+        else:
+            artifact = json.loads(Path(head_adapter_path).read_text())
+            if (not isinstance(artifact, dict) or artifact.get("format") != "direct-quality-head-adaptation-artifact"
+                    or type(artifact.get("version")) is not int or artifact["version"] != 1
+                    or artifact.get("base_checkpoint_sha256") != checkpoint_sha256
+                    or "adapter" not in artifact or not isinstance(artifact.get("report"), dict)):
+                raise ValueError("invalid adapter artifact or base checkpoint mismatch")
+            adapter = artifact["adapter"]
+            if adapter is not None:
+                apply_head_adapter(model, adapter, checkpoint_sha256)
+            adaptation_report = {"accepted": adapter is not None, "reason": "loaded_artifact",
+                                 "artifact_source": artifact.get("source"), "original_report": artifact["report"]}
+        _synchronize_device(device)
+        _add_timing(timings, "head_adaptation", stage_started)
+        adaptation_report["total_stage_seconds"] = timings["head_adaptation"]
+        adaptation_report["parameter_bytes"] = adapter["parameter_bytes"] if adapter else 0
+        # Actual added canonical JSON member bytes (base64 and framing included).
+        adaptation_report["container_adapter_bytes"] = (len(json.dumps({"head_adapter": adapter},
+            sort_keys=True, separators=(",", ":")).encode()) - 1 if adapter else 0)
+        if adapter is not None and online_prior_config is None:
+            adaptation_report["container_adapter_bytes"] += len('"probability_profile":null,')
+        print(f"Head adaptation: {adaptation_report['reason']}; "
+              f"accepted={adaptation_report['accepted']}; {timings['head_adaptation']:.3f}s", file=sys.stderr)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     source_digest = hashlib.sha256()
@@ -438,6 +497,10 @@ def encode_fastq(
                 metadata["probability_profile"] = (
                     online_prior_config.to_profile_metadata()
                 )
+            if adapter is not None:
+                metadata["format_version"] = ADAPTED_CONTAINER_VERSION
+                metadata["head_adapter"] = adapter
+                metadata.setdefault("probability_profile", None)
             stage_started = time.perf_counter()
             container_info = write_container(
                 output_path,
@@ -517,6 +580,9 @@ def encode_fastq(
         quality_entropy_coding_seconds=quality_entropy_coding_seconds,
         encoding_stage_seconds=dict(timings),
         online_adaptation=(online_prior.diagnostics() if isinstance(online_prior, AdaptivePriorState) else None),
+        head_adaptation=adaptation_report,
+        quality_and_adapter_bytes=range_stream_bytes + (
+            adaptation_report["container_adapter_bytes"] if adaptation_report else 0),
     )
 
 
@@ -569,6 +635,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit validated profile JSON; cannot combine with nondefault --prior-* values")
     profile_options.add_argument("--adaptive-weights", action="store_true",
         help="opt-in v3 adaptive neural/cycle-order2/run/running-delta mixture; initial neural weight 0.5")
+    profile_options.add_argument("--neural-only", action="store_true", help="disable all online experts")
+    adaptation_options = parser.add_mutually_exclusive_group()
+    adaptation_options.add_argument("--finetune-head", action="store_true",
+        help="adapt frozen-feature output head; defaults to neural-only unless a profile is explicit")
+    adaptation_options.add_argument("--head-adapter", type=Path, help="load exported adapter, without retraining")
+    parser.add_argument("--save-head-adapter", type=Path, help="export accepted head or explicit fallback for paired tests")
+    parser.add_argument("--head-max-reads", type=int, default=4096)
+    parser.add_argument("--head-max-symbols", type=int, default=600000)
+    parser.add_argument("--head-max-read-length", type=int, default=2048)
+    parser.add_argument("--head-steps", type=int, default=50)
+    parser.add_argument("--head-symbols-per-step", type=int, default=8192)
+    parser.add_argument("--head-learning-rate", type=float, default=0.001)
+    parser.add_argument("--head-anchor-strength", type=float, default=0.01)
+    parser.add_argument("--head-max-seconds", type=float, default=20.0)
+    parser.add_argument("--head-min-gain", type=float, default=0.0)
+    parser.add_argument("--head-seed", type=int, default=20260921)
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -597,6 +679,21 @@ def main() -> int:
             values = json.loads(args.probability_profile.read_text())
             # JSON null explicitly requests the already supported legacy neural-only path.
             prior_config = None if values is None else parse_probability_profile(values)
+        elif args.neural_only or args.finetune_head or args.head_adapter is not None:
+            if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
+                raise ValueError("neural-only/head adaptation requires an explicit profile to customize priors")
+            prior_config = None
+        head_config = None
+        if args.finetune_head:
+            head_config = HeadAdaptationConfig(max_reads=args.head_max_reads, max_symbols=args.head_max_symbols,
+                max_read_length=args.head_max_read_length, steps=args.head_steps,
+                symbols_per_step=args.head_symbols_per_step, learning_rate=args.head_learning_rate,
+                anchor_strength=args.head_anchor_strength, max_seconds=args.head_max_seconds,
+                min_gain_bits_per_quality=args.head_min_gain, seed=args.head_seed)
+        elif any(getattr(args, name) != build_parser().get_default(name) for name in (
+            "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
+            "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed")):
+            raise ValueError("--head-* training options require --finetune-head")
         statistics = encode_fastq(
             args.input,
             args.output,
@@ -608,6 +705,9 @@ def main() -> int:
             verify_cdf=args.verify_cdf,
             online_prior_config=prior_config,
             report_neural_only_bits=args.report_neural_only_bits,
+            head_adaptation_config=head_config,
+            head_adapter_path=args.head_adapter,
+            save_head_adapter_path=args.save_head_adapter,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

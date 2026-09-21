@@ -10,6 +10,15 @@ calibrates the frozen neural probabilities with a causal online file prior;
 the prior is not a model input and does not affect training. The historical
 Q-hat-conditioned experiments remain below for reproducibility.
 
+Optional per-file output-head fitting is now available with `--finetune-head`:
+freeze the backbone, cache a bounded prefix, fit only the final linear layer,
+and transmit an accepted FP32 head in a version-3 container. The decoder loads
+the head without training. The default adaptation budget is 20 seconds with
+cooperative checks, not a measured GPU guarantee. `--finetune-head` defaults to
+neural-only; add `--adaptive-weights` for the v3 mixture. See
+[codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md) for paired pure/hybrid commands,
+fallback behavior, exact adapter reuse, and quality-plus-adapter byte accounting.
+
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
 `k=2,3,4`, complete decoder-known base reads, position/read length, and an
 active mask. `forward_full` performs causal teacher-forced prediction for

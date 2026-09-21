@@ -24,7 +24,8 @@ from .online_prior import OnlinePriorError
 CONTAINER_FORMAT = "fastq-direct-quality-container"
 LEGACY_CONTAINER_VERSION = 1
 CONTAINER_VERSION = 2
-SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION)
+ADAPTED_CONTAINER_VERSION = 3
+SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION)
 CONTAINER_MAGIC = b"FQDC0001"
 CONTAINER_FLAGS = 0
 SECTION_NAMES = ("header_gzip", "base_gzip", "plus_gzip", "quality_range")
@@ -281,12 +282,23 @@ def _validate_metadata(
     _integer(quantization.get("phred_offset"), name="phred_offset")
 
     probability_profile = metadata.get("probability_profile")
+    if format_version == ADAPTED_CONTAINER_VERSION:
+        if "probability_profile" not in metadata:
+            raise ContainerError("version-3 requires explicit probability_profile (null for neural-only)")
+        try:
+            from .head_adapter import validate_head_adapter
+            validate_head_adapter(metadata.get("head_adapter"),
+                                  checkpoint["model_config"].get("d_model"), checkpoint["sha256"])
+        except ValueError as exc:
+            raise ContainerError(f"invalid head_adapter: {exc}") from exc
+    elif "head_adapter" in metadata:
+        raise ContainerError("head_adapter requires container version 3")
     if format_version == LEGACY_CONTAINER_VERSION:
         if probability_profile is not None:
             raise ContainerError(
                 "legacy version-1 containers cannot declare a probability profile"
             )
-    else:
+    elif format_version == CONTAINER_VERSION or probability_profile is not None:
         if probability_profile is None:
             raise ContainerError("version-2 probability_profile metadata is missing")
         try:
