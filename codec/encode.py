@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compress a plain or gzip FASTQ into the version-1 direct-quality container."""
+"""Pure-neural FASTQ encoding, with optional transmitted output-head adaptation.
+
+Private historical profile branches are retained for decoder regression fixtures.
+Neither the public encoder nor its CLI can select those branches.
+"""
 
 from __future__ import annotations
 
@@ -52,10 +56,10 @@ from .online_prior import (
     OnlinePriorState,
 )
 from .encode_fastpath import fuse_batch_logits, selected_quantized_bits
-from .adaptive_prior import AdaptivePriorConfig, AdaptivePriorState
+from .adaptive_prior import AdaptivePriorState
 from .mixture_prior import (
     MixturePriorConfig, MixturePriorState, make_prior_state,
-    parse_probability_profile, fuse_profile_positions,
+    fuse_profile_positions,
 )
 from .probability_quantization import (
     QUANTIZATION_VERSION,
@@ -214,9 +218,11 @@ def _quantize_verified_batch(
                 )
                 stage_started = time.perf_counter()
                 active_rows = np.flatnonzero(batch.active_mask[:, cycle])
-                step_scores = fuse_profile_positions(online_prior,
-                    step_logits.detach().cpu().numpy()[active_rows], batch.qualities,
-                    active_rows, np.full(active_rows.size, cycle, dtype=np.int64))
+                step_scores = step_logits.detach().cpu().numpy()[active_rows]
+                if online_prior is not None:
+                    step_scores = fuse_profile_positions(online_prior,
+                        step_scores, batch.qualities, active_rows,
+                        np.full(active_rows.size, cycle, dtype=np.int64))
                 step_cdfs = logits_to_cdfs(step_scores, total=total)
                 stop = offset + active_rows.size
                 full_cycle_cdfs = cdfs[offset:stop]
@@ -235,7 +241,7 @@ def _quantize_verified_batch(
     return symbols, cdfs, theoretical_bits, neural_theoretical_bits
 
 
-def encode_fastq(
+def _encode_fastq_compat(
     input_path: Path,
     output_path: Path,
     checkpoint_path: Path,
@@ -251,7 +257,7 @@ def encode_fastq(
     head_adapter_path: Optional[Path] = None,
     save_head_adapter_path: Optional[Path] = None,
 ) -> EncodeStatistics:
-    """Stream a gzip FASTQ through the neural model into one atomic container."""
+    """Shared engine; expert profiles are for historical decoder fixtures only."""
 
     started = time.perf_counter()
     input_path = Path(input_path)
@@ -346,7 +352,7 @@ def encode_fastq(
     quantized_theoretical_bits = 0.0
     neural_only_theoretical_bits = 0.0
     range_encoder = RangeEncoder()
-    online_prior = make_prior_state(online_prior_config)
+    online_prior = make_prior_state(online_prior_config) if online_prior_config is not None else None
     progress_bar = None
     if progress and tqdm is not None:
         progress_bar = tqdm(desc="encode FASTQ", unit="read", leave=True)
@@ -421,14 +427,14 @@ def encode_fastq(
                         symbols, cdfs, total=quantization_total
                     )
                     _add_timing(timings, "range_encode", stage_started)
-                    stage_started = time.perf_counter()
-                    if isinstance(online_prior, AdaptivePriorState):
-                        online_prior.observe_symbols(symbols)
-                    _add_timing(timings, "adaptive_weight_feedback", stage_started)
-                    stage_started = time.perf_counter()
                     if online_prior is not None:
+                        stage_started = time.perf_counter()
+                        if isinstance(online_prior, AdaptivePriorState):
+                            online_prior.observe_symbols(symbols)
+                        _add_timing(timings, "adaptive_weight_feedback", stage_started)
+                        stage_started = time.perf_counter()
                         online_prior.update_batch(batch.qualities, batch.active_mask)
-                    _add_timing(timings, "prior_update", stage_started)
+                        _add_timing(timings, "prior_update", stage_started)
                     read_count += batch.read_count
                     batch_count += 1
                     quality_symbols += int(symbols.size)
@@ -586,9 +592,41 @@ def encode_fastq(
     )
 
 
+def encode_fastq(
+    input_path: Path, output_path: Path, checkpoint_path: Path, *, device: torch.device,
+    batch_reads: int = DEFAULT_BATCH_READS, quantization_total: int = TOTAL,
+    progress: bool = True, verify_cdf: bool = False,
+    report_neural_only_bits: bool = False,
+    head_adaptation_config: Optional[HeadAdaptationConfig] = None,
+    head_adapter_path: Optional[Path] = None,
+    save_head_adapter_path: Optional[Path] = None,
+) -> EncodeStatistics:
+    """Encode only neural probabilities; legacy experts cannot be selected here."""
+    return _encode_fastq_compat(
+        input_path, output_path, checkpoint_path, device=device, batch_reads=batch_reads,
+        quantization_total=quantization_total, progress=progress, verify_cdf=verify_cdf,
+        online_prior_config=None, report_neural_only_bits=report_neural_only_bits,
+        head_adaptation_config=head_adaptation_config, head_adapter_path=head_adapter_path,
+        save_head_adapter_path=save_head_adapter_path,
+    )
+
+
+class _NeuralEncoderParser(argparse.ArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        supplied = list(sys.argv[1:] if args is None else args)
+        for token in supplied:
+            option = token.split("=", 1)[0]
+            if option in ("--adaptive-weights", "--probability-profile") or option.startswith("--prior-"):
+                self.error(f"{option} has been retired: encoding is pure neural. "
+                           "Old expert containers remain decodable; historical v3 batch commands "
+                           "must not be reused for new neural runs.")
+        return super().parse_known_args(supplied, namespace)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Compress plain/gzip FASTQ with the no-SeqArc neural codec"
+    parser = _NeuralEncoderParser(
+        description="Compress plain/gzip FASTQ with pure neural probabilities and optional head fitting",
+        allow_abbrev=False,
     )
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
@@ -596,31 +634,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-reads", type=int, default=DEFAULT_BATCH_READS)
     parser.add_argument("--quantization-total", type=int, default=TOTAL)
-    parser.add_argument(
-        "--prior-cycle-bin-width",
-        type=int,
-        default=DEFAULT_ONLINE_PRIOR_CONFIG.cycle_bin_width,
-    )
-    parser.add_argument(
-        "--prior-global-backoff-strength",
-        type=float,
-        default=DEFAULT_ONLINE_PRIOR_CONFIG.global_backoff_strength,
-    )
-    parser.add_argument(
-        "--prior-prev-q-backoff-strength",
-        type=float,
-        default=DEFAULT_ONLINE_PRIOR_CONFIG.prev_q_backoff_strength,
-    )
-    parser.add_argument(
-        "--prior-cycle-backoff-strength",
-        type=float,
-        default=DEFAULT_ONLINE_PRIOR_CONFIG.cycle_backoff_strength,
-    )
-    parser.add_argument(
-        "--prior-weight",
-        type=float,
-        default=DEFAULT_ONLINE_PRIOR_CONFIG.prior_weight,
-    )
     parser.add_argument(
         "--verify-cdf",
         action="store_true",
@@ -630,15 +643,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-progress", action="store_true")
-    profile_options = parser.add_mutually_exclusive_group()
-    profile_options.add_argument("--probability-profile", type=Path,
-        help="explicit validated profile JSON; cannot combine with nondefault --prior-* values")
-    profile_options.add_argument("--adaptive-weights", action="store_true",
-        help="opt-in v3 adaptive neural/cycle-order2/run/running-delta mixture; initial neural weight 0.5")
-    profile_options.add_argument("--neural-only", action="store_true", help="disable all online experts")
+    parser.add_argument("--neural-only", action="store_true", help="compatibility alias; encoding is always neural-only")
     adaptation_options = parser.add_mutually_exclusive_group()
     adaptation_options.add_argument("--finetune-head", action="store_true",
-        help="adapt frozen-feature output head; defaults to neural-only unless a profile is explicit")
+        help="adapt frozen-feature output head before pure-neural encoding")
     adaptation_options.add_argument("--head-adapter", type=Path, help="load exported adapter, without retraining")
     parser.add_argument("--save-head-adapter", type=Path, help="export accepted head or explicit fallback for paired tests")
     parser.add_argument("--head-max-reads", type=int, default=4096)
@@ -661,28 +669,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        prior_config = OnlinePriorConfig(
-            cycle_bin_width=args.prior_cycle_bin_width,
-            global_backoff_strength=args.prior_global_backoff_strength,
-            prev_q_backoff_strength=args.prior_prev_q_backoff_strength,
-            cycle_backoff_strength=args.prior_cycle_backoff_strength,
-            prior_weight=args.prior_weight,
-        )
-        if args.adaptive_weights:
-            if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
-                raise ValueError("--adaptive-weights cannot be combined with nondefault --prior-* values")
-            from .running_delta import RunningDeltaPriorConfig
-            prior_config = RunningDeltaPriorConfig()
-        elif args.probability_profile is not None:
-            if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
-                raise ValueError("profile JSON cannot be combined with nondefault --prior-* values")
-            values = json.loads(args.probability_profile.read_text())
-            # JSON null explicitly requests the already supported legacy neural-only path.
-            prior_config = None if values is None else parse_probability_profile(values)
-        elif args.neural_only or args.finetune_head or args.head_adapter is not None:
-            if prior_config != DEFAULT_ONLINE_PRIOR_CONFIG:
-                raise ValueError("neural-only/head adaptation requires an explicit profile to customize priors")
-            prior_config = None
         head_config = None
         if args.finetune_head:
             head_config = HeadAdaptationConfig(max_reads=args.head_max_reads, max_symbols=args.head_max_symbols,
@@ -703,7 +689,6 @@ def main() -> int:
             quantization_total=args.quantization_total,
             progress=not args.no_progress,
             verify_cdf=args.verify_cdf,
-            online_prior_config=prior_config,
             report_neural_only_bits=args.report_neural_only_bits,
             head_adaptation_config=head_config,
             head_adapter_path=args.head_adapter,

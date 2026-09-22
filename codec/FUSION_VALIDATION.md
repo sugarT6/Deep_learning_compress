@@ -1,5 +1,9 @@
 # Validation-only fusion study and opt-in mixture profile
 
+Historical experiment: production encoding is now neural-only. Expert encoding
+flags below require the earlier commit `071247c`; the diagnostic evaluator and
+decoding of old expert containers remain supported. See [current commands](HEAD_ADAPTATION.md).
+
 The production default remains `causal_online_hierarchical_v1`. This study
 does not train/update neural weights or alter the ten-train/nine-unseen split.
 Candidate availability is not evidence of better unseen compression.

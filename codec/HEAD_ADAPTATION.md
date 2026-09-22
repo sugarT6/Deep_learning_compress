@@ -42,17 +42,18 @@ Evaluate a later, unused region and ultimately actual full-file results.
 
 ## Experts and encoding
 
-`--finetune-head` or `--head-adapter FILE` defaults to **neural-only** unless an
-explicit probability profile or `--adaptive-weights` is supplied. Old invocations
-without these flags retain their existing hierarchical-prior default.
-`--neural-only` is also available for the unadapted baseline.
+All production encoding is now **neural-only**, with or without head fitting.
+`--neural-only` remains a harmless compatibility alias. `--adaptive-weights`,
+`--probability-profile`, and `--prior-*` are rejected explicitly. The public
+Python encoder no longer accepts `online_prior_config`. No expert state is
+created and no expert fusion, count update or weight feedback is performed.
+Formal encoding reopens the FASTQ at read 1 after prefix fitting.
 
-In hybrid mode, all v3 experts remain enabled. Formal encoding reopens the FASTQ
-at read 1, creates fresh zero-count expert state and initial weights, and updates
-only after each completely encoded batch. Prefix fitting never preloads counts.
-The decoder mirrors this timing. New probabilities get their own weight feedback;
-do not reuse the old-model mixture weights. This experiment does not automatically
-choose between pure and hybrid modes.
+The decoder retains the exact historical expert protocols, including mixed
+adapted containers. Historical profile code and private encoder fixtures remain
+for regression testing, not as production modes. To reproduce old four-way
+experiments, use their original commit `071247c` in a separate checkout. Do not
+resume old v3 batch runs under the new neural-only encoder.
 
 ## Container and decoder contract
 
@@ -77,7 +78,7 @@ FASTQ, cache or an external adapter JSON. Numerical runtime requirements and
 full/step integer-CDF agreement still apply; transferring weights alone does not
 guarantee portability across arbitrary GPU/PyTorch configurations.
 
-## Four-way comparison
+## Current neural-only commands
 
 Run from the repository root. Choose new output paths for every experiment:
 
@@ -88,28 +89,20 @@ CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
   codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
   --device cuda --batch-reads 256 --neural-only
 
-# B: original v3 mixture (the existing nine-file batch already supplies this baseline)
-CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
-  data/2nd/CNR0847462_1.head2M.fastq.gz codec/output/CNR0847462_headexp_B.fqdc \
-  codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
-  --device cuda --batch-reads 256 --adaptive-weights
-
-# C: fit once, pure neural encoding, export exact result for a paired D run
+# C: fit 8000 prefix reads / up to 1000 updates, then pure neural encoding
 CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
   data/2nd/CNR0847462_1.head2M.fastq.gz codec/output/CNR0847462_headexp_C.fqdc \
   codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
   --device cuda --batch-reads 256 --finetune-head --head-max-seconds 20 \
+  --head-max-reads 8000 --head-max-symbols 1200000 --head-steps 1000 \
   --save-head-adapter codec/output/CNR0847462_headexp.adapter.json
 
-# D: exactly the C head plus v3 experts; no second fitting run
+# Reuse exactly the C head; no second fitting run
 CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
   data/2nd/CNR0847462_1.head2M.fastq.gz codec/output/CNR0847462_headexp_D.fqdc \
   codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
   --device cuda --batch-reads 256 \
-  --head-adapter codec/output/CNR0847462_headexp.adapter.json --adaptive-weights
-
-# Independent fresh-fit hybrid command instead of paired D:
-# use --finetune-head --adaptive-weights (and a fresh output path).
+  --head-adapter codec/output/CNR0847462_headexp.adapter.json
 
 # Decoder needs only container + unchanged base checkpoint; no new flags.
 CUDA_VISIBLE_DEVICES=3 python -m codec.decode \
@@ -117,6 +110,11 @@ CUDA_VISIBLE_DEVICES=3 python -m codec.decode \
   codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
   --device cuda --batch-reads 256
 ```
+
+The 8000-read/1000-update command is the current single-file engineering test,
+not a newly calibrated global default. The CLI defaults above remain unchanged.
+`--head-max-symbols` caps the entire sampled prefix (training plus validation),
+not the cumulative number of sampled positions across optimizer updates.
 
 The export is a JSON artifact with base SHA, source provenance, fitting report
 and adapter (null if fitting was rejected). Reusing a null artifact retains the
@@ -143,7 +141,7 @@ fit can complete a different number of steps; exported-head reuse avoids this.
   the explicit null profile for adapted neural-only) to the quality section.
   Use this instead of raw range bytes when comparing compression savings.
   Full `output_bytes` includes every container header and side-stream byte.
-- No diagnostic four-way search, full-file scan, automatic expert removal or
+- No diagnostic four-way search, full-file scan or
   whole-file net-savings guarantee runs inside prefix fitting.
 
 Correctness checks cover frozen backbone, read-disjoint splits, deterministic

@@ -11,6 +11,11 @@ formal encoding. Accepted adapters use version 3; see
 budget and read-disjoint admission procedure. The base checkpoint stays external
 and hash-checked; fitted head bytes are embedded in metadata and counted in size.
 
+Current production encoding is neural-only: version 1 without an accepted head,
+version 3 with an accepted head and null `probability_profile`. All non-null
+expert profiles below describe historical containers whose decoding remains
+supported; they are no longer selectable by the production encoder.
+
 ## Top-level layout
 
 All fixed-width integers are little-endian:

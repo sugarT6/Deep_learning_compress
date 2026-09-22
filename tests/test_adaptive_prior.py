@@ -14,13 +14,18 @@ from codec.probability_quantization import logits_to_cdfs
 
 
 class AdaptivePriorTest(unittest.TestCase):
-    def test_cli_adaptive_is_opt_in_and_excludes_profile_file(self):
+    def test_encoder_rejects_retired_expert_options(self):
         from codec.encode import build_parser
         parser = build_parser()
-        self.assertFalse(parser.parse_args(["a.fq", "b.fqdc", "c.pt"]).adaptive_weights)
-        self.assertTrue(parser.parse_args(["a.fq", "b.fqdc", "c.pt", "--adaptive-weights"]).adaptive_weights)
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parser.parse_args(["a.fq", "b.fqdc", "c.pt", "--adaptive-weights", "--probability-profile", "x.json"])
+        self.assertFalse(hasattr(parser.parse_args(["a.fq", "b.fqdc", "c.pt"]), "adaptive_weights"))
+        for flags in (["--adaptive-weights"], ["--probability-profile", "x.json"],
+                      ["--probability-profile=x.json"], ["--prior-weight", "0.25"],
+                      ["--prior-cycle-bin-width=8"]):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as error:
+                    parser.parse_args(["a.fq", "b.fqdc", "c.pt"] + flags)
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn("has been retired", stderr.getvalue())
 
     def test_manual_responsibility_and_completed_batch_update(self):
         config = AdaptivePriorConfig(adaptation_rate=0.5)

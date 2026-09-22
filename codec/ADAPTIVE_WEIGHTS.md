@@ -1,5 +1,9 @@
 # Opt-in completed-batch adaptive mixture weights
 
+Historical experiment: production encoding is now neural-only. Expert flags
+below require the earlier commit `071247c`; old expert containers still decode.
+See [current encoding commands](HEAD_ADAPTATION.md).
+
 The CLI now defaults to four-expert v3: see [running delta](RUNNING_DELTA.md).
 The following context and update details describe the retained three-expert v2.
 

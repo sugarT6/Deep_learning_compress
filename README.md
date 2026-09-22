@@ -5,18 +5,18 @@
 The current production direction is the independent `codec/` package. It
 reads direct-quality training caches built from FASTQ, predicts all Q0..Q41
 symbols, and does not use SeqArc matrices, `q_hat`, residual features,
-platform embeddings, or accession ids. Runtime codec version 2 additionally
-calibrates the frozen neural probabilities with a causal online file prior;
-the prior is not a model input and does not affect training. The historical
+platform embeddings, or accession ids. Production encoding is now pure neural,
+with optional per-file output-head fitting. Online priors/experts have been
+retired from the encoder; their old containers remain decodable. The historical
 Q-hat-conditioned experiments remain below for reproducibility.
 
 Optional per-file output-head fitting is now available with `--finetune-head`:
 freeze the backbone, cache a bounded prefix, fit only the final linear layer,
 and transmit an accepted FP32 head in a version-3 container. The decoder loads
 the head without training. The default adaptation budget is 20 seconds with
-cooperative checks, not a measured GPU guarantee. `--finetune-head` defaults to
-neural-only; add `--adaptive-weights` for the v3 mixture. See
-[codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md) for paired pure/hybrid commands,
+cooperative checks, not a measured GPU guarantee. All encodes are neural-only;
+`--adaptive-weights`, `--probability-profile`, and `--prior-*` are rejected. See
+[codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md) for current commands,
 fallback behavior, exact adapter reuse, and quality-plus-adapter byte accounting.
 
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
@@ -95,20 +95,18 @@ Stage D connects the trained model to the quantizer and single range stream,
 while keeping training caches out of the runtime codec. The encoder accepts
 `.fastq`, `.fq`, `.fastq.gz`, and `.fq.gz`. Encode a FASTQ:
 
-The encoder now reuses frozen prior contexts and has a faster bit-exact range
-batch loop. Neural-only diagnostic bits default to `null`; enable them with
+The encoder uses a bit-exact range batch loop, without expert fusion, count
+updates or weight feedback. Neural-only diagnostic bits default to `null`; enable them with
 `--report-neural-only-bits` when needed. Final quantized bits remain enabled.
 See [encoder speed notes](codec/ENCODING_SPEED.md) for compatibility and timings.
 The command below uses the historical checkpoint; substitute your new `best.pt`
 and a new output filename when evaluating retraining.
 
-For validation-only fusion diagnostics and opt-in calibrated mixtures with
-order-2/run-length online contexts, see [fusion evaluation](codec/FUSION_VALIDATION.md).
-The production default is unchanged; no training or unseen tuning is performed.
-
-For optional causal online weights with position-conditioned order-2 and a
-running-delta expert (v3), use `--adaptive-weights`;
-see [running delta](codec/RUNNING_DELTA.md) and [adaptive weights](codec/ADAPTIVE_WEIGHTS.md).
+The [fusion evaluation](codec/FUSION_VALIDATION.md),
+[running delta](codec/RUNNING_DELTA.md), and [adaptive weights](codec/ADAPTIVE_WEIGHTS.md)
+documents describe historical experiments, not current encoder options.
+Old v3 batch runners that pass expert flags must not be reused or resumed as
+neural runs; the encoder rejects these flags instead of silently changing a run.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
@@ -166,26 +164,20 @@ bulk, and passes prevalidated integer intervals to the range coder. Public
 standalone quantizer/range-coder calls retain strict input validation; the
 trusted codec path avoids repeating the same 43-entry CDF checks per symbol.
 
-New encodes default to probability profile `causal_online_hierarchical_v1`.
-It combines global Q counts, same-read previous-Q transition counts (with BOS
-at cycle 0), and cycle-bin/previous-Q transition counts. All tables are reset
-per file, accumulate across batches, and are updated only after the current
-batch has completely finished. The defaults are an 8-cycle bin, backoff
-strength 42.0 at each of the three levels, and prior-ratio logit-adjustment
-weight 0.25. A still-uniform prior leaves the neural CDF unchanged, so online
-calibration begins only after an earlier batch has supplied evidence.
-The encode CLI exposes all five parameters; decode obtains and strictly checks
-them from container metadata. No FASTQ prescan, training cache, or transmitted
-target-file histogram is involved.
+New encodes use no probability profile: without an accepted adapter they use
+container version 1; with an accepted adapter they use version 3 and a null
+profile. The public Python encoder also has no expert configuration argument.
+Expert implementations and a private fixture encoder remain solely for
+historical diagnostics and decoder regression coverage. Previously generated
+version-2/v3 expert containers retain their exact decoding protocol.
 
-Encode JSON statistics report final fused quantized theoretical bits and
+Encode JSON statistics report final neural quantized theoretical bits and
 bits/Q in `quantized_theoretical_bits` and
-`quantized_theoretical_bits_per_quality`. They also report the corresponding
+`quantized_theoretical_bits_per_quality`. With the diagnostic flag they also report
 float64 stable-softmax neural-only CE in `neural_only_theoretical_bits` and
 `neural_only_theoretical_bits_per_quality`, avoiding a second expensive integer
-CDF construction. Version-1 containers without a probability profile remain decodable
-through the legacy neural-only path; new online-prior files use container
-version 2 so an old decoder cannot silently select incompatible CDFs.
+CDF construction. Removing experts does not remove integer CDF quantization or
+range coding; these remain significant CPU costs.
 
 ## Historical Q-hat-conditioned pipeline
 

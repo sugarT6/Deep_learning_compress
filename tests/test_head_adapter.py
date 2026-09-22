@@ -16,7 +16,7 @@ import torch
 from codec.checkpoint import save_training_checkpoint
 from codec.container import ContainerError, read_container, sha256_file
 from codec.decode import decode_fastq
-from codec.encode import encode_fastq, main
+from codec.encode import encode_fastq, _encode_fastq_compat, main
 from codec.fastq_stream import iter_fastq_batches
 from codec.head_adapter import (
     HeadAdaptationConfig, adapt_output_head, apply_head_adapter,
@@ -161,7 +161,7 @@ class HeadAdapterTest(unittest.TestCase):
             artifact = root / "adapter.json"
             pure = root / "pure.fqdc"
             stats = encode_fastq(source, pure, ckpt, device=torch.device("cpu"), batch_reads=8,
-                progress=False, verify_cdf=True, online_prior_config=None,
+                progress=False, verify_cdf=True,
                 head_adaptation_config=config(), save_head_adapter_path=artifact)
             self.assertTrue(stats.head_adaptation["accepted"])
             self.assertEqual(stats.quality_and_adapter_bytes,
@@ -171,7 +171,7 @@ class HeadAdapterTest(unittest.TestCase):
             self.assertIsNone(metadata["probability_profile"])
             for name, profile in (("repeat", None), ("mixed", RunningDeltaPriorConfig(cycle_bin_width=2))):
                 target = root / (name + ".fqdc")
-                replay = encode_fastq(source, target, ckpt, device=torch.device("cpu"), batch_reads=8,
+                replay = _encode_fastq_compat(source, target, ckpt, device=torch.device("cpu"), batch_reads=8,
                     progress=False, verify_cdf=True, online_prior_config=profile, head_adapter_path=artifact)
                 self.assertEqual(metadata["head_adapter"], read_container(target).metadata["head_adapter"])
                 if profile is None:
@@ -195,7 +195,7 @@ class HeadAdapterTest(unittest.TestCase):
             source, _ = source_file(root)
             container = root / "valid.fqdc"
             encode_fastq(source, container, ckpt, device=torch.device("cpu"), batch_reads=8,
-                progress=False, online_prior_config=None, head_adaptation_config=config())
+                progress=False, head_adaptation_config=config())
             changes = [lambda m: m.pop("head_adapter"), lambda m: m.pop("probability_profile"),
                        lambda m: m["head_adapter"].update(sha256="0" * 64)]
             for i, mutate in enumerate(changes):
@@ -217,7 +217,7 @@ class HeadAdapterTest(unittest.TestCase):
                 container, out = root / f"{n}.fqdc", root / f"{n}.fq"
                 artifact = root / f"{n}.json"
                 stats = encode_fastq(source, container, ckpt, device=torch.device("cpu"), batch_reads=8,
-                    progress=False, online_prior_config=None, head_adaptation_config=config(min_gain_bits_per_quality=1000),
+                    progress=False, head_adaptation_config=config(min_gain_bits_per_quality=1000),
                     save_head_adapter_path=artifact)
                 self.assertFalse(stats.head_adaptation["accepted"])
                 self.assertEqual(read_container(container).metadata["format_version"], 1)
@@ -225,25 +225,47 @@ class HeadAdapterTest(unittest.TestCase):
                 self.assertEqual(raw, out.read_bytes())
                 repeated = root / f"repeat{n}.fqdc"
                 encode_fastq(source, repeated, ckpt, device=torch.device("cpu"), batch_reads=8,
-                             progress=False, online_prior_config=None, head_adapter_path=artifact)
+                             progress=False, head_adapter_path=artifact)
                 self.assertEqual(container.read_bytes(), repeated.read_bytes())
 
     def test_cli_modes_and_invalid_training_options(self):
         common = ["codec.encode", "in.fq", "out.fqdc", "base.pt"]
-        for flags, expected in ((["--finetune-head"], None), (["--neural-only"], None),
-                                (["--finetune-head", "--adaptive-weights"], RunningDeltaPriorConfig)):
+        for flags in ([], ["--finetune-head"], ["--neural-only"], ["--head-adapter", "head.json"]):
             with mock.patch("sys.argv", common + flags), mock.patch("codec.encode.encode_fastq") as encode:
                 encode.return_value.to_dict.return_value = {}
                 with mock.patch("builtins.print"):
                     main()
-                actual = encode.call_args.kwargs["online_prior_config"]
-                if expected is None:
-                    self.assertIsNone(actual)
-                else:
-                    self.assertIsInstance(actual, expected)
+                self.assertNotIn("online_prior_config", encode.call_args.kwargs)
         with mock.patch("sys.argv", common + ["--head-steps", "8"]):
             with self.assertRaisesRegex(SystemExit, "require --finetune-head"):
                 main()
+
+    def test_production_is_neural_only_and_bit_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, ckpt = model_and_checkpoint(root)
+            source, raw = source_file(root, compressed=True)
+            for adapted in (False, True):
+                with self.subTest(adapted=adapted):
+                    target = root / f"production{adapted}.fqdc"
+                    reference = root / f"reference{adapted}.fqdc"
+                    kwargs = dict(device=torch.device("cpu"), batch_reads=8, progress=False,
+                                  verify_cdf=True, head_adaptation_config=config() if adapted else None)
+                    with mock.patch("codec.encode.make_prior_state", side_effect=AssertionError("expert created")), \
+                         mock.patch("codec.encode.fuse_profile_positions", side_effect=AssertionError("expert fused")), \
+                         mock.patch("codec.encode.fuse_batch_logits", side_effect=AssertionError("expert fused")):
+                        stats = encode_fastq(source, target, ckpt, **kwargs)
+                    self.assertIsNone(stats.online_adaptation)
+                    self.assertIsNone(read_container(target).metadata.get("probability_profile"))
+                    _encode_fastq_compat(source, reference, ckpt, online_prior_config=None, **kwargs)
+                    self.assertEqual(target.read_bytes(), reference.read_bytes())
+                    restored = root / f"restored{adapted}.fq"
+                    decode_fastq(target, restored, ckpt, device=torch.device("cpu"), batch_reads=8,
+                                 progress=False, verify_cdf=True)
+                    self.assertEqual(restored.read_bytes(), raw)
+            with self.assertRaisesRegex(TypeError, "online_prior_config"):
+                encode_fastq(source, root / "forbidden.fqdc", ckpt, device=torch.device("cpu"),
+                             online_prior_config=RunningDeltaPriorConfig())
 
     def test_invalid_config(self):
         for override in ({"steps": True}, {"max_seconds": float("nan")}, {"max_seconds": 0},

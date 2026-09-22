@@ -1,5 +1,9 @@
 # Causal running-delta expert (adaptive v3)
 
+Historical experiment: production encoding is now neural-only. Expert flags
+below require the earlier commit `071247c`; old expert containers still decode.
+See [current encoding commands](HEAD_ADAPTATION.md).
+
 `--adaptive-weights` now selects `causal_adaptive_mixture_v3`, adding a fourth
 expert to the existing neural / cycle-order2 / cycle-previous-Q-run mixture.
 No model, training, checkpoint architecture, data split, or neural inference

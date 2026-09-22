@@ -26,7 +26,8 @@ from codec.decode import ModelMismatchError, build_parser as build_decode_parser
 from codec.decode import decode_fastq
 from codec.encode import CodecDeterminismError, _quantize_verified_batch
 from codec.encode import build_parser as build_encode_parser
-from codec.encode import encode_fastq
+# Historical profile fixtures must remain readable after production retires experts.
+from codec.encode import _encode_fastq_compat as encode_fastq
 from codec.fastq_stream import DEFAULT_BATCH_READS, iter_fastq_batches
 from codec.model import DirectQualityModelConfig, DirectQualityTransformer
 from codec.online_prior import (
@@ -294,10 +295,7 @@ class NeuralCodecRoundTripTest(unittest.TestCase):
         self.assertEqual(decode_args.batch_reads, 256)
         self.assertFalse(encode_args.verify_cdf)
         self.assertFalse(decode_args.verify_cdf)
-        self.assertEqual(
-            encode_args.prior_cycle_bin_width,
-            DEFAULT_ONLINE_PRIOR_CONFIG.cycle_bin_width,
-        )
+        self.assertFalse(hasattr(encode_args, "prior_cycle_bin_width"))
 
     def test_existing_64_read_grouping_remains_supported(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
