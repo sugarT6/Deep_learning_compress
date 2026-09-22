@@ -80,6 +80,14 @@ the complete existing prior profile is validated. Versions 1 and 2 reject any
 is unchanged. After loading the base checkpoint, both codec ends replace its
 output head with the exact stored parameters. The decoder never fits a model.
 
+Two head-adapter schemas are supported: adapter v1 replaces the linear weight
+and bias; adapter v2 replaces those plus a 256-to-r-to-42 residual MLP (the input
+dimension follows the checkpoint). The residual activation is exact GELU;
+the bounded width, all tensor shapes, ordering, and six FP32 tensors are
+transmitted. Both use physical container v3. Unknown adapter versions,
+activations or layouts are rejected, including by older decoders. External
+adapter JSON exports are not decoding dependencies. See `HEAD_ADAPTATION.md`.
+
 Version 2 changes the probability protocol but not the four-section physical
 layout. The default prior is specified in `ONLINE_PRIOR_FORMAT.md`; the optional
 `causal_quality_mixture_v1` profile is specified in `FUSION_VALIDATION.md`.

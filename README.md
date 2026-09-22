@@ -11,13 +11,17 @@ retired from the encoder; their old containers remain decodable. The historical
 Q-hat-conditioned experiments remain below for reproducibility.
 
 Optional per-file output-head fitting is now available with `--finetune-head`:
-freeze the backbone, cache a bounded prefix, fit only the final linear layer,
+freeze the backbone, cache a bounded prefix, fit only the output head,
 and transmit an accepted FP32 head in a version-3 container. The decoder loads
 the head without training. The default adaptation budget is 20 seconds with
 cooperative checks, not a measured GPU guarantee. All encodes are neural-only;
 `--adaptive-weights`, `--probability-profile`, and `--prior-*` are rejected. See
 [codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md) for current commands,
 fallback behavior, exact adapter reuse, and quality-plus-adapter byte accounting.
+The default head is linear. `--head-type residual --head-residual-dim 32`
+adds a small trainable GELU residual branch, keeping the same frozen backbone
+and features. Its full parameters are embedded as adapter v2 inside container
+v3; update the decoder as well. No separate adapter JSON is needed to decode.
 
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
 `k=2,3,4`, complete decoder-known base reads, position/read length, and an

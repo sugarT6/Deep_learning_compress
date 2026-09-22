@@ -20,7 +20,7 @@ import torch
 from torch.nn import functional as F
 
 from .fastq_stream import encode_base_ids, iter_fastq_records, make_fastq_batch
-from .model import fastq_batch_to_tensors
+from .model import ResidualOutputHead, fastq_batch_to_tensors
 from .probability_quantization import logits_to_cdfs
 from .encode_fastpath import selected_quantized_bits
 
@@ -40,8 +40,14 @@ class HeadAdaptationConfig:
     max_seconds: float = 20.0
     min_gain_bits_per_quality: float = 0.0
     seed: int = 20260921
+    head_type: str = "linear"
+    residual_dim: int = 32
 
     def __post_init__(self):
+        if self.head_type not in ("linear", "residual"):
+            raise ValueError("head_type must be linear or residual")
+        if type(self.residual_dim) is not int or not 1 <= self.residual_dim <= 128:
+            raise ValueError("residual_dim must be in [1, 128]")
         for name in ("max_reads", "max_symbols", "max_read_length", "steps", "symbols_per_step", "seed"):
             value = getattr(self, name)
             if type(value) is not int or value < (0 if name == "seed" else 1):
@@ -56,12 +62,28 @@ class HeadAdaptationConfig:
             raise ValueError("invalid head adaptation rate, time, anchor or gain")
 
 
+def _head_parameters(head):
+    parameters = [head.weight, head.bias]
+    if isinstance(head, ResidualOutputHead):
+        parameters.extend((head.down.weight, head.down.bias, head.up.weight, head.up.bias))
+    return parameters
+
+
+def _new_head(d_model, residual_dim, *, device, dtype, seed=0):
+    # Initialization runs on CPU with an isolated RNG, including during decode.
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        head = (ResidualOutputHead(d_model, residual_dim) if residual_dim is not None
+                else torch.nn.Linear(d_model, 42))
+    return head.to(device=device, dtype=dtype)
+
+
 def serialize_head(head, base_sha256):
-    arrays = [p.detach().cpu().numpy().astype("<f4", copy=False) for p in (head.weight, head.bias)]
+    arrays = [p.detach().cpu().numpy().astype("<f4", copy=False) for p in _head_parameters(head)]
     if not all(np.isfinite(a).all() for a in arrays):
         raise ValueError("adapter parameters must be finite")
     raw = b"".join(a.tobytes(order="C") for a in arrays)
-    return {
+    metadata = {
         "format": ADAPTER_FORMAT, "version": 1, "dtype": "little_endian_float32",
         "layout": "weight_row_major_then_bias", "application": "replace_output_head",
         "base_checkpoint_sha256": base_sha256,
@@ -69,28 +91,49 @@ def serialize_head(head, base_sha256):
         "parameter_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
         "data_base64": base64.b64encode(raw).decode("ascii"),
     }
+    if isinstance(head, ResidualOutputHead):
+        metadata.update(version=2, residual_dim=head.down.out_features, activation="gelu_exact",
+                        layout="weight_bias_down_weight_down_bias_up_weight_up_bias")
+        for name, array in zip(("down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"), arrays[2:]):
+            metadata[name] = list(array.shape)
+    return metadata
 
 
 def validate_head_adapter(metadata, d_model, base_sha256):
     """Validate bounded plain data before allocating model tensors; no pickle."""
     keys = {"format", "version", "dtype", "layout", "application", "base_checkpoint_sha256",
             "weight_shape", "bias_shape", "parameter_bytes", "sha256", "data_base64"}
-    if not isinstance(metadata, dict) or set(metadata) != keys:
+    if not isinstance(metadata, dict):
         raise ValueError("adapter fields missing or unknown")
-    if (metadata["format"] != ADAPTER_FORMAT or type(metadata["version"]) is not int
-            or metadata["version"] != 1 or metadata["dtype"] != "little_endian_float32"
-            or metadata["layout"] != "weight_row_major_then_bias"
+    version = metadata.get("version")
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("unsupported adapter version")
+    if version == 2:
+        keys.update(("residual_dim", "activation", "down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"))
+    if set(metadata) != keys:
+        raise ValueError("adapter fields missing or unknown")
+    layout = ("weight_row_major_then_bias" if version == 1 else
+              "weight_bias_down_weight_down_bias_up_weight_up_bias")
+    if (metadata["format"] != ADAPTER_FORMAT or metadata["dtype"] != "little_endian_float32"
+            or metadata["layout"] != layout
             or metadata["application"] != "replace_output_head"):
         raise ValueError("unsupported adapter format or rules")
     if type(d_model) is not int or not 1 <= d_model <= 65536:
         raise ValueError("invalid adapter hidden dimension")
-    for name, expected in (("weight_shape", [42, d_model]), ("bias_shape", [42])):
+    shapes = [("weight_shape", [42, d_model]), ("bias_shape", [42])]
+    if version == 2:
+        width = metadata["residual_dim"]
+        if type(width) is not int or not 1 <= width <= 128 or metadata["activation"] != "gelu_exact":
+            raise ValueError("invalid residual head width or activation")
+        shapes.extend((("down_weight_shape", [width, d_model]), ("down_bias_shape", [width]),
+                       ("up_weight_shape", [42, width]), ("up_bias_shape", [42])))
+    for name, expected in shapes:
         shape = metadata[name]
         if not isinstance(shape, list) or any(type(v) is not int for v in shape) or shape != expected:
             raise ValueError("adapter shape mismatch")
     if metadata["base_checkpoint_sha256"] != base_sha256:
         raise ValueError("adapter base checkpoint SHA-256 mismatch")
-    size = (42 * d_model + 42) * 4
+    size = sum(math.prod(shape) for _, shape in shapes) * 4
     encoded = metadata["data_base64"]
     if (type(metadata["parameter_bytes"]) is not int or metadata["parameter_bytes"] != size
             or not isinstance(encoded, str) or len(encoded) != 4 * ((size + 2) // 3)):
@@ -107,12 +150,26 @@ def validate_head_adapter(metadata, d_model, base_sha256):
     return values
 
 
-def apply_head_adapter(model, metadata, base_sha256):
-    values = validate_head_adapter(metadata, model.config.d_model, base_sha256)
-    split = 42 * model.config.d_model
+def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
+    values = validate_head_adapter(metadata, d_model, base_sha256)
+    head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype)
+    offset = 0
     with torch.no_grad():
-        model.output_head.weight.copy_(torch.from_numpy(values[:split].copy().reshape(42, -1)))
-        model.output_head.bias.copy_(torch.from_numpy(values[split:].copy()))
+        for parameter in _head_parameters(head):
+            stop = offset + parameter.numel()
+            parameter.copy_(torch.from_numpy(values[offset:stop].copy().reshape(tuple(parameter.shape))))
+            offset = stop
+    return head
+
+
+def apply_head_adapter(model, metadata, base_sha256):
+    original = model.output_head
+    head = _restore_head(metadata, model.config.d_model, base_sha256,
+                         device=original.weight.device, dtype=original.weight.dtype)
+    head.train(original.training)
+    head.requires_grad_(original.weight.requires_grad)
+    head.bias.requires_grad_(original.bias.requires_grad)
+    model.output_head = head
 
 
 def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256, config):
@@ -175,7 +232,7 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
     report.update(train_reads=split, validation_reads=len(records) - split,
                   train_read_range=[0, split], validation_read_range=[split, len(records)])
     original_training = model.training
-    original_requires_grad = [p.requires_grad for p in model.parameters()]
+    original_requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
     model.eval()
     model.requires_grad_(False)
     try:
@@ -210,7 +267,15 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
             cached.append((features, labels))
         stages["features"] = time.perf_counter() - feature_started
         (train_h, train_y), (val_h, val_y) = cached
-        head = copy.deepcopy(model.output_head).requires_grad_(True)
+        if config.head_type == "residual":
+            head = _new_head(model.config.d_model, config.residual_dim, device=device,
+                             dtype=model.output_head.weight.dtype, seed=config.seed)
+            with torch.no_grad():
+                head.weight.copy_(model.output_head.weight)
+                head.bias.copy_(model.output_head.bias)
+        else:
+            head = copy.deepcopy(model.output_head)
+        head.requires_grad_(True)
         anchor = [p.detach().clone() for p in head.parameters()]
         optimizer = torch.optim.Adam(head.parameters(), lr=config.learning_rate)
         generator = torch.Generator(device=device).manual_seed(config.seed)
@@ -242,11 +307,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         serialization_started = time.perf_counter()
         adapter = serialize_head(head, base_sha256)
         # Validate/restore the exact wire representation before admission scoring.
-        values = validate_head_adapter(adapter, model.config.d_model, base_sha256)
-        wire_head = copy.deepcopy(head).requires_grad_(False)
-        with torch.no_grad():
-            wire_head.weight.copy_(torch.from_numpy(values[:42 * model.config.d_model].copy().reshape(42, -1)))
-            wire_head.bias.copy_(torch.from_numpy(values[42 * model.config.d_model:].copy()))
+        wire_head = _restore_head(adapter, model.config.d_model, base_sha256,
+                                  device=device, dtype=head.weight.dtype).requires_grad_(False)
         report["candidate_parameter_bytes"] = adapter["parameter_bytes"]
         report["candidate_metadata_bytes"] = len(json.dumps(adapter, sort_keys=True, separators=(",", ":")).encode())
         stages["serialization"] = time.perf_counter() - serialization_started
@@ -280,8 +342,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
             return finish(adapter)
         return finish()
     finally:
-        for p, flag in zip(model.parameters(), original_requires_grad):
-            p.requires_grad_(flag)
+        for name, p in model.named_parameters():
+            p.requires_grad_(original_requires_grad.get(name, original_requires_grad["output_head.weight"]))
         model.train(original_training)
 
 

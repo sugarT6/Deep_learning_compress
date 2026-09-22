@@ -288,6 +288,26 @@ class BaseContextEncoder(nn.Module):
         return context * active_mask.unsqueeze(-1).to(context.dtype)
 
 
+class ResidualOutputHead(nn.Linear):
+    """Linear logits plus a small GELU residual; installed only by a wire adapter.
+
+    Keep weight/bias at the root for the base linear head. Zero-initialized up
+    projection makes the initial function exactly the supplied linear head.
+    """
+
+    def __init__(self, d_model: int, residual_dim: int):
+        super().__init__(d_model, QUALITY_ALPHABET_SIZE)
+        self.down = nn.Linear(d_model, residual_dim)
+        self.up = nn.Linear(residual_dim, QUALITY_ALPHABET_SIZE)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return F.linear(hidden, self.weight, self.bias) + self.up(
+            F.gelu(self.down(hidden), approximate="none")
+        )
+
+
 class DirectQualityTransformer(nn.Module):
     """Causal quality model using only decoder-synchronous stage-B features."""
 

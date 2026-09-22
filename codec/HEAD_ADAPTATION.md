@@ -1,7 +1,8 @@
 # Per-file output-head adaptation
 
-This opt-in experiment freezes the base model and fits its `Linear(d_model, 42)`
-output head on a bounded FASTQ prefix. It does not train on the whole target file,
+This opt-in experiment freezes the base model and fits its output head on a
+bounded FASTQ prefix. The default is `Linear(d_model, 42)`; the opt-in residual
+head adds a small GELU branch. It does not train on the whole target file,
 change the shared checkpoint, or use/update online experts during optimization.
 It changes the codec from no-lookahead streaming to prefix-pre-read adaptation.
 The exact fitted head is transmitted and paid for in the container.
@@ -40,6 +41,34 @@ training datasets' fixed validation regions. A prefix admission check does not
 prove net whole-file savings, hybrid gains, or representativeness of later reads.
 Evaluate a later, unused region and ultimately actual full-file results.
 
+## Optional nonlinear residual head
+
+Use `--finetune-head --head-type residual --head-residual-dim 32` to fit
+
+```text
+z = W h + b + V GELU(U h + a) + c
+```
+
+Here `h` is the same frozen 256-dimensional feature. `U/a` map 256 to 32 and
+`V/c` map 32 to 42; GELU uses `approximate="none"`. `W/b` start from the base
+checkpoint, `U/a` use seeded initialization, and `V/c` start at zero, so the
+initial function is exactly the original linear head. Initialization preserves
+the global RNG state. Train all six head tensors on cached features; the
+backbone and data features are unchanged. The existing anchor penalty applies
+to each tensor's mean squared deviation from its initialization, including the
+residual tensors. No experts, extra input features, LoRA, or Transformer updates.
+
+`--head-type linear` remains the default and retains the original wire format.
+Residual width defaults to 32 and must be in [1, 128]. Both modes use the same
+prefix split, sampling, optimization, deadline and final-only admission test.
+There is no periodic best-state selection or automatic residual-vs-linear
+search: admission compares the final candidate to the original base head, not
+to a separately fine-tuned linear head. Rejection returns the original head.
+
+The extra computation affects both fitting and inference. A 20-second budget
+is still cooperative, not a hard guarantee. Inspect `steps_completed` and
+`budget_exceeded`; compare total time as well as quality-plus-adapter bytes.
+
 ## Experts and encoding
 
 All production encoding is now **neural-only**, with or without head fitting.
@@ -69,9 +98,20 @@ length, raw SHA-256, base checkpoint SHA-256 and strict base64 data. Unknown or
 missing fields, bad shapes/length/hash/dtype/version, and NaN/Inf are rejected
 before entropy decoding. No pickle is used for the adapter.
 
+The residual head uses **adapter version 2 inside physical container version
+3**, not a new expert profile. Its layout is
+`weight_bias_down_weight_down_bias_up_weight_up_bias`, all row-major FP32, with
+`residual_dim`, `activation="gelu_exact"`, and explicit shapes for the four
+extra tensors. All six tensors are serialized and restored before admission
+scoring and formal inference. Old linear adapters remain readable; older
+decoders without adapter-v2 support reject the new format. Update both ends.
+
 For the production d_model=256 model, raw head size is 43176 bytes. Base64 and
 metadata make the actual container overhead approximately 58 KB; **raw FP32
 parameter size is not the full wire cost**. No FP16 quantization in this version.
+With residual width 32, the head has 20404 parameters (81616 raw bytes), about
+109 KB on the wire. The external exported `.adapter.json` is optional: all
+parameters required for decoding already live inside the `.fqdc` metadata.
 The encoder applies the same serialized values as the decoder. The base
 checkpoint SHA check remains mandatory; the decoder never trains or needs source
 FASTQ, cache or an external adapter JSON. Numerical runtime requirements and
@@ -111,6 +151,32 @@ CUDA_VISIBLE_DEVICES=3 python -m codec.decode \
   --device cuda --batch-reads 256
 ```
 
+For the nonlinear experiment, keep the same 8000-read / 1000-update setup:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  codec/output/CNR0847462_head8k_s1000_res32_20260922.fqdc \
+  codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
+  --device cuda --batch-reads 256 \
+  --finetune-head --head-type residual --head-residual-dim 32 \
+  --head-max-reads 8000 --head-max-symbols 1200000 \
+  --head-steps 1000 --head-max-seconds 20 \
+  --save-head-adapter codec/output/CNR0847462_head8k_s1000_res32_20260922.adapter.json
+
+# No adapter JSON or head-type arguments needed at decode.
+CUDA_VISIBLE_DEVICES=3 python -m codec.decode \
+  codec/output/CNR0847462_head8k_s1000_res32_20260922.fqdc \
+  codec/output/CNR0847462_head8k_s1000_res32_20260922.restored.fq \
+  codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
+  --device cuda --batch-reads 256
+```
+
+For a fresh linear control, replace `--head-type residual --head-residual-dim
+32` with `--head-type linear` and choose distinct output and adapter paths.
+When reusing an exported residual head, supply only `--head-adapter FILE`;
+the head type/width are restored from the artifact, not from training flags.
+
 The 8000-read/1000-update command is the current single-file engineering test,
 not a newly calibrated global default. The CLI defaults above remain unchanged.
 `--head-max-symbols` caps the entire sampled prefix (training plus validation),
@@ -149,3 +215,17 @@ fixed-step fitting, shared causal features, accepted/rejected/timed-out adapters
 strict malformed metadata rejection, original checkpoint preservation, and
 byte-exact pure/hybrid full/step-CDF round trips. CPU tiny tests do not establish
 GPU fitting time or compression gains on real files.
+
+### Bounded GPU check (2026-09-22)
+
+On an A100-PCIE-40GB, with the balanced-b256-s40000 base checkpoint and the
+CNR0847462 8000-read prefix, residual width 32 completed 1000 updates in a total
+adaptation time of 6.806 s (optimization 2.747 s). The read split was 6000/2000;
+validation quantized bits/Q changed from 2.8610113614 to 2.2194215204. The earlier
+linear 8000/1000 run scored 2.2534338031 on the same held-out prefix. This is
+prefix evidence only, not a whole-file compression result or a timing guarantee.
+
+A separate 257-read GPU round trip using the real checkpoint verified full/step
+integer CDF agreement and byte-exact restoration, after the test-owned external
+adapter export was removed. The embedded adapter overhead was 109443 bytes.
+No full-file compression was launched for this check.

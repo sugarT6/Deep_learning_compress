@@ -659,6 +659,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-max-seconds", type=float, default=20.0)
     parser.add_argument("--head-min-gain", type=float, default=0.0)
     parser.add_argument("--head-seed", type=int, default=20260921)
+    parser.add_argument("--head-type", choices=("linear", "residual"), default="linear",
+        help="fitted output head: linear baseline or linear + small GELU residual")
+    parser.add_argument("--head-residual-dim", type=int, default=32,
+        help="residual hidden width (1..128); requires --head-type residual")
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -670,15 +674,19 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         head_config = None
+        if args.head_residual_dim != 32 and args.head_type != "residual":
+            raise ValueError("--head-residual-dim requires --head-type residual")
         if args.finetune_head:
             head_config = HeadAdaptationConfig(max_reads=args.head_max_reads, max_symbols=args.head_max_symbols,
                 max_read_length=args.head_max_read_length, steps=args.head_steps,
                 symbols_per_step=args.head_symbols_per_step, learning_rate=args.head_learning_rate,
                 anchor_strength=args.head_anchor_strength, max_seconds=args.head_max_seconds,
-                min_gain_bits_per_quality=args.head_min_gain, seed=args.head_seed)
+                min_gain_bits_per_quality=args.head_min_gain, seed=args.head_seed,
+                head_type=args.head_type, residual_dim=args.head_residual_dim)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
-            "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed")):
+            "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",
+            "head_type", "head_residual_dim")):
             raise ValueError("--head-* training options require --finetune-head")
         statistics = encode_fastq(
             args.input,

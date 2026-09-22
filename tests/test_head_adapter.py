@@ -22,7 +22,7 @@ from codec.head_adapter import (
     HeadAdaptationConfig, adapt_output_head, apply_head_adapter,
     serialize_head, validate_head_adapter,
 )
-from codec.model import DirectQualityModelConfig, DirectQualityTransformer, fastq_batch_to_tensors
+from codec.model import DirectQualityModelConfig, DirectQualityTransformer, ResidualOutputHead, fastq_batch_to_tensors
 from codec.running_delta import RunningDeltaPriorConfig
 
 
@@ -269,9 +269,141 @@ class HeadAdapterTest(unittest.TestCase):
 
     def test_invalid_config(self):
         for override in ({"steps": True}, {"max_seconds": float("nan")}, {"max_seconds": 0},
-                         {"max_reads": 3}, {"learning_rate": 0}, {"anchor_strength": -1}):
+                         {"max_reads": 3}, {"learning_rate": 0}, {"anchor_strength": -1},
+                         {"head_type": "unknown"}, {"residual_dim": 0}, {"residual_dim": 129},
+                         {"residual_dim": True}):
             with self.assertRaises(ValueError):
                 config(**override)
+
+    def test_residual_initial_function_wire_parameters_and_linear_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model, ckpt = model_and_checkpoint(Path(directory))
+            digest = sha256_file(ckpt)
+            base = serialize_head(model.output_head, digest)
+            head = ResidualOutputHead(8, 32)
+            with torch.no_grad():
+                head.weight.copy_(model.output_head.weight)
+                head.bias.copy_(model.output_head.bias)
+            hidden = torch.randn(3, 5, 8)
+            self.assertTrue(torch.equal(head(hidden), model.output_head(hidden)))
+            with torch.no_grad():
+                head.up.weight.normal_()
+                head.up.bias.normal_()
+            adapter = serialize_head(head, digest)
+            self.assertEqual(adapter["version"], 2)
+            self.assertEqual(adapter["parameter_bytes"], sum(p.numel() for p in head.parameters()) * 4)
+            self.assertEqual(serialize_head(ResidualOutputHead(256, 32), digest)["parameter_bytes"], 81616)
+            rng = torch.get_rng_state().clone()
+            apply_head_adapter(model, adapter, digest)
+            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+            self.assertTrue(torch.equal(head(hidden), model.output_head(hidden)))
+            self.assertEqual(adapter, serialize_head(model.output_head, digest))
+            apply_head_adapter(model, base, digest)
+            self.assertNotIsInstance(model.output_head, ResidualOutputHead)
+            self.assertEqual(base, serialize_head(model.output_head, digest))
+
+    def test_residual_fit_frozen_backbone_rng_and_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, ckpt = model_and_checkpoint(root)
+            source, _ = source_file(root)
+            original = copy.deepcopy(model)
+            twin = copy.deepcopy(model)
+            rng = torch.get_rng_state().clone()
+            kwargs = dict(device=torch.device("cpu"), batch_reads=8, total=65536,
+                          base_sha256=sha256_file(ckpt), config=config(head_type="residual"))
+            adapter, report = adapt_output_head(model, source, **kwargs)
+            self.assertTrue(report["accepted"])
+            self.assertEqual(report["steps_completed"], 30)
+            self.assertEqual(report["train_read_range"], [0, 36])
+            self.assertEqual(report["validation_read_range"], [36, 48])
+            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+            self.assertTrue(model.training)
+            self.assertTrue(all(p.requires_grad and p.grad is None for p in model.parameters()))
+            self.assertGreater(int(torch.count_nonzero(model.output_head.up.weight)), 0)
+            for name, value in original.state_dict().items():
+                if not name.startswith("output_head."):
+                    self.assertTrue(torch.equal(value, model.state_dict()[name]), name)
+            other, _ = adapt_output_head(twin, source, **kwargs)
+            self.assertEqual(adapter, other)
+            for override in ({"min_gain_bits_per_quality": 1000}, {"max_seconds": 1e-12}):
+                fallback = copy.deepcopy(original)
+                fallback.requires_grad_(False)
+                kwargs["config"] = config(head_type="residual", **override)
+                rejected, report = adapt_output_head(fallback, source, **kwargs)
+                self.assertIsNone(rejected)
+                self.assertNotIsInstance(fallback.output_head, ResidualOutputHead)
+                self.assertTrue(all(not p.requires_grad for p in fallback.parameters()))
+                for name, value in original.state_dict().items():
+                    self.assertTrue(torch.equal(value, fallback.state_dict()[name]), name)
+
+    def test_residual_roundtrip_reuse_and_no_external_artifact_at_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, ckpt = model_and_checkpoint(root)
+            digest = sha256_file(ckpt)
+            source, raw = source_file(root, compressed=True)
+            artifact, target = root / "adapter.json", root / "residual.fqdc"
+            kwargs = dict(device=torch.device("cpu"), batch_reads=8, progress=False, verify_cdf=True)
+            stats = encode_fastq(source, target, ckpt, **kwargs,
+                                head_adaptation_config=config(head_type="residual"), save_head_adapter_path=artifact)
+            self.assertTrue(stats.head_adaptation["accepted"])
+            meta = read_container(target).metadata
+            self.assertEqual(meta["format_version"], 3)
+            self.assertEqual(meta["head_adapter"]["version"], 2)
+            self.assertEqual(meta["head_adapter"]["residual_dim"], 32)
+            self.assertIsNone(meta["probability_profile"])
+            self.assertEqual(stats.quality_and_adapter_bytes,
+                             stats.range_stream_bytes + stats.head_adaptation["container_adapter_bytes"])
+            repeated = root / "repeat.fqdc"
+            encode_fastq(source, repeated, ckpt, **kwargs, head_adapter_path=artifact)
+            self.assertEqual(target.read_bytes(), repeated.read_bytes())
+            artifact.unlink()  # This test-owned export is deliberately absent at decode.
+            with mock.patch("codec.head_adapter.adapt_output_head", side_effect=AssertionError("decoder trained")):
+                restored = root / "restored.fq"
+                decode_fastq(target, restored, ckpt, **kwargs)
+            self.assertEqual(restored.read_bytes(), raw)
+            self.assertEqual(digest, sha256_file(ckpt))
+
+    def test_residual_metadata_rejects_invalid_protocol_and_corruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, ckpt = model_and_checkpoint(root)
+            source, _ = source_file(root)
+            target = root / "valid.fqdc"
+            encode_fastq(source, target, ckpt, device=torch.device("cpu"), batch_reads=8,
+                         progress=False, head_adaptation_config=config(head_type="residual"))
+            changes = [lambda a: a.update(version=1), lambda a: a.update(version=True),
+                       lambda a: a.update(residual_dim=129), lambda a: a.update(residual_dim=True),
+                       lambda a: a.update(activation="gelu_tanh"), lambda a: a.pop("up_bias_shape"),
+                       lambda a: a.update(down_weight_shape=[32, 9]), lambda a: a.update(up_bias_shape=[True]),
+                       lambda a: a.update(layout="weight_row_major_then_bias"),
+                       lambda a: a.update(parameter_bytes=a["parameter_bytes"] - 4),
+                       lambda a: a.update(sha256="0" * 64)]
+            for i, change in enumerate(changes):
+                bad = root / f"bad{i}.fqdc"
+                rewrite_metadata(target, bad, lambda m: change(m["head_adapter"]))
+                with self.subTest(change=i), self.assertRaises(ContainerError):
+                    read_container(bad)
+            adapter = copy.deepcopy(read_container(target).metadata["head_adapter"])
+            data = bytearray(base64.b64decode(adapter["data_base64"]))
+            data[-4:] = struct.pack("<f", float("nan"))
+            adapter.update(data_base64=base64.b64encode(data).decode(), sha256=hashlib.sha256(data).hexdigest())
+            with self.assertRaisesRegex(ValueError, "finite"):
+                validate_head_adapter(adapter, 8, sha256_file(ckpt))
+
+    def test_residual_cli_is_opt_in_and_requires_training(self):
+        common = ["codec.encode", "in.fq", "out.fqdc", "base.pt"]
+        with mock.patch("sys.argv", common + ["--finetune-head", "--head-type", "residual", "--head-residual-dim", "16"]), \
+             mock.patch("codec.encode.encode_fastq") as encode, mock.patch("builtins.print"):
+            encode.return_value.to_dict.return_value = {}
+            main()
+            cfg = encode.call_args.kwargs["head_adaptation_config"]
+            self.assertEqual((cfg.head_type, cfg.residual_dim), ("residual", 16))
+        for flags in (["--head-type", "residual"], ["--head-adapter", "head.json", "--head-type", "residual"],
+                      ["--finetune-head", "--head-residual-dim", "16"]):
+            with mock.patch("sys.argv", common + flags), self.assertRaises(SystemExit):
+                main()
 
 
 if __name__ == "__main__":
