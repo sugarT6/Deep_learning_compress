@@ -21,6 +21,9 @@ from torch.nn import functional as F
 
 from .fastq_stream import encode_base_ids, iter_fastq_records, make_fastq_batch
 from .model import ResidualOutputHead, fastq_batch_to_tensors
+from .quality_history_features import (
+    HISTORY_FEATURE_DIM, history_feature_schema, quality_history_features, validate_history_feature_schema,
+)
 from .probability_quantization import logits_to_cdfs
 from .encode_fastpath import selected_quantized_bits
 
@@ -42,8 +45,11 @@ class HeadAdaptationConfig:
     seed: int = 20260921
     head_type: str = "linear"
     residual_dim: int = 32
+    history_features: bool = False
 
     def __post_init__(self):
+        if type(self.history_features) is not bool or (self.history_features and self.head_type != "residual"):
+            raise ValueError("history_features requires a residual head and a boolean flag")
         if self.head_type not in ("linear", "residual"):
             raise ValueError("head_type must be linear or residual")
         if type(self.residual_dim) is not int or not 1 <= self.residual_dim <= 128:
@@ -69,11 +75,11 @@ def _head_parameters(head):
     return parameters
 
 
-def _new_head(d_model, residual_dim, *, device, dtype, seed=0):
+def _new_head(d_model, residual_dim, *, device, dtype, seed=0, history_features=False):
     # Initialization runs on CPU with an isolated RNG, including during decode.
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
-        head = (ResidualOutputHead(d_model, residual_dim) if residual_dim is not None
+        head = (ResidualOutputHead(d_model, residual_dim, history_features) if residual_dim is not None
                 else torch.nn.Linear(d_model, 42))
     return head.to(device=device, dtype=dtype)
 
@@ -96,6 +102,8 @@ def serialize_head(head, base_sha256):
                         layout="weight_bias_down_weight_down_bias_up_weight_up_bias")
         for name, array in zip(("down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"), arrays[2:]):
             metadata[name] = list(array.shape)
+        if head.history_features:
+            metadata.update(version=3, history_features=history_feature_schema())
     return metadata
 
 
@@ -106,12 +114,16 @@ def validate_head_adapter(metadata, d_model, base_sha256):
     if not isinstance(metadata, dict):
         raise ValueError("adapter fields missing or unknown")
     version = metadata.get("version")
-    if type(version) is not int or version not in (1, 2):
+    if type(version) is not int or version not in (1, 2, 3):
         raise ValueError("unsupported adapter version")
-    if version == 2:
+    if version >= 2:
         keys.update(("residual_dim", "activation", "down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"))
+    if version == 3:
+        keys.add("history_features")
     if set(metadata) != keys:
         raise ValueError("adapter fields missing or unknown")
+    if version == 3:
+        validate_history_feature_schema(metadata["history_features"])
     layout = ("weight_row_major_then_bias" if version == 1 else
               "weight_bias_down_weight_down_bias_up_weight_up_bias")
     if (metadata["format"] != ADAPTER_FORMAT or metadata["dtype"] != "little_endian_float32"
@@ -121,11 +133,12 @@ def validate_head_adapter(metadata, d_model, base_sha256):
     if type(d_model) is not int or not 1 <= d_model <= 65536:
         raise ValueError("invalid adapter hidden dimension")
     shapes = [("weight_shape", [42, d_model]), ("bias_shape", [42])]
-    if version == 2:
+    if version >= 2:
         width = metadata["residual_dim"]
         if type(width) is not int or not 1 <= width <= 128 or metadata["activation"] != "gelu_exact":
             raise ValueError("invalid residual head width or activation")
-        shapes.extend((("down_weight_shape", [width, d_model]), ("down_bias_shape", [width]),
+        input_dim = d_model + (HISTORY_FEATURE_DIM if version == 3 else 0)
+        shapes.extend((("down_weight_shape", [width, input_dim]), ("down_bias_shape", [width]),
                        ("up_weight_shape", [42, width]), ("up_bias_shape", [42])))
     for name, expected in shapes:
         shape = metadata[name]
@@ -152,7 +165,8 @@ def validate_head_adapter(metadata, d_model, base_sha256):
 
 def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
     values = validate_head_adapter(metadata, d_model, base_sha256)
-    head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype)
+    head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype,
+                     history_features=metadata["version"] == 3)
     offset = 0
     with torch.no_grad():
         for parameter in _head_parameters(head):
@@ -244,7 +258,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
             report[name + "_symbols"] = n
             if not n:
                 return finish()
-            features = torch.empty((n, model.config.d_model), dtype=torch.float32, device=device)
+            feature_dim = model.config.d_model + (HISTORY_FEATURE_DIM if config.history_features else 0)
+            features = torch.empty((n, feature_dim), dtype=torch.float32, device=device)
             labels = torch.empty(n, dtype=torch.long, device=device)
             offset = 0
             for begin in range(0, len(subset), batch_reads):
@@ -258,6 +273,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
                 tensors = fastq_batch_to_tensors(batch, device)
                 with torch.no_grad():
                     h = model.forward_features(**tensors)
+                    if config.history_features:
+                        h = torch.cat((h, quality_history_features(tensors["qualities"], tensors["active_mask"])), dim=-1)
                     active = tensors["active_mask"]
                     count = int(batch.active_mask.sum())
                     features[offset:offset + count].copy_(h[active])
@@ -269,7 +286,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         (train_h, train_y), (val_h, val_y) = cached
         if config.head_type == "residual":
             head = _new_head(model.config.d_model, config.residual_dim, device=device,
-                             dtype=model.output_head.weight.dtype, seed=config.seed)
+                             dtype=model.output_head.weight.dtype, seed=config.seed,
+                             history_features=config.history_features)
             with torch.no_grad():
                 head.weight.copy_(model.output_head.weight)
                 head.bias.copy_(model.output_head.bias)
@@ -320,7 +338,10 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
                 for begin in range(0, val_y.numel(), 4096):
                     if time.perf_counter() >= deadline:
                         return None
-                    logits = candidate(val_h[begin:begin + 4096]).cpu().numpy()
+                    inputs = val_h[begin:begin + 4096]
+                    if config.history_features and not getattr(candidate, "history_features", False):
+                        inputs = inputs[:, :model.config.d_model]
+                    logits = candidate(inputs).cpu().numpy()
                     targets = val_y[begin:begin + 4096].cpu().numpy()
                     cdfs = logits_to_cdfs(logits, total=total)
                     bits += selected_quantized_bits(targets, cdfs, total)

@@ -22,6 +22,9 @@ The default head is linear. `--head-type residual --head-residual-dim 32`
 adds a small trainable GELU residual branch, keeping the same frozen backbone
 and features. Its full parameters are embedded as adapter v2 inside container
 v3; update the decoder as well. No separate adapter JSON is needed to decode.
+Optional `--head-history-features` adds eight same-read strict-prefix Q scalars
+to that residual branch only (adapter v3). This remains an experimental opt-in;
+initial prefix validation did not show a gain over the residual-only head.
 
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
 `k=2,3,4`, complete decoder-known base reads, position/read length, and an
