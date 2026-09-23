@@ -154,6 +154,20 @@ three streams and then requires gzip EOF and the declared uncompressed size.
 Headers must begin with `@`, plus fields with `+`, and non-quality lines must
 have an ending. Only the final quality line may omit its ending.
 
+### Optional causal sequence adapter v5
+
+Adapter schema v5 extends cross-layer v4 with a strictly causal eight-Q
+embedding/convolution branch. `sequence_protocol` must equal
+`q8_embed8_conv5x16_conv4x16_gelu_v1`. The existing tensors are followed by
+embedding [43,8], conv1 weight [16,40], bias [16], conv2 weight [16,64], bias
+[16], projection weight [42,16], bias [42], all transmitted as FP32. Windows
+contain Q[t-8:t] in chronological order, with BOS token 42 at each read start.
+The first kernel processes four overlapping five-token windows; the second
+processes their four outputs. Both use exact GELU. Their output projection is
+added to v4 logits before the unchanged softmax/CDF protocol. The branch never
+uses the target or future Q. Physical container version stays 3; decode uses
+embedded parameters without fitting. Unknown sequence protocols are rejected.
+
 ## Quality stream and batching
 
 The quality section is the standalone single range stream documented in

@@ -139,6 +139,78 @@ CDF verification; 200 CPU regression tests passed. Local diagnostic script,
 JSON report and reusable adapters are in
 `codec/runs/cross_layer_comparison_20260923_z6R3u0/` (ignored run artifacts).
 
+## Optional causal sequence branch
+
+Add `--head-sequence-branch` to the residual + cross-layer command above.
+This is opt-in and requires `--head-cross-layer`; baseline behavior is unchanged.
+The new neural logit correction uses only the eight exact preceding Q tokens,
+oldest first, padded independently per read with token 42 (BOS). Token 42 has
+its own trainable embedding. Current and future Q are never inputs.
+
+Architecture: embedding 43x8, valid temporal kernel 5 (8 to 16 channels), exact
+GELU, valid kernel 4 (16 to 16), exact GELU, linear 16 to 42. Shared temporal
+kernels use linear-on-unfold to keep full/step arithmetic on the same backend.
+There is no probability mixture, expert counter or online parameter update.
+The final sequence projection is zero-initialized. Existing seeded residual
+and cross parameters start identically to the baseline. All head and sequence
+parameters train jointly; the Transformer remains frozen.
+
+Sampled training positions retain their eight-token history (not eight random
+unrelated positions). Histories are cached beside frozen features, adding
+38.4 MB for 1.2M positions in FP32. The branch adds 2754 trainable parameters,
+11016 raw FP32 bytes. Extraction, fitting, validation and serialization remain
+within the same cooperative deadline; 1000 requested updates need not finish
+if the deadline is reached. Admission still compares the final model against
+the unadapted base, not against a separately fitted cross-layer head.
+
+Adapter schema v5 stores all v4 tensors followed by embedding, kernel-5 weight
+and bias, kernel-4 weight and bias, final projection weight and bias. Fixed
+protocol `q8_embed8_conv5x16_conv4x16_gelu_v1` defines their dimensions, causal
+alignment, padding and nonlinearities. Physical container version remains 3.
+Decode restores the exact transmitted parameters; no external adapter or
+training is needed. Older software rejects this new adapter schema.
+
+The small paired diagnostic can be reproduced with an unused output directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+python -m codec.benchmark_sequence_head \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
+  codec/runs/sequence_head_comparison_new
+```
+
+It fits ABBA trials on 8000 reads (6000 train, 2000 validation), evaluates
+reads 8001–12000 without training on them, exports reusable adapters, and checks
+a 257-read actual GPU roundtrip with integer CDF verification. It does not
+encode the complete file. Later-region bits/Q excludes adapter overhead and
+does not establish whole-file or blind-dataset improvement.
+
+### Sequence experiment result (2026-09-23)
+
+An isolated A100-PCIE-40GB run with PyTorch 2.0.0+cu118, after CPU regression
+tests finished, used the ABBA procedure above. Both repetitions completed all
+1000 updates, stayed below 20 seconds and produced identical adapter tensors.
+
+| Metric | res64 + cross16 | plus sequence branch |
+| --- | ---: | ---: |
+| Mean complete adaptation seconds | 8.777 | 11.298 |
+| Mean optimization seconds | 4.756 | 7.440 |
+| Prefix validation bits/Q | 2.211936662 | 2.211927607 |
+| Reads 8001–12000 bits/Q | 2.246396727 | 2.246663738 |
+| Container adapter bytes | 186496 | 201312 |
+
+The sequence branch added about 2.52 seconds and 14816 container bytes. Its
+later-region bits/Q was 0.0119% worse, not the targeted 1% improvement. The
+tiny prefix validation improvement is not evidence of a useful gain. Both
+adapters are admitted because admission compares to the original base head.
+Keep this experiment disabled by default; a full-file run is not justified by
+this result. This does not rule out other architectures or other datasets.
+Reports and artifacts are in the ignored local directory
+`codec/runs/sequence_head_comparison_20260923_isolated/`; the preceding run
+overlapping CPU tests is retained separately as `sequence_head_comparison_20260923_v1/`.
+All 203 CPU tests and a 257-read GPU byte-exact/full-step CDF roundtrip passed.
+
 ## Experts and encoding
 
 All production encoding is now **neural-only**, with or without head fitting.

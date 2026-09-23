@@ -323,6 +323,42 @@ class CrossLayerOutputHead(ResidualOutputHead):
             F.gelu(self.cross_down(packed[..., self.in_features:]), approximate="none"))
 
 
+def causal_quality_windows(qualities):
+    """Oldest-to-newest Q[t-8:t], padded with token 42 at each read start."""
+    if qualities.shape[1] == 0:
+        return qualities.new_empty((*qualities.shape, 8))
+    return F.pad(qualities, (8, 0), value=42).unfold(1, 8, 1)[:, :qualities.shape[1]]
+
+
+class CausalSequenceOutputHead(CrossLayerOutputHead):
+    """Cross-layer head plus two valid temporal convolutions on eight past Qs.
+
+    Linear-on-unfold implements shared kernels 5 and 4, avoiding separate
+    convolution backends for full encoding and incremental decoding.
+    """
+
+    def __init__(self, d_model, residual_dim, cross_dim=16):
+        super().__init__(d_model, residual_dim, cross_dim)
+        self.sequence_embedding = nn.Embedding(43, 8)
+        self.sequence_conv1 = nn.Linear(5 * 8, 16)
+        self.sequence_conv2 = nn.Linear(4 * 16, 16)
+        self.sequence_up = nn.Linear(16, QUALITY_ALPHABET_SIZE)
+        nn.init.zeros_(self.sequence_up.weight)
+        nn.init.zeros_(self.sequence_up.bias)
+
+    def forward(self, packed):
+        hidden, history = packed[..., :-8], packed[..., -8:].long()
+        embedded = self.sequence_embedding(history)
+        windows = embedded.unfold(-2, 5, 1).transpose(-1, -2).flatten(-2)
+        local = F.gelu(self.sequence_conv1(windows), approximate="none").flatten(-2)
+        local = F.gelu(self.sequence_conv2(local), approximate="none")
+        return super().forward(hidden) + self.sequence_up(local)
+
+    def forward_with_quality(self, hidden, qualities, active_mask):
+        history = causal_quality_windows(qualities).to(hidden.dtype)
+        return self(torch.cat((hidden, history), dim=-1))
+
+
 class DirectQualityTransformer(nn.Module):
     """Causal quality model using only decoder-synchronous stage-B features."""
 
@@ -469,8 +505,8 @@ class DirectQualityTransformer(nn.Module):
         hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask)
                   if isinstance(self.output_head, CrossLayerOutputHead)
                   else self._hidden_impl(bases, qualities, lengths, active_mask))
-        # Historical container heads may require decoder-known context. Normal
-        # linear/residual heads never implement or execute this compatibility hook.
+        # Sequence branches and historical heads require decoder-known context.
+        # Ordinary linear/residual heads do not use this hook.
         contextual_head = getattr(self.output_head, "forward_with_quality", None)
         logits = (self.output_head(hidden) if contextual_head is None
                   else contextual_head(hidden, qualities, active_mask))

@@ -74,6 +74,82 @@ def rewrite_metadata(source, target, change, physical=None):
 
 
 class HeadAdapterTest(unittest.TestCase):
+    def test_sequence_windows_causality_and_seeded_zero_start(self):
+        from codec.model import CausalSequenceOutputHead, causal_quality_windows
+        from codec.head_adapter import _new_head
+        q = torch.arange(12).reshape(1, 12)
+        windows = causal_quality_windows(q)
+        self.assertEqual(windows[0, 0].tolist(), [42] * 8)
+        self.assertEqual(windows[0, 9].tolist(), list(range(1, 9)))
+        altered = q.clone()
+        altered[:, 5:] = 41
+        self.assertTrue(torch.equal(windows[:, :6], causal_quality_windows(altered)[:, :6]))
+        self.assertEqual(tuple(causal_quality_windows(q[:, :0]).shape), (1, 0, 8))
+        kw = dict(device="cpu", dtype=torch.float32, seed=123, cross_dim=16)
+        baseline = _new_head(8, 64, **kw)
+        head = _new_head(8, 64, sequence_branch=True, **kw)
+        self.assertIsInstance(head, CausalSequenceOutputHead)
+        for name, value in baseline.state_dict().items():
+            self.assertTrue(torch.equal(value, head.state_dict()[name]))
+        h = torch.randn(1, 12, 16)
+        self.assertTrue(torch.equal(baseline(h), head.forward_with_quality(h, q, None)))
+        with torch.no_grad():
+            head.sequence_up.weight.normal_()
+        left = head.forward_with_quality(h, q, None)
+        right = head.forward_with_quality(h, altered, None)
+        self.assertTrue(torch.equal(left[:, :6], right[:, :6]))
+        self.assertFalse(torch.equal(left[:, 6:], right[:, 6:]))
+
+    def test_sequence_fit_roundtrip_serialization_and_frozen_backbone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, ckpt = model_and_checkpoint(root, num_layers=4)
+            original = copy.deepcopy(model)
+            source, raw = source_file(root)
+            cfg = config(head_type="residual", cross_layer=True, sequence_branch=True)
+            kw = dict(device=torch.device("cpu"), batch_reads=8, total=65536,
+                      base_sha256=sha256_file(ckpt), config=cfg)
+            rng = torch.get_rng_state().clone()
+            adapter, report = adapt_output_head(model, source, **kw)
+            self.assertTrue(report["accepted"])
+            self.assertEqual(adapter["version"], 5)
+            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+            self.assertGreater(model.output_head.sequence_up.weight.abs().sum().item(), 0)
+            for name, value in original.state_dict().items():
+                if not name.startswith("output_head."):
+                    self.assertTrue(torch.equal(value, model.state_dict()[name]), name)
+            twin, _ = adapt_output_head(copy.deepcopy(original), source, **kw)
+            self.assertEqual(adapter, twin)
+            for change in ({"sequence_protocol": "future_q"}, {"version": 4},
+                           {"parameter_bytes": adapter["parameter_bytes"] - 4}):
+                with self.assertRaises(ValueError):
+                    validate_head_adapter(dict(adapter, **change), 8, sha256_file(ckpt))
+            artifact = root / "sequence.json"
+            artifact.write_text(json.dumps(dict(format="direct-quality-head-adaptation-artifact",
+                version=1, base_checkpoint_sha256=sha256_file(ckpt), adapter=adapter, report={})))
+            target = root / "sequence.fqdc"
+            io_kw = dict(device=torch.device("cpu"), batch_reads=8, progress=False, verify_cdf=True)
+            encode_fastq(source, target, ckpt, **io_kw, head_adapter_path=artifact)
+            self.assertEqual(read_container(target).metadata["head_adapter"]["version"], 5)
+            artifact.unlink()
+            restored = root / "restored.fq"
+            decode_fastq(target, restored, ckpt, **io_kw)
+            self.assertEqual(raw, restored.read_bytes())
+
+    def test_sequence_cli_and_config_guards(self):
+        for overrides in (dict(sequence_branch=True), dict(sequence_branch=1),
+                          dict(sequence_branch=True, cross_layer=True, head_type="linear")):
+            with self.assertRaises(ValueError):
+                config(**overrides)
+        common = ["codec.encode", "in.fq", "out.fqdc", "base.pt"]
+        with mock.patch("sys.argv", common + ["--head-sequence-branch"]), self.assertRaises(SystemExit):
+            main()
+        flags = ["--finetune-head", "--head-type", "residual", "--head-cross-layer", "--head-sequence-branch"]
+        with mock.patch("sys.argv", common + flags), mock.patch("codec.encode.encode_fastq") as encode, mock.patch("builtins.print"):
+            encode.return_value.to_dict.return_value = {}
+            main()
+            self.assertTrue(encode.call_args.kwargs["head_adaptation_config"].sequence_branch)
+
     def test_frozen_backbone_whole_read_split_and_determinism(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

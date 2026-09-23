@@ -669,6 +669,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="residual hidden width (1..128); requires --head-type residual")
     parser.add_argument("--head-cross-layer", action="store_true", help="add a trainable branch from frozen block 3; requires residual head")
     parser.add_argument("--head-cross-dim", type=int, default=16, help="cross-layer branch width (1..128)")
+    parser.add_argument("--head-sequence-branch", action="store_true",
+        help="learn a causal eight-Q convolution branch; requires --head-cross-layer")
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -691,11 +693,12 @@ def main() -> int:
                 anchor_strength=args.head_anchor_strength, max_seconds=args.head_max_seconds,
                 min_gain_bits_per_quality=args.head_min_gain, seed=args.head_seed,
                 head_type=args.head_type, residual_dim=args.head_residual_dim,
-                cross_layer=args.head_cross_layer, cross_dim=args.head_cross_dim)
+                cross_layer=args.head_cross_layer, cross_dim=args.head_cross_dim,
+                sequence_branch=args.head_sequence_branch)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
             "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",
-            "head_type", "head_residual_dim", "head_cross_layer", "head_cross_dim")):
+            "head_type", "head_residual_dim", "head_cross_layer", "head_cross_dim", "head_sequence_branch")):
             raise ValueError("--head-* training options require --finetune-head")
         statistics = encode_fastq(
             args.input,
