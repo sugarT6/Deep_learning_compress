@@ -69,6 +69,76 @@ The extra computation affects both fitting and inference. A 20-second budget
 is still cooperative, not a hard guarantee. Inspect `steps_completed` and
 `budget_exceeded`; compare total time as well as quality-plus-adapter bytes.
 
+## Optional cross-layer branch
+
+With `--head-type residual --head-residual-dim 64`, add `--head-cross-layer`
+and optionally `--head-cross-dim 16` (default 16, permitted 1..128). At least
+four Transformer blocks are required. The branch computes
+
+```text
+z = residual_head(h_final) + cross_up(GELU(cross_down(LN(h_block3))))
+```
+
+`h_block3` is the output of the third block (one-based), before later blocks
+and final encoder normalization. LN is per-position over channels, with no
+affine parameters and epsilon 1e-5. A temporary hook captures the existing
+forward and is removed even on failure. The original backbone and checkpoint
+feature schema are unchanged. New up weights/bias start at zero; seeded res64
+initialization remains the same. All head tensors train jointly; backbone
+parameters remain frozen. This does not load or continue a previously fitted
+res64 adapter, and admission still compares to the unadapted base head.
+
+Both final and normalized block-3 features are cached once. At 1.2M qualities,
+the extra cache is 1.2288 GB (decimal). Width 16 adds 4826 parameters; res64 plus
+cross16 totals 34798 parameters / 139192 raw FP32 bytes. Feature extraction,
+optimization, validation and serialization all count against the same
+cooperative 20-second budget. Sampling and final-only admission are unchanged.
+
+Adapter **version 4**, still inside physical container **version 3**, transmits
+all ten tensors in linear / residual down-up / cross down-up order. It stores
+cross width, source layer=3, normalization rule/epsilon, and all shapes. The
+decoder reconstructs the branch from the container; no external adapter JSON
+is required. Unknown or malformed rules are rejected. Older decoders reject
+adapter v4; existing adapters v1/v2 and decode-only v3 remain supported.
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  codec/output/CNR0847462_head8k_s1000_res64_cross16_20260923.fqdc \
+  codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
+  --device cuda --batch-reads 256 \
+  --finetune-head --head-type residual --head-residual-dim 64 \
+  --head-cross-layer --head-cross-dim 16 \
+  --head-max-reads 8000 --head-max-symbols 1200000 \
+  --head-steps 1000 --head-max-seconds 20 \
+  --save-head-adapter codec/output/CNR0847462_head8k_s1000_res64_cross16_20260923.adapter.json
+```
+
+### Small GPU comparison (2026-09-23)
+
+On one idle A100-PCIE-40GB, PyTorch 2.0.0+cu118, the same base checkpoint and
+CNR0847462 prefix were used for res64 / cross16 / cross16 / res64 runs.
+Each used 8000 prefix reads (6000 train, 2000 validation), 1000 updates and a
+20-second budget. All completed 1000 updates and accepted the adapter.
+
+| Metric | res64 | res64 + cross16 |
+| --- | ---: | ---: |
+| Mean adaptation seconds, including read/extract/validate/serialize | 6.347 | 7.223 |
+| Mean optimization seconds | 2.679 | 3.717 |
+| Prefix validation bits/Q | 2.215747602 | 2.211936662 |
+| Later reads 8001–12000 bits/Q | 2.250578093 | 2.246396727 |
+| Container adapter bytes | 160472 | 186496 |
+
+The later 4000 reads were not used for this fit or admission; this is a local
+engineering comparison, not a new blind dataset. Their quantized bits/Q
+improves about 0.19%, excluding adapter overhead. No full-file size or speed
+claim follows from this sample. Fitting adds about 0.88 seconds and adapter
+metadata adds 26024 bytes. Repeated fits produced identical adapter tensors.
+A 257-read GPU encode/decode passed byte-exact roundtrip and full/step integer
+CDF verification; 200 CPU regression tests passed. Local diagnostic script,
+JSON report and reusable adapters are in
+`codec/runs/cross_layer_comparison_20260923_z6R3u0/` (ignored run artifacts).
+
 ## Experts and encoding
 
 All production encoding is now **neural-only**, with or without head fitting.

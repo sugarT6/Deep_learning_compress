@@ -23,14 +23,14 @@ from codec.head_adapter import (
     HeadAdaptationConfig, adapt_output_head, apply_head_adapter,
     serialize_head, validate_head_adapter,
 )
-from codec.model import DirectQualityModelConfig, DirectQualityTransformer, ResidualOutputHead, fastq_batch_to_tensors
+from codec.model import CrossLayerOutputHead, DirectQualityModelConfig, DirectQualityTransformer, ResidualOutputHead, fastq_batch_to_tensors
 from codec.running_delta import RunningDeltaPriorConfig
 
 
-def model_and_checkpoint(root):
+def model_and_checkpoint(root, num_layers=1):
     torch.manual_seed(27)
     model = DirectQualityTransformer(DirectQualityModelConfig(
-        d_model=8, num_heads=2, num_layers=1, feedforward_dim=16,
+        d_model=8, num_heads=2, num_layers=num_layers, feedforward_dim=16,
         prev_q_embed_dim=4, qmer_embed_dim=2, base_embed_dim=3,
         base_conv_channels=3, base_context_dim=4, dropout=0.1))
     checkpoint = root / "base.pt"
@@ -267,6 +267,106 @@ class HeadAdapterTest(unittest.TestCase):
             with self.assertRaisesRegex(TypeError, "online_prior_config"):
                 encode_fastq(source, root / "forbidden.fqdc", ckpt, device=torch.device("cpu"),
                              online_prior_config=RunningDeltaPriorConfig())
+
+    def test_cross_layer_features_causal_exact_and_hooks_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, _ = model_and_checkpoint(root, num_layers=4)
+            model.eval()
+            source, _ = source_file(root)
+            tensors = fastq_batch_to_tensors(next(iter_fastq_batches(source, batch_reads=8)), "cpu")
+            with torch.no_grad():
+                base = model.forward_features(**tensors)
+                packed = model.forward_cross_layer_features(**tensors)
+                self.assertTrue(torch.equal(base, packed[..., :8]))
+                self.assertEqual(packed.shape[-1], 16)
+                changed = {k: v.clone() for k, v in tensors.items()}
+                changed["qualities"][:, 3:] = torch.where(changed["active_mask"][:, 3:], 5, 42)
+                other = model.forward_cross_layer_features(**changed)
+                self.assertTrue(torch.equal(packed[:, :4], other[:, :4]))
+                empty = {k: (v[:, :0] if v.ndim == 2 else v * 0) for k, v in tensors.items()}
+                self.assertEqual(model.forward_cross_layer_features(**empty).shape, (8, 0, 16))
+            self.assertFalse(model.transformer.layers[2]._forward_hooks)
+            with mock.patch.object(model, "_hidden_impl", side_effect=RuntimeError("fixture")):
+                with self.assertRaises(RuntimeError):
+                    model.forward_cross_layer_features(**tensors)
+            self.assertFalse(model.transformer.layers[2]._forward_hooks)
+
+    def test_cross_layer_fit_roundtrip_and_exact_wire(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, ckpt = model_and_checkpoint(root, num_layers=4)
+            source, raw = source_file(root, compressed=True)
+            original = copy.deepcopy(model)
+            twin = copy.deepcopy(model)
+            rng = torch.get_rng_state().clone()
+            cfg = config(head_type="residual", residual_dim=64, cross_layer=True)
+            kwargs = dict(device=torch.device("cpu"), batch_reads=8, total=65536, base_sha256=sha256_file(ckpt), config=cfg)
+            adapter, report = adapt_output_head(model, source, **kwargs)
+            self.assertTrue(report["accepted"])
+            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+            self.assertGreater(int(torch.count_nonzero(model.output_head.cross_up.weight)), 0)
+            self.assertTrue(all(p.requires_grad and p.grad is None for p in model.parameters()))
+            for name, value in original.state_dict().items():
+                if not name.startswith("output_head."):
+                    self.assertTrue(torch.equal(value, model.state_dict()[name]))
+            second, _ = adapt_output_head(twin, source, **kwargs)
+            self.assertEqual(adapter, second)
+            self.assertEqual(adapter, serialize_head(model.output_head, sha256_file(ckpt)))
+            artifact, target = root / "head.json", root / "cross.fqdc"
+            common = dict(device=torch.device("cpu"), batch_reads=8, progress=False, verify_cdf=True)
+            encode_fastq(source, target, ckpt, **common, head_adaptation_config=cfg, save_head_adapter_path=artifact)
+            self.assertEqual(read_container(target).metadata["head_adapter"]["version"], 4)
+            repeat = root / "repeat.fqdc"
+            encode_fastq(source, repeat, ckpt, **common, head_adapter_path=artifact)
+            self.assertEqual(target.read_bytes(), repeat.read_bytes())
+            artifact.unlink()
+            restored = root / "out.fq"
+            decode_fastq(target, restored, ckpt, **common)
+            self.assertEqual(raw, restored.read_bytes())
+            for i, change in enumerate((lambda a: a.update(source_layer=2), lambda a: a.update(source_layer=True),
+                                       lambda a: a.update(source_eps=1e-6), lambda a: a.update(source_normalization="none"),
+                                       lambda a: a.update(cross_dim=0), lambda a: a.pop("cross_up_bias_shape"),
+                                       lambda a: a.update(cross_down_weight_shape=[16, 9]), lambda a: a.update(version=2))):
+                bad = root / f"bad{i}.fqdc"
+                rewrite_metadata(target, bad, lambda m: change(m["head_adapter"]))
+                with self.assertRaises(ContainerError):
+                    read_container(bad)
+            kwargs["config"] = config(head_type="residual", cross_layer=True, min_gain_bits_per_quality=1000)
+            rejected, _ = adapt_output_head(original, source, **kwargs)
+            self.assertIsNone(rejected)
+            self.assertNotIsInstance(original.output_head, CrossLayerOutputHead)
+
+    def test_cross_layer_initial_function_and_architecture_guard(self):
+        torch.manual_seed(13)
+        base = ResidualOutputHead(256, 64)
+        torch.manual_seed(13)
+        cross = CrossLayerOutputHead(256, 64, 16)
+        for name, value in base.state_dict().items():
+            self.assertTrue(torch.equal(value, cross.state_dict()[name]))
+        h = torch.randn(2, 7, 256)
+        self.assertTrue(torch.allclose(base(h), cross(torch.cat((h, torch.randn_like(h)), -1)), atol=1e-7))
+        self.assertEqual(serialize_head(cross, "0" * 64)["parameter_bytes"], 139192)
+        with tempfile.TemporaryDirectory() as directory:
+            model, ckpt = model_and_checkpoint(Path(directory))
+            adapter = serialize_head(CrossLayerOutputHead(8, 64, 16), sha256_file(ckpt))
+            with self.assertRaisesRegex(ValueError, "at least 4"):
+                apply_head_adapter(model, adapter, sha256_file(ckpt))
+
+    def test_cross_layer_cli_and_config_guards(self):
+        common = ["codec.encode", "in.fq", "out.fqdc", "base.pt"]
+        with mock.patch("sys.argv", common + ["--finetune-head", "--head-type", "residual", "--head-cross-layer"]), \
+             mock.patch("codec.encode.encode_fastq") as encode, mock.patch("builtins.print"):
+            encode.return_value.to_dict.return_value = {}
+            main()
+            self.assertTrue(encode.call_args.kwargs["head_adaptation_config"].cross_layer)
+        for flags in (["--head-cross-layer"], ["--finetune-head", "--head-cross-layer"],
+                      ["--finetune-head", "--head-cross-dim", "32"]):
+            with mock.patch("sys.argv", common + flags), self.assertRaises(SystemExit):
+                main()
+        for values in ({"cross_layer": True}, {"cross_dim": 0}, {"cross_dim": True}):
+            with self.assertRaises(ValueError):
+                config(**values)
 
     def test_invalid_config(self):
         for override in ({"steps": True}, {"max_seconds": float("nan")}, {"max_seconds": 0},

@@ -20,7 +20,7 @@ import torch
 from torch.nn import functional as F
 
 from .fastq_stream import encode_base_ids, iter_fastq_records, make_fastq_batch
-from .model import ResidualOutputHead, fastq_batch_to_tensors
+from .model import CrossLayerOutputHead, ResidualOutputHead, fastq_batch_to_tensors
 from .probability_quantization import logits_to_cdfs
 from .encode_fastpath import selected_quantized_bits
 
@@ -42,8 +42,14 @@ class HeadAdaptationConfig:
     seed: int = 20260921
     head_type: str = "linear"
     residual_dim: int = 32
+    cross_layer: bool = False
+    cross_dim: int = 16
 
     def __post_init__(self):
+        if type(self.cross_layer) is not bool or (self.cross_layer and self.head_type != "residual"):
+            raise ValueError("cross_layer requires a residual head and a boolean flag")
+        if type(self.cross_dim) is not int or not 1 <= self.cross_dim <= 128:
+            raise ValueError("cross_dim must be in [1, 128]")
         if self.head_type not in ("linear", "residual"):
             raise ValueError("head_type must be linear or residual")
         if type(self.residual_dim) is not int or not 1 <= self.residual_dim <= 128:
@@ -66,15 +72,20 @@ def _head_parameters(head):
     parameters = [head.weight, head.bias]
     if isinstance(head, ResidualOutputHead):
         parameters.extend((head.down.weight, head.down.bias, head.up.weight, head.up.bias))
+    if isinstance(head, CrossLayerOutputHead):
+        parameters.extend((head.cross_down.weight, head.cross_down.bias, head.cross_up.weight, head.cross_up.bias))
     return parameters
 
 
-def _new_head(d_model, residual_dim, *, device, dtype, seed=0):
+def _new_head(d_model, residual_dim, *, device, dtype, seed=0, cross_dim=None):
     # Initialization runs on CPU with an isolated RNG, including during decode.
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
-        head = (ResidualOutputHead(d_model, residual_dim) if residual_dim is not None
-                else torch.nn.Linear(d_model, 42))
+        if cross_dim is not None:
+            head = CrossLayerOutputHead(d_model, residual_dim, cross_dim)
+        else:
+            head = (ResidualOutputHead(d_model, residual_dim) if residual_dim is not None
+                    else torch.nn.Linear(d_model, 42))
     return head.to(device=device, dtype=dtype)
 
 
@@ -98,6 +109,12 @@ def serialize_head(head, base_sha256):
                         layout="weight_bias_down_weight_down_bias_up_weight_up_bias")
         for name, array in zip(("down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"), arrays[2:]):
             metadata[name] = list(array.shape)
+    if isinstance(head, CrossLayerOutputHead):
+        metadata.update(version=4, cross_dim=head.cross_down.out_features, source_layer=3,
+                        source_normalization="layer_norm_no_affine", source_eps=1e-5,
+                        layout=metadata["layout"] + "_cross_down_weight_cross_down_bias_cross_up_weight_cross_up_bias")
+        for name, array in zip(("cross_down_weight_shape", "cross_down_bias_shape", "cross_up_weight_shape", "cross_up_bias_shape"), arrays[6:]):
+            metadata[name] = list(array.shape)
     return metadata
 
 
@@ -108,12 +125,15 @@ def validate_head_adapter(metadata, d_model, base_sha256):
     if not isinstance(metadata, dict):
         raise ValueError("adapter fields missing or unknown")
     version = metadata.get("version")
-    if type(version) is not int or version not in (1, 2, 3):
+    if type(version) is not int or version not in (1, 2, 3, 4):
         raise ValueError("unsupported adapter version")
     if version >= 2:
         keys.update(("residual_dim", "activation", "down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"))
     if version == 3:
         keys.add("history_features")
+    if version == 4:
+        keys.update(("cross_dim", "source_layer", "source_normalization", "source_eps",
+                     "cross_down_weight_shape", "cross_down_bias_shape", "cross_up_weight_shape", "cross_up_bias_shape"))
     if set(metadata) != keys:
         raise ValueError("adapter fields missing or unknown")
     if version == 3:
@@ -121,6 +141,8 @@ def validate_head_adapter(metadata, d_model, base_sha256):
         validate_history_feature_schema(metadata["history_features"])
     layout = ("weight_row_major_then_bias" if version == 1 else
               "weight_bias_down_weight_down_bias_up_weight_up_bias")
+    if version == 4:
+        layout += "_cross_down_weight_cross_down_bias_cross_up_weight_cross_up_bias"
     if (metadata["format"] != ADAPTER_FORMAT or metadata["dtype"] != "little_endian_float32"
             or metadata["layout"] != layout
             or metadata["application"] != "replace_output_head"):
@@ -135,6 +157,15 @@ def validate_head_adapter(metadata, d_model, base_sha256):
         input_dim = d_model + (8 if version == 3 else 0)
         shapes.extend((("down_weight_shape", [width, input_dim]), ("down_bias_shape", [width]),
                        ("up_weight_shape", [42, width]), ("up_bias_shape", [42])))
+    if version == 4:
+        width = metadata["cross_dim"]
+        if (type(width) is not int or not 1 <= width <= 128
+                or type(metadata["source_layer"]) is not int or metadata["source_layer"] != 3
+                or metadata["source_normalization"] != "layer_norm_no_affine"
+                or type(metadata["source_eps"]) is not float or metadata["source_eps"] != 1e-5):
+            raise ValueError("invalid cross-layer head protocol")
+        shapes.extend((("cross_down_weight_shape", [width, d_model]), ("cross_down_bias_shape", [width]),
+                       ("cross_up_weight_shape", [42, width]), ("cross_up_bias_shape", [42])))
     for name, expected in shapes:
         shape = metadata[name]
         if not isinstance(shape, list) or any(type(v) is not int for v in shape) or shape != expected:
@@ -166,7 +197,8 @@ def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
             head = LegacyHistoryHead(d_model, metadata["residual_dim"])
         head = head.to(device=device, dtype=dtype)
     else:
-        head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype)
+        head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype,
+                         cross_dim=metadata.get("cross_dim"))
     offset = 0
     with torch.no_grad():
         for parameter in _head_parameters(head):
@@ -177,6 +209,8 @@ def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
 
 
 def apply_head_adapter(model, metadata, base_sha256):
+    if isinstance(metadata, dict) and metadata.get("version") == 4 and model.config.num_layers < 4:
+        raise ValueError("cross-layer adapter requires at least 4 Transformer layers")
     original = model.output_head
     head = _restore_head(metadata, model.config.d_model, base_sha256,
                          device=original.weight.device, dtype=original.weight.dtype)
@@ -194,6 +228,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
     """
     if getattr(model.output_head, "decode_only", False):
         raise ValueError("Q-history adapters are retired and cannot be fine-tuned")
+    if config.cross_layer and model.config.num_layers < 4:
+        raise ValueError("cross-layer adaptation requires at least 4 Transformer layers")
     started = time.perf_counter()
     deadline = started + config.max_seconds
     work_deadline = started + config.max_seconds * 0.70
@@ -260,7 +296,7 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
             report[name + "_symbols"] = n
             if not n:
                 return finish()
-            features = torch.empty((n, model.config.d_model), dtype=torch.float32, device=device)
+            features = torch.empty((n, model.config.d_model * (2 if config.cross_layer else 1)), dtype=torch.float32, device=device)
             labels = torch.empty(n, dtype=torch.long, device=device)
             offset = 0
             for begin in range(0, len(subset), batch_reads):
@@ -273,7 +309,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
                     [r.read_index for r in rows], source_name=Path(source).name)
                 tensors = fastq_batch_to_tensors(batch, device)
                 with torch.no_grad():
-                    h = model.forward_features(**tensors)
+                    h = (model.forward_cross_layer_features(**tensors) if config.cross_layer
+                         else model.forward_features(**tensors))
                     active = tensors["active_mask"]
                     count = int(batch.active_mask.sum())
                     features[offset:offset + count].copy_(h[active])
@@ -285,7 +322,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         (train_h, train_y), (val_h, val_y) = cached
         if config.head_type == "residual":
             head = _new_head(model.config.d_model, config.residual_dim, device=device,
-                             dtype=model.output_head.weight.dtype, seed=config.seed)
+                             dtype=model.output_head.weight.dtype, seed=config.seed,
+                             cross_dim=config.cross_dim if config.cross_layer else None)
             with torch.no_grad():
                 head.weight.copy_(model.output_head.weight)
                 head.bias.copy_(model.output_head.bias)
@@ -336,7 +374,10 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
                 for begin in range(0, val_y.numel(), 4096):
                     if time.perf_counter() >= deadline:
                         return None
-                    logits = candidate(val_h[begin:begin + 4096]).cpu().numpy()
+                    inputs = val_h[begin:begin + 4096]
+                    if config.cross_layer and not isinstance(candidate, CrossLayerOutputHead):
+                        inputs = inputs[:, :model.config.d_model]
+                    logits = candidate(inputs).cpu().numpy()
                     targets = val_y[begin:begin + 4096].cpu().numpy()
                     cdfs = logits_to_cdfs(logits, total=total)
                     bits += selected_quantized_bits(targets, cdfs, total)

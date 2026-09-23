@@ -308,6 +308,21 @@ class ResidualOutputHead(nn.Linear):
         )
 
 
+class CrossLayerOutputHead(ResidualOutputHead):
+    """Residual head on final features plus a zero-start branch on layer 3."""
+
+    def __init__(self, d_model, residual_dim, cross_dim=16):
+        super().__init__(d_model, residual_dim)
+        self.cross_down = nn.Linear(d_model, cross_dim)
+        self.cross_up = nn.Linear(cross_dim, QUALITY_ALPHABET_SIZE)
+        nn.init.zeros_(self.cross_up.weight)
+        nn.init.zeros_(self.cross_up.bias)
+
+    def forward(self, packed):
+        return super().forward(packed[..., :self.in_features]) + self.cross_up(
+            F.gelu(self.cross_down(packed[..., self.in_features:]), approximate="none"))
+
+
 class DirectQualityTransformer(nn.Module):
     """Causal quality model using only decoder-synchronous stage-B features."""
 
@@ -451,7 +466,9 @@ class DirectQualityTransformer(nn.Module):
         return hidden
 
     def _forward_impl(self, bases, qualities, lengths, active_mask):
-        hidden = self._hidden_impl(bases, qualities, lengths, active_mask)
+        hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask)
+                  if isinstance(self.output_head, CrossLayerOutputHead)
+                  else self._hidden_impl(bases, qualities, lengths, active_mask))
         # Historical container heads may require decoder-known context. Normal
         # linear/residual heads never implement or execute this compatibility hook.
         contextual_head = getattr(self.output_head, "forward_with_quality", None)
@@ -466,6 +483,34 @@ class DirectQualityTransformer(nn.Module):
             raise ValueError("qualities must have the same shape as bases")
         _validate_target_values(qualities, active_mask, name="qualities")
         return self._hidden_impl(bases, qualities, lengths, active_mask)
+
+    def forward_cross_layer_features(self, bases, qualities, lengths, active_mask):
+        self._validate_common_inputs(bases, lengths, active_mask)
+        if qualities.shape != bases.shape:
+            raise ValueError("qualities must have the same shape as bases")
+        _validate_target_values(qualities, active_mask, name="qualities")
+        return self._cross_hidden_impl(bases, qualities, lengths, active_mask)
+
+    def _cross_hidden_impl(self, bases, qualities, lengths, active_mask):
+        """Pack final features and per-position, affine-free LN of block 3.
+
+        Capture the existing forward instead of rerunning the backbone. The
+        temporary hook is always removed, including on failed inference.
+        """
+        if self.config.num_layers < 4:
+            raise ValueError("cross-layer adaptation requires at least 4 Transformer layers")
+        if bases.shape[1] == 0:
+            return self._hidden_impl(bases, qualities, lengths, active_mask).repeat(1, 1, 2)
+        captured = []
+        def capture(module, inputs, output):
+            captured.append(output)
+        handle = self.transformer.layers[2].register_forward_hook(capture)
+        try:
+            final = self._hidden_impl(bases, qualities, lengths, active_mask)
+        finally:
+            handle.remove()
+        middle = F.layer_norm(captured[0], (self.config.d_model,), weight=None, bias=None, eps=1e-5)
+        return torch.cat((final, middle), dim=-1)
 
     def forward_full(
         self,

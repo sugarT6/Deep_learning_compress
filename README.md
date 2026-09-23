@@ -25,6 +25,11 @@ v3; update the decoder as well. No separate adapter JSON is needed to decode.
 The unsuccessful `--head-history-features` experiment has been retired. Its
 training/encoding path and standalone feature module were removed; existing
 adapter-v3 Q-history containers remain readable via decode-only compatibility.
+`--head-cross-layer --head-cross-dim 16` optionally adds a small branch from
+the frozen third Transformer block to the residual head (adapter v4). It caches
+both layer representations for fitting and transmits the full head for decoding.
+The original residual-only mode remains unchanged; compare measured time and
+quality-plus-adapter bytes before adopting the extra branch.
 
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
 `k=2,3,4`, complete decoder-known base reads, position/read length, and an

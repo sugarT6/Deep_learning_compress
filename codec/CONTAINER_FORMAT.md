@@ -80,13 +80,21 @@ the complete existing prior profile is validated. Versions 1 and 2 reject any
 is unchanged. After loading the base checkpoint, both codec ends replace its
 output head with the exact stored parameters. The decoder never fits a model.
 
-Two head-adapter schemas are produced: adapter v1 replaces the linear weight
+Current head-adapter schemas include: adapter v1 replaces the linear weight
 and bias; adapter v2 replaces those plus a 256-to-r-to-42 residual MLP (the input
 dimension follows the checkpoint). The residual activation is exact GELU;
 the bounded width, all tensor shapes, ordering, and six FP32 tensors are
 transmitted. Both use physical container v3. Unknown adapter versions,
 activations or layouts are rejected, including by older decoders. External
 adapter JSON exports are not decoding dependencies. See `HEAD_ADAPTATION.md`.
+
+Adapter v4 adds a cross-layer branch to the residual head. Its source is the
+third block output with per-position, channel-only, affine-free LayerNorm
+(epsilon 1e-5). It requires at least four blocks, transmits four additional
+cross-projection tensors and their shapes, and records source/normalization
+rules and branch width. Physical container version remains 3. The normalization
+is performed when extracting features on both codec ends, not learned during
+decoding. Older adapters keep their original probability paths.
 
 Historical adapter v3 (not expert profile v3) is decode-only. It widened the
 residual input by eight strict-prefix Q features and stored their exact schema
