@@ -30,10 +30,15 @@ the frozen third Transformer block to the residual head (adapter v4). It caches
 both layer representations for fitting and transmits the full head for decoding.
 The original residual-only mode remains unchanged; compare measured time and
 quality-plus-adapter bytes before adopting the extra branch.
-`--head-sequence-branch` is an experimental, default-off addition to that
-cross-layer head: an exact eight-Q embedding and two small causal convolutions
-produce a logit correction (adapter v5). The initial 8000-read comparison did
-not improve later-region bits/Q; it is not recommended as a new default.
+`--head-lora` optionally adapts fourth-block Q/V with rank-4 LoRA after the
+cross-layer head warm-up, under the same total time budget. Its schema-v6
+adapter embeds the head and low-rank factors; both codec ends canonically merge
+the factors into the base attention weights. The unsuccessful sequence branch,
+its CLI switch, and adapter-v5 support have been removed (old experiment code
+remains in Git commit `d73c8b8`).
+The 8000-read LoRA pilot showed a small gain over 1000 head updates but was
+weaker than spending the same time budget on additional head-only updates;
+it is experimental and remains disabled by default.
 
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
 `k=2,3,4`, complete decoder-known base reads, position/read length, and an

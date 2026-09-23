@@ -139,77 +139,96 @@ CDF verification; 200 CPU regression tests passed. Local diagnostic script,
 JSON report and reusable adapters are in
 `codec/runs/cross_layer_comparison_20260923_z6R3u0/` (ignored run artifacts).
 
-## Optional causal sequence branch
+## Optional final-block Q/V LoRA
 
-Add `--head-sequence-branch` to the residual + cross-layer command above.
-This is opt-in and requires `--head-cross-layer`; baseline behavior is unchanged.
-The new neural logit correction uses only the eight exact preceding Q tokens,
-oldest first, padded independently per read with token 42 (BOS). Token 42 has
-its own trainable embedding. Current and future Q are never inputs.
+The unsuccessful small sequence branch and `--head-sequence-branch` have been
+removed, including adapter-v5 decoding. Historical experiment outputs/reports
+are untouched; commit `d73c8b8` can recover the removed implementation.
 
-Architecture: embedding 43x8, valid temporal kernel 5 (8 to 16 channels), exact
-GELU, valid kernel 4 (16 to 16), exact GELU, linear 16 to 42. Shared temporal
-kernels use linear-on-unfold to keep full/step arithmetic on the same backend.
-There is no probability mixture, expert counter or online parameter update.
-The final sequence projection is zero-initialized. Existing seeded residual
-and cross parameters start identically to the baseline. All head and sequence
-parameters train jointly; the Transformer remains frozen.
+Add `--head-lora` to the residual + cross-layer command. Exactly four backbone
+blocks and PyTorch 2.0 or newer are required. Optional controls are `--head-lora-rank 4` (1..16),
+`--head-lora-steps 1000` (maximum sequence updates), and
+`--head-lora-learning-rate 0.0003`. These controls require `--head-lora`.
 
-Sampled training positions retain their eight-token history (not eight random
-unrelated positions). Histories are cached beside frozen features, adding
-38.4 MB for 1.2M positions in FP32. The branch adds 2754 trainable parameters,
-11016 raw FP32 bytes. Extraction, fitting, validation and serialization remain
-within the same cooperative deadline; 1000 requested updates need not finish
-if the deadline is reached. Admission still compares the final model against
-the unadapted base, not against a separately fitted cross-layer head.
+The same total `--head-max-seconds` includes the ordinary head warm-up, rereading
+the selected prefix, caching raw third-block sequence states, LoRA training,
+checkpoint selection, wire validation and serialization. It is not an extra
+20 seconds after head fitting. First the normal head fits for `--head-steps`;
+then Q/V rank factors and that fitted head train together with Adam, gradient
+clip 1 and the configured anchoring penalty. All other parameters are frozen.
+Rank 4 at D=256 adds 4096 parameters (16384 raw FP32 bytes).
 
-Adapter schema v5 stores all v4 tensors followed by embedding, kernel-5 weight
-and bias, kernel-4 weight and bias, final projection weight and bias. Fixed
-protocol `q8_embed8_conv5x16_conv4x16_gelu_v1` defines their dimensions, causal
-alignment, padding and nonlinearities. Physical container version remains 3.
-Decode restores the exact transmitted parameters; no external adapter or
-training is needed. Older software rejects this new adapter schema.
+The second stage samples cached chunks of up to 32 complete reads uniformly,
+not 8192 independent quality positions. Empty chunks are skipped. Variable
+read lengths therefore affect the number of symbols per update. Each update
+reruns only the last block, final normalization and head. It cannot reuse
+frozen final-layer features. Baseline and all later evaluations use the same
+whole-read 75/25 prefix split. The deadline reserves its last 30% for final
+validation; incomplete training is expected under tight budgets.
 
-The small paired diagnostic can be reproduced with an unused output directory:
+Every 20 updates (and the requested final step), held-out prefix cross entropy
+selects the best head/factors, with the warm-up head as step-zero fallback.
+Unvalidated updates are never selected. The selected factors are serialized,
+canonically merged into FP32 base weights, and checked with integer-CDF bits/Q.
+LoRA is admitted only when this improves upon the already fitted warm-up head
+by `--head-min-gain`, not merely upon the unadapted base. Otherwise the warm-up
+v4 adapter is returned. The admission threshold does not automatically account
+for extra container bytes; whole-file quality-plus-adapter size remains the
+final metric. A time budget is cooperative, not a hard real-time guarantee.
+
+Inspect `warmup_report`, `lora_steps_completed`, `lora_selected_step`,
+`lora_accepted`, `lora_validation_history`, and `lora_stage_seconds` in addition
+to total `seconds`. `steps_completed` still describes the head warm-up.
+Schema v6 embeds the v4 head and low-rank factors, with a fixed CPU FP64 merge
+rule. Updated decoder software needs only the base checkpoint and container.
+
+Small paired benchmark (choose a new output directory and an idle GPU):
 
 ```bash
 CUDA_VISIBLE_DEVICES=3 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-python -m codec.benchmark_sequence_head \
+python -m codec.benchmark_lora \
   data/2nd/CNR0847462_1.head2M.fastq.gz \
   codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
-  codec/runs/sequence_head_comparison_new
+  codec/runs/lora_comparison_new
 ```
 
-It fits ABBA trials on 8000 reads (6000 train, 2000 validation), evaluates
-reads 8001–12000 without training on them, exports reusable adapters, and checks
-a 257-read actual GPU roundtrip with integer CDF verification. It does not
-encode the complete file. Later-region bits/Q excludes adapter overhead and
-does not establish whole-file or blind-dataset improvement.
+This repeats baseline 1000-step fitting, head-only fitting with a high step cap
+under the same 20-second budget, and warm-up plus LoRA, in reverse order on the
+second pass. It evaluates each fitted model on reads 8001–12000 (not used to fit
+or select), exports artifacts, and checks an actual 257-read GPU roundtrip with
+full/step integer-CDF verification. Equal budgets need not produce identical
+wall times or update counts. The head-only control uses existing final-step
+selection, while LoRA uses intermediate validation. This is an engineering
+comparison of whole procedures, not an isolated architectural causal claim.
 
-### Sequence experiment result (2026-09-23)
+### LoRA experiment result (2026-09-23)
 
-An isolated A100-PCIE-40GB run with PyTorch 2.0.0+cu118, after CPU regression
-tests finished, used the ABBA procedure above. Both repetitions completed all
-1000 updates, stayed below 20 seconds and produced identical adapter tensors.
+The A100-PCIE-40GB / PyTorch 2.0.0+cu118 paired run used 8000 prefix reads,
+6000 for training and 2000 for validation. The following are means of two
+runs, with no concurrent CPU regression tests. Later evaluation uses the same
+4000 reads (8001–12000) for every trial, not used for fitting/selection.
 
-| Metric | res64 + cross16 | plus sequence branch |
-| --- | ---: | ---: |
-| Mean complete adaptation seconds | 8.777 | 11.298 |
-| Mean optimization seconds | 4.756 | 7.440 |
-| Prefix validation bits/Q | 2.211936662 | 2.211927607 |
-| Reads 8001–12000 bits/Q | 2.246396727 | 2.246663738 |
-| Container adapter bytes | 186496 | 201312 |
+| Procedure | Total fit seconds | Later bits/Q | Improvement vs baseline | Adapter bytes |
+| --- | ---: | ---: | ---: | ---: |
+| res64 + cross16, 1000 updates | 7.473 | 2.246396727 | — | 186496 |
+| Head only, 20s budget | 16.220 | 2.238124534 | 0.368% | 186496 |
+| 1000 head updates + Q/V LoRA, 20s budget | 15.161 | 2.244014612 | 0.106% | 208712 |
 
-The sequence branch added about 2.52 seconds and 14816 container bytes. Its
-later-region bits/Q was 0.0119% worse, not the targeted 1% improvement. The
-tiny prefix validation improvement is not evidence of a useful gain. Both
-adapters are admitted because admission compares to the original base head.
-Keep this experiment disabled by default; a full-file run is not justified by
-this result. This does not rule out other architectures or other datasets.
-Reports and artifacts are in the ignored local directory
-`codec/runs/sequence_head_comparison_20260923_isolated/`; the preceding run
-overlapping CPU tests is retained separately as `sequence_head_comparison_20260923_v1/`.
-All 203 CPU tests and a 257-read GPU byte-exact/full-step CDF roundtrip passed.
+Head-only budget runs completed 3394 and 3295 updates. LoRA completed 360 and
+380 additional updates before the work deadline; both selected step 340 with
+prefix validation 2.209425958 bits/Q (warm-up 2.211936662). The default 1000
+LoRA-step cap is an upper bound, not a promise to complete that many updates.
+Neither variant achieved the targeted 1% reduction. LoRA improved over the
+1000-step baseline but lost to more head-only updates under the same budget.
+No full-file improvement is claimed; the extra 22216 adapter bytes are excluded
+from bits/Q. LoRA remains opt-in and is not recommended as the default.
+
+The initial 200-LoRA-step experiment took 12.821 seconds and yielded
+2.244656012 bits/Q (0.078% gain), motivating the larger-cap budget comparison.
+Reports and exported artifacts remain in ignored local directories
+`codec/runs/lora_comparison_20260923_v1/` and
+`codec/runs/lora_comparison_20260923_budget/` respectively. A 257-read actual
+GPU roundtrip passed byte equality and full/step integer-CDF verification.
 
 ## Experts and encoding
 

@@ -102,6 +102,23 @@ in `history_features`. The isolated `_legacy_quality_history.py` module retains
 that numerical protocol to decode existing files. New training/encoding cannot
 select it, and exported Q-history artifacts are rejected by the encoder.
 
+Adapter v5 was an unsuccessful eight-Q sequence-branch experiment and is no
+longer supported. Use original commit `d73c8b8` for any experimental v5 files;
+version 5 must never be reused for another protocol.
+
+Adapter v6 requires exactly four Transformer blocks. Its envelope has
+`application=replace_head_and_block4_qv`, a nested validated v4 `head`, bounded
+integer `rank` (1..16), and `protocol=block4_qv_rank_major_f64_merge_v1`. Four
+FP32 arrays are transmitted in Q-A [r,D], Q-B [D,r], V-A [r,D], V-B [D,r]
+row-major order using SHA-256-protected base64. `parameter_bytes` counts these
+arrays plus the nested head. Scaling is exactly 1. For each Q/V matrix, decoder
+and encoder accumulate B[:,k]*A[k,:] in increasing rank order using CPU FP64,
+add the original base matrix in FP64, then round once to FP32. K, all biases,
+FFN and normalization weights remain unchanged. The merged model and head,
+not an unmerged training graph, are used for wire validation and coding.
+No additional inference branch or decode-time training is needed. The nested
+head must be v4, preventing recursive envelopes. Physical container remains v3.
+
 Version 2 changes the probability protocol but not the four-section physical
 layout. The default prior is specified in `ONLINE_PRIOR_FORMAT.md`; the optional
 `causal_quality_mixture_v1` profile is specified in `FUSION_VALIDATION.md`.
@@ -153,20 +170,6 @@ The decoder reads exactly the container-declared number of entries from all
 three streams and then requires gzip EOF and the declared uncompressed size.
 Headers must begin with `@`, plus fields with `+`, and non-quality lines must
 have an ending. Only the final quality line may omit its ending.
-
-### Optional causal sequence adapter v5
-
-Adapter schema v5 extends cross-layer v4 with a strictly causal eight-Q
-embedding/convolution branch. `sequence_protocol` must equal
-`q8_embed8_conv5x16_conv4x16_gelu_v1`. The existing tensors are followed by
-embedding [43,8], conv1 weight [16,40], bias [16], conv2 weight [16,64], bias
-[16], projection weight [42,16], bias [42], all transmitted as FP32. Windows
-contain Q[t-8:t] in chronological order, with BOS token 42 at each read start.
-The first kernel processes four overlapping five-token windows; the second
-processes their four outputs. Both use exact GELU. Their output projection is
-added to v4 logits before the unchanged softmax/CDF protocol. The branch never
-uses the target or future Q. Physical container version stays 3; decode uses
-embedded parameters without fitting. Unknown sequence protocols are rejected.
 
 ## Quality stream and batching
 

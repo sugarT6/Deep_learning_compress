@@ -20,8 +20,7 @@ import torch
 from torch.nn import functional as F
 
 from .fastq_stream import encode_base_ids, iter_fastq_records, make_fastq_batch
-from .model import (CausalSequenceOutputHead, CrossLayerOutputHead, ResidualOutputHead,
-                    causal_quality_windows, fastq_batch_to_tensors)
+from .model import CrossLayerOutputHead, ResidualOutputHead, fastq_batch_to_tensors
 from .probability_quantization import logits_to_cdfs
 from .encode_fastpath import selected_quantized_bits
 
@@ -45,11 +44,21 @@ class HeadAdaptationConfig:
     residual_dim: int = 32
     cross_layer: bool = False
     cross_dim: int = 16
-    sequence_branch: bool = False
+    lora: bool = False
+    lora_rank: int = 4
+    lora_steps: int = 1000
+    lora_learning_rate: float = 0.0003
 
     def __post_init__(self):
-        if type(self.sequence_branch) is not bool or (self.sequence_branch and not self.cross_layer):
-            raise ValueError("sequence_branch requires cross_layer and a boolean flag")
+        if type(self.lora) is not bool or (self.lora and not self.cross_layer):
+            raise ValueError("lora requires cross_layer and a boolean flag")
+        if type(self.lora_rank) is not int or not 1 <= self.lora_rank <= 16:
+            raise ValueError("lora_rank must be in [1, 16]")
+        if type(self.lora_steps) is not int or self.lora_steps < 1:
+            raise ValueError("lora_steps must be positive")
+        if (isinstance(self.lora_learning_rate, bool) or not isinstance(self.lora_learning_rate, (float, int))
+                or not math.isfinite(self.lora_learning_rate) or self.lora_learning_rate <= 0):
+            raise ValueError("invalid lora_learning_rate")
         if type(self.cross_layer) is not bool or (self.cross_layer and self.head_type != "residual"):
             raise ValueError("cross_layer requires a residual head and a boolean flag")
         if type(self.cross_dim) is not int or not 1 <= self.cross_dim <= 128:
@@ -78,20 +87,14 @@ def _head_parameters(head):
         parameters.extend((head.down.weight, head.down.bias, head.up.weight, head.up.bias))
     if isinstance(head, CrossLayerOutputHead):
         parameters.extend((head.cross_down.weight, head.cross_down.bias, head.cross_up.weight, head.cross_up.bias))
-    if isinstance(head, CausalSequenceOutputHead):
-        parameters.extend((head.sequence_embedding.weight, head.sequence_conv1.weight,
-                           head.sequence_conv1.bias, head.sequence_conv2.weight, head.sequence_conv2.bias,
-                           head.sequence_up.weight, head.sequence_up.bias))
     return parameters
 
 
-def _new_head(d_model, residual_dim, *, device, dtype, seed=0, cross_dim=None, sequence_branch=False):
+def _new_head(d_model, residual_dim, *, device, dtype, seed=0, cross_dim=None):
     # Initialization runs on CPU with an isolated RNG, including during decode.
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
-        if sequence_branch:
-            head = CausalSequenceOutputHead(d_model, residual_dim, cross_dim)
-        elif cross_dim is not None:
+        if cross_dim is not None:
             head = CrossLayerOutputHead(d_model, residual_dim, cross_dim)
         else:
             head = (ResidualOutputHead(d_model, residual_dim) if residual_dim is not None
@@ -125,30 +128,28 @@ def serialize_head(head, base_sha256):
                         layout=metadata["layout"] + "_cross_down_weight_cross_down_bias_cross_up_weight_cross_up_bias")
         for name, array in zip(("cross_down_weight_shape", "cross_down_bias_shape", "cross_up_weight_shape", "cross_up_bias_shape"), arrays[6:]):
             metadata[name] = list(array.shape)
-    if isinstance(head, CausalSequenceOutputHead):
-        metadata.update(version=5, sequence_protocol="q8_embed8_conv5x16_conv4x16_gelu_v1",
-                        layout=metadata["layout"] + "_sequence_embedding_conv1_weight_bias_conv2_weight_bias_up_weight_bias")
     return metadata
 
 
 def validate_head_adapter(metadata, d_model, base_sha256):
     """Validate bounded plain data before allocating model tensors; no pickle."""
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 6:
+        from .lora_adapter import validate_lora_adapter
+        return validate_lora_adapter(metadata, d_model, base_sha256)
     keys = {"format", "version", "dtype", "layout", "application", "base_checkpoint_sha256",
             "weight_shape", "bias_shape", "parameter_bytes", "sha256", "data_base64"}
     if not isinstance(metadata, dict):
         raise ValueError("adapter fields missing or unknown")
     version = metadata.get("version")
-    if type(version) is not int or version not in (1, 2, 3, 4, 5):
+    if type(version) is not int or version not in (1, 2, 3, 4):
         raise ValueError("unsupported adapter version")
     if version >= 2:
         keys.update(("residual_dim", "activation", "down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"))
     if version == 3:
         keys.add("history_features")
-    if version >= 4:
+    if version == 4:
         keys.update(("cross_dim", "source_layer", "source_normalization", "source_eps",
                      "cross_down_weight_shape", "cross_down_bias_shape", "cross_up_weight_shape", "cross_up_bias_shape"))
-    if version == 5:
-        keys.add("sequence_protocol")
     if set(metadata) != keys:
         raise ValueError("adapter fields missing or unknown")
     if version == 3:
@@ -156,12 +157,8 @@ def validate_head_adapter(metadata, d_model, base_sha256):
         validate_history_feature_schema(metadata["history_features"])
     layout = ("weight_row_major_then_bias" if version == 1 else
               "weight_bias_down_weight_down_bias_up_weight_up_bias")
-    if version >= 4:
+    if version == 4:
         layout += "_cross_down_weight_cross_down_bias_cross_up_weight_cross_up_bias"
-    if version == 5:
-        layout += "_sequence_embedding_conv1_weight_bias_conv2_weight_bias_up_weight_bias"
-        if metadata["sequence_protocol"] != "q8_embed8_conv5x16_conv4x16_gelu_v1":
-            raise ValueError("invalid causal sequence protocol")
     if (metadata["format"] != ADAPTER_FORMAT or metadata["dtype"] != "little_endian_float32"
             or metadata["layout"] != layout
             or metadata["application"] != "replace_output_head"):
@@ -176,7 +173,7 @@ def validate_head_adapter(metadata, d_model, base_sha256):
         input_dim = d_model + (8 if version == 3 else 0)
         shapes.extend((("down_weight_shape", [width, input_dim]), ("down_bias_shape", [width]),
                        ("up_weight_shape", [42, width]), ("up_bias_shape", [42])))
-    if version >= 4:
+    if version == 4:
         width = metadata["cross_dim"]
         if (type(width) is not int or not 1 <= width <= 128
                 or type(metadata["source_layer"]) is not int or metadata["source_layer"] != 3
@@ -192,8 +189,6 @@ def validate_head_adapter(metadata, d_model, base_sha256):
     if metadata["base_checkpoint_sha256"] != base_sha256:
         raise ValueError("adapter base checkpoint SHA-256 mismatch")
     size = sum(math.prod(shape) for _, shape in shapes) * 4
-    if version == 5:
-        size += (43 * 8 + 16 * 40 + 16 + 16 * 64 + 16 + 42 * 16 + 42) * 4
     encoded = metadata["data_base64"]
     if (type(metadata["parameter_bytes"]) is not int or metadata["parameter_bytes"] != size
             or not isinstance(encoded, str) or len(encoded) != 4 * ((size + 2) // 3)):
@@ -219,7 +214,7 @@ def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
         head = head.to(device=device, dtype=dtype)
     else:
         head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype,
-                         cross_dim=metadata.get("cross_dim"), sequence_branch=metadata["version"] == 5)
+                         cross_dim=metadata.get("cross_dim"))
     offset = 0
     with torch.no_grad():
         for parameter in _head_parameters(head):
@@ -230,7 +225,10 @@ def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
 
 
 def apply_head_adapter(model, metadata, base_sha256):
-    if isinstance(metadata, dict) and metadata.get("version") in (4, 5) and model.config.num_layers < 4:
+    if isinstance(metadata, dict) and metadata.get("version") == 6:
+        from .lora_adapter import apply_lora_adapter
+        return apply_lora_adapter(model, metadata, base_sha256)
+    if isinstance(metadata, dict) and metadata.get("version") == 4 and model.config.num_layers < 4:
         raise ValueError("cross-layer adapter requires at least 4 Transformer layers")
     original = model.output_head
     head = _restore_head(metadata, model.config.d_model, base_sha256,
@@ -238,6 +236,10 @@ def apply_head_adapter(model, metadata, base_sha256):
     head.train(original.training)
     head.requires_grad_(original.weight.requires_grad)
     head.bias.requires_grad_(original.bias.requires_grad)
+    if hasattr(model, "_lora_original_qkv"):
+        with torch.no_grad():
+            model.transformer.layers[3].self_attn.in_proj_weight.copy_(model._lora_original_qkv)
+        del model._lora_original_qkv
     model.output_head = head
 
 
@@ -247,6 +249,10 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
     Prefix split is by whole reads (first 75% train, last 25% validation).
     Admission tests neural quantized bits, not hybrid or whole-file savings.
     """
+    if config.lora:
+        from .lora_adapter import adapt_last_layer
+        return adapt_last_layer(model, source, device=device, batch_reads=batch_reads,
+                               total=total, base_sha256=base_sha256, config=config)
     if getattr(model.output_head, "decode_only", False):
         raise ValueError("Q-history adapters are retired and cannot be fine-tuned")
     if config.cross_layer and model.config.num_layers < 4:
@@ -317,8 +323,7 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
             report[name + "_symbols"] = n
             if not n:
                 return finish()
-            feature_dim = model.config.d_model * (2 if config.cross_layer else 1) + (8 if config.sequence_branch else 0)
-            features = torch.empty((n, feature_dim), dtype=torch.float32, device=device)
+            features = torch.empty((n, model.config.d_model * (2 if config.cross_layer else 1)), dtype=torch.float32, device=device)
             labels = torch.empty(n, dtype=torch.long, device=device)
             offset = 0
             for begin in range(0, len(subset), batch_reads):
@@ -333,8 +338,6 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
                 with torch.no_grad():
                     h = (model.forward_cross_layer_features(**tensors) if config.cross_layer
                          else model.forward_features(**tensors))
-                    if config.sequence_branch:
-                        h = torch.cat((h, causal_quality_windows(tensors["qualities"]).to(h.dtype)), dim=-1)
                     active = tensors["active_mask"]
                     count = int(batch.active_mask.sum())
                     features[offset:offset + count].copy_(h[active])
@@ -347,8 +350,7 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         if config.head_type == "residual":
             head = _new_head(model.config.d_model, config.residual_dim, device=device,
                              dtype=model.output_head.weight.dtype, seed=config.seed,
-                             cross_dim=config.cross_dim if config.cross_layer else None,
-                             sequence_branch=config.sequence_branch)
+                             cross_dim=config.cross_dim if config.cross_layer else None)
             with torch.no_grad():
                 head.weight.copy_(model.output_head.weight)
                 head.bias.copy_(model.output_head.bias)

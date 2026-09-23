@@ -74,81 +74,91 @@ def rewrite_metadata(source, target, change, physical=None):
 
 
 class HeadAdapterTest(unittest.TestCase):
-    def test_sequence_windows_causality_and_seeded_zero_start(self):
-        from codec.model import CausalSequenceOutputHead, causal_quality_windows
+    def test_lora_wire_roundtrip_idempotence_and_rejection(self):
+        from codec.lora_adapter import QVLoRA, serialize_lora
         from codec.head_adapter import _new_head
-        q = torch.arange(12).reshape(1, 12)
-        windows = causal_quality_windows(q)
-        self.assertEqual(windows[0, 0].tolist(), [42] * 8)
-        self.assertEqual(windows[0, 9].tolist(), list(range(1, 9)))
-        altered = q.clone()
-        altered[:, 5:] = 41
-        self.assertTrue(torch.equal(windows[:, :6], causal_quality_windows(altered)[:, :6]))
-        self.assertEqual(tuple(causal_quality_windows(q[:, :0]).shape), (1, 0, 8))
-        kw = dict(device="cpu", dtype=torch.float32, seed=123, cross_dim=16)
-        baseline = _new_head(8, 64, **kw)
-        head = _new_head(8, 64, sequence_branch=True, **kw)
-        self.assertIsInstance(head, CausalSequenceOutputHead)
-        for name, value in baseline.state_dict().items():
-            self.assertTrue(torch.equal(value, head.state_dict()[name]))
-        h = torch.randn(1, 12, 16)
-        self.assertTrue(torch.equal(baseline(h), head.forward_with_quality(h, q, None)))
-        with torch.no_grad():
-            head.sequence_up.weight.normal_()
-        left = head.forward_with_quality(h, q, None)
-        right = head.forward_with_quality(h, altered, None)
-        self.assertTrue(torch.equal(left[:, :6], right[:, :6]))
-        self.assertFalse(torch.equal(left[:, 6:], right[:, 6:]))
-
-    def test_sequence_fit_roundtrip_serialization_and_frozen_backbone(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model, ckpt = model_and_checkpoint(root, num_layers=4)
+            digest = sha256_file(ckpt)
             original = copy.deepcopy(model)
-            source, raw = source_file(root)
-            cfg = config(head_type="residual", cross_layer=True, sequence_branch=True)
-            kw = dict(device=torch.device("cpu"), batch_reads=8, total=65536,
-                      base_sha256=sha256_file(ckpt), config=cfg)
-            rng = torch.get_rng_state().clone()
-            adapter, report = adapt_output_head(model, source, **kw)
-            self.assertTrue(report["accepted"])
-            self.assertEqual(adapter["version"], 5)
-            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
-            self.assertGreater(model.output_head.sequence_up.weight.abs().sum().item(), 0)
+            base_head = serialize_head(model.output_head, digest)
+            head = _new_head(8, 16, cross_dim=4, device="cpu", dtype=torch.float32)
+            lora = QVLoRA(8, 4, 123)
+            with torch.no_grad():
+                lora.qb.normal_(std=0.03)
+                lora.vb.normal_(std=0.03)
+            adapter = serialize_lora(head, lora, digest)
+            self.assertEqual(adapter["version"], 6)
+            self.assertEqual(adapter["parameter_bytes"], adapter["head"]["parameter_bytes"] + 512)
+            apply_head_adapter(model, adapter, digest)
+            once = copy.deepcopy(model.state_dict())
+            self.assertTrue(torch.equal(original.transformer.layers[3].self_attn.in_proj_weight[8:16],
+                                        model.transformer.layers[3].self_attn.in_proj_weight[8:16]))
+            apply_head_adapter(model, adapter, digest)
+            for name, value in once.items():
+                self.assertTrue(torch.equal(value, model.state_dict()[name]))
             for name, value in original.state_dict().items():
-                if not name.startswith("output_head."):
+                if not name.startswith("output_head.") and name != "transformer.layers.3.self_attn.in_proj_weight":
                     self.assertTrue(torch.equal(value, model.state_dict()[name]), name)
-            twin, _ = adapt_output_head(copy.deepcopy(original), source, **kw)
-            self.assertEqual(adapter, twin)
-            for change in ({"sequence_protocol": "future_q"}, {"version": 4},
-                           {"parameter_bytes": adapter["parameter_bytes"] - 4}):
+            apply_head_adapter(model, base_head, digest)
+            for name, value in original.state_dict().items():
+                self.assertTrue(torch.equal(value, model.state_dict()[name]), name)
+            for change in ({"rank": True}, {"rank": 17}, {"protocol": "other"}, {"head": adapter},
+                           {"sha256": "0"*64}, {"parameter_bytes": 1}):
                 with self.assertRaises(ValueError):
-                    validate_head_adapter(dict(adapter, **change), 8, sha256_file(ckpt))
-            artifact = root / "sequence.json"
+                    validate_head_adapter(dict(adapter, **change), 8, digest)
+            source, raw = source_file(root)
+            artifact = root / "lora.json"
             artifact.write_text(json.dumps(dict(format="direct-quality-head-adaptation-artifact",
-                version=1, base_checkpoint_sha256=sha256_file(ckpt), adapter=adapter, report={})))
-            target = root / "sequence.fqdc"
-            io_kw = dict(device=torch.device("cpu"), batch_reads=8, progress=False, verify_cdf=True)
-            encode_fastq(source, target, ckpt, **io_kw, head_adapter_path=artifact)
-            self.assertEqual(read_container(target).metadata["head_adapter"]["version"], 5)
+                version=1, base_checkpoint_sha256=digest, adapter=adapter, report={})))
+            target = root / "lora.fqdc"
+            kw = dict(device=torch.device("cpu"), batch_reads=8, progress=False, verify_cdf=True)
+            encode_fastq(source, target, ckpt, **kw, head_adapter_path=artifact)
             artifact.unlink()
             restored = root / "restored.fq"
-            decode_fastq(target, restored, ckpt, **io_kw)
+            decode_fastq(target, restored, ckpt, **kw)
             self.assertEqual(raw, restored.read_bytes())
 
-    def test_sequence_cli_and_config_guards(self):
-        for overrides in (dict(sequence_branch=True), dict(sequence_branch=1),
-                          dict(sequence_branch=True, cross_layer=True, head_type="linear")):
+    def test_lora_fit_budget_and_frozen_backbone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, ckpt = model_and_checkpoint(root, num_layers=4)
+            source, _ = source_file(root)
+            original = copy.deepcopy(model.state_dict())
+            rng = torch.get_rng_state().clone()
+            adapter, report = adapt_output_head(model, source, device=torch.device("cpu"), batch_reads=8,
+                total=65536, base_sha256=sha256_file(ckpt),
+                config=config(head_type="residual", cross_layer=True, lora=True, lora_steps=40))
+            self.assertIsNotNone(adapter)
+            self.assertEqual(report["lora_steps_completed"], 40)
+            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+            self.assertTrue(model.training)
+            for name, value in original.items():
+                if not name.startswith("output_head.") and name != "transformer.layers.3.self_attn.in_proj_weight":
+                    self.assertTrue(torch.equal(value, model.state_dict()[name]), name)
+            self.assertIn(report["lora_selected_step"], (0, 20, 40))
+            tiny, ckpt = model_and_checkpoint(root, num_layers=4)
+            rejected, timed = adapt_output_head(tiny, source, device=torch.device("cpu"), batch_reads=8,
+                total=65536, base_sha256=sha256_file(ckpt),
+                config=config(head_type="residual", cross_layer=True, lora=True, max_seconds=1e-12))
+            self.assertIsNone(rejected)
+            self.assertEqual(timed["lora_steps_completed"], 0)
+
+    def test_lora_cli_guards_and_sequence_removal(self):
+        from codec.encode import build_parser
+        for overrides in (dict(lora=True), dict(lora_rank=17), dict(lora_steps=0), dict(lora_learning_rate=float("nan"))):
             with self.assertRaises(ValueError):
                 config(**overrides)
         common = ["codec.encode", "in.fq", "out.fqdc", "base.pt"]
-        with mock.patch("sys.argv", common + ["--head-sequence-branch"]), self.assertRaises(SystemExit):
+        with mock.patch("sys.argv", common + ["--head-lora"]), self.assertRaises(SystemExit):
             main()
-        flags = ["--finetune-head", "--head-type", "residual", "--head-cross-layer", "--head-sequence-branch"]
-        with mock.patch("sys.argv", common + flags), mock.patch("codec.encode.encode_fastq") as encode, mock.patch("builtins.print"):
-            encode.return_value.to_dict.return_value = {}
-            main()
-            self.assertTrue(encode.call_args.kwargs["head_adaptation_config"].sequence_branch)
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            build_parser().parse_args(common[1:] + ["--head-sequence-branch"])
+        with self.assertRaises(TypeError):
+            config(sequence_branch=True)
+        with self.assertRaises(ValueError):
+            validate_head_adapter({"version": 5}, 8, "0"*64)
 
     def test_frozen_backbone_whole_read_split_and_determinism(self):
         with tempfile.TemporaryDirectory() as directory:

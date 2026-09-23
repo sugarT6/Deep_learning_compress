@@ -669,8 +669,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="residual hidden width (1..128); requires --head-type residual")
     parser.add_argument("--head-cross-layer", action="store_true", help="add a trainable branch from frozen block 3; requires residual head")
     parser.add_argument("--head-cross-dim", type=int, default=16, help="cross-layer branch width (1..128)")
-    parser.add_argument("--head-sequence-branch", action="store_true",
-        help="learn a causal eight-Q convolution branch; requires --head-cross-layer")
+    parser.add_argument("--head-lora", action="store_true", help="adapt final-layer Q/V after fitting cross-layer head")
+    parser.add_argument("--head-lora-rank", type=int, default=4)
+    parser.add_argument("--head-lora-steps", type=int, default=1000, help="maximum extra sequence updates within total budget")
+    parser.add_argument("--head-lora-learning-rate", type=float, default=0.0003)
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -682,6 +684,8 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         head_config = None
+        if not args.head_lora and (args.head_lora_rank != 4 or args.head_lora_steps != 1000 or args.head_lora_learning_rate != 0.0003):
+            raise ValueError("--head-lora-* requires --head-lora")
         if args.head_cross_dim != 16 and not args.head_cross_layer:
             raise ValueError("--head-cross-dim requires --head-cross-layer")
         if args.head_residual_dim != 32 and args.head_type != "residual":
@@ -694,11 +698,13 @@ def main() -> int:
                 min_gain_bits_per_quality=args.head_min_gain, seed=args.head_seed,
                 head_type=args.head_type, residual_dim=args.head_residual_dim,
                 cross_layer=args.head_cross_layer, cross_dim=args.head_cross_dim,
-                sequence_branch=args.head_sequence_branch)
+                lora=args.head_lora, lora_rank=args.head_lora_rank, lora_steps=args.head_lora_steps,
+                lora_learning_rate=args.head_lora_learning_rate)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
             "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",
-            "head_type", "head_residual_dim", "head_cross_layer", "head_cross_dim", "head_sequence_branch")):
+            "head_type", "head_residual_dim", "head_cross_layer", "head_cross_dim",
+            "head_lora", "head_lora_rank", "head_lora_steps", "head_lora_learning_rate")):
             raise ValueError("--head-* training options require --finetune-head")
         statistics = encode_fastq(
             args.input,
