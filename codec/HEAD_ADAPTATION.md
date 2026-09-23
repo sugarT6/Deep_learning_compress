@@ -69,43 +69,6 @@ The extra computation affects both fitting and inference. A 20-second budget
 is still cooperative, not a hard guarantee. Inspect `steps_completed` and
 `budget_exceeded`; compare total time as well as quality-plus-adapter bytes.
 
-## Optional strict-prefix Q features
-
-Add `--head-history-features` to `--finetune-head --head-type residual`. This
-changes only the residual input from `h` to `[h, s]`; the linear path still sees
-the original 256-dimensional `h`, and the backbone/checkpoint/features remain
-unchanged. There is no online expert, count table, or cross-read state.
-
-`s` has eight FP32 scalars at zero-based cycle t, in this exact wire order:
-
-1. Exact `q[t-2]/41`, or -1 when t < 2.
-2. Exact `q[t-3]/41`, or -1 when t < 3.
-3. `(q[t-1]-q[t-2])/41`, or zero when t < 2.
-4. Mean of `q[:t]`, divided by 41 (zero for empty history).
-5. Population standard deviation of `q[:t]`, divided by 41 (zero for empty).
-6. Mean of the last min(t,8) past Q values, divided by 41 (zero for empty).
-7. Feature 6 minus feature 4.
-8. `min(t,8)/8`, an available-history marker.
-
-Current/future qualities are excluded. Padding outputs are zero. Prefix sums
-and sums of squares use int64, including the variance numerator `n*S2-S*S`,
-before FP32 division and square root; this avoids floating-point scan order
-differences between full and step inference. The exact implementation and
-versioned schema live in `quality_history_features.py` and are shared by
-training, encoding and decoding.
-
-Features are computed once per prefix feature batch and cached with `h` for
-all updates. At 1.2 million active qualities the eight added features use
-38.4 MB of extra cache. For residual width 32, only 256 parameters are added:
-total 20660 parameters / 82640 raw bytes. New input columns start at zero;
-the seeded original residual h-weights/biases are preserved. All head tensors
-are trained with the unchanged optimizer and anchor penalty. Deadline, split,
-steps, and final-only admission remain unchanged. The gate still compares
-against the unadapted base, not against an independently fitted residual head.
-
-This is opt-in and is not assumed to improve compression. Both codec ends must
-understand the new adapter schema; no external feature file is required.
-
 ## Experts and encoding
 
 All production encoding is now **neural-only**, with or without head fitting.
@@ -142,13 +105,6 @@ The residual head uses **adapter version 2 inside physical container version
 extra tensors. All six tensors are serialized and restored before admission
 scoring and formal inference. Old linear adapters remain readable; older
 decoders without adapter-v2 support reject the new format. Update both ends.
-
-**Adapter v3** adds the strict `history_features` schema (`causal_q_summary`,
-version 1) and widens `down_weight_shape` to `[r,d_model+8]`. The tensor order,
-activation, and physical container version 3 are unchanged. Unknown feature
-orders, normalization, window sizes, or rules are rejected. Adapter versions
-1/2 remain readable. This is unrelated to the retired four-expert profile v3;
-`probability_profile` remains null for all current encodes.
 
 For the production d_model=256 model, raw head size is 43176 bytes. Base64 and
 metadata make the actual container overhead approximately 58 KB; **raw FP32
@@ -221,24 +177,6 @@ For a fresh linear control, replace `--head-type residual --head-residual-dim
 When reusing an exported residual head, supply only `--head-adapter FILE`;
 the head type/width are restored from the artifact, not from training flags.
 
-To test the added Q features without overwriting the previous experiment:
-
-```bash
-CUDA_VISIBLE_DEVICES=3 python -m codec.encode \
-  data/2nd/CNR0847462_1.head2M.fastq.gz \
-  codec/output/CNR0847462_head8k_s1000_res32_qhist_20260922.fqdc \
-  codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
-  --device cuda --batch-reads 256 \
-  --finetune-head --head-type residual --head-residual-dim 32 \
-  --head-history-features \
-  --head-max-reads 8000 --head-max-symbols 1200000 \
-  --head-steps 1000 --head-max-seconds 20 \
-  --save-head-adapter codec/output/CNR0847462_head8k_s1000_res32_qhist_20260922.adapter.json
-```
-
-Decode with the updated decoder and base checkpoint as above, using the new
-container/output paths; no feature flag or external adapter is needed.
-
 The 8000-read/1000-update command is the current single-file engineering test,
 not a newly calibrated global default. The CLI defaults above remain unchanged.
 `--head-max-symbols` caps the entire sampled prefix (training plus validation),
@@ -292,11 +230,28 @@ integer CDF agreement and byte-exact restoration, after the test-owned external
 adapter export was removed. The embedded adapter overhead was 109443 bytes.
 No full-file compression was launched for this check.
 
-The eight-Q-feature extension, with the same prefix/seed/1000-update budget,
-completed in 6.647 s (optimization 2.767 s), scoring 2.2195841372 bits/Q on the
-same validation reads. This is slightly worse than 2.2194215204 without the
-features, not evidence of improved whole-file compression. All 1000 updates
-completed, no budget overrun; embedded adapter overhead was 111128 bytes.
-The 257-read real-checkpoint GPU full/step CDF and byte-exact round trip passed
-without an external adapter file. The implementation remains an opt-in
-ablation; no hyperparameter search was performed against this file.
+### Retired Q-history experiment (2026-09-23)
+
+The follow-up eight-feature Q-history experiment is no longer an encoding or
+training option. On CNR0847462 (2M reads / 300M qualities, 8000-read prefix,
+1000 updates, residual width 32), the user's complete-file results were:
+
+- Residual only: 76814552 quality-plus-adapter bytes; 2828.850 s encoding.
+- With Q-history: 76820775 quality-plus-adapter bytes; 2822.309 s encoding.
+- Q-history added 6223 bytes: 4538 quality-stream bytes and 1685 adapter bytes.
+  The roughly 6.5-second timing difference is not evidence of a reliable speedup.
+
+The `history_features` fitting configuration, feature-cache concatenation,
+CLI flag and training-specific tests were removed. `--head-history-features`
+and loading a Q-history artifact for new encoding fail explicitly. Current
+heads use only the original 256-dimensional frozen features. Existing adapter
+v3 containers are still decoded with the unchanged feature formulas in the
+isolated `_legacy_quality_history.py` compatibility module. Its regression
+tests remain; no generated containers/artifacts or user data were deleted.
+The complete historical implementation remains in Git commit `d9bedd4`.
+
+Next proposed ablation (not run or promoted to a default): compare residual
+widths 32 and 64 with the same 8000-read prefix, 1000 updates, seed and 20-second
+budget. Then, separately, assess update count if useful. Use training-dataset
+validation for global choices and later diagnostic regions before full-file
+timing; one observed unseen file must not become a claimed blind benchmark.

@@ -1,11 +1,34 @@
-"""Small, decoder-reconstructible features of the strict same-read Q prefix."""
+"""Decode-only compatibility for retired Q-history adapters (wire version 3).
+
+Do not use this module for new training or encoding experiments.
+"""
 
 import json
 
 import torch
+from torch.nn import functional as F
+
+from .model import ResidualOutputHead
 
 
 HISTORY_FEATURE_DIM = 8
+
+
+class LegacyHistoryHead(ResidualOutputHead):
+    """Only instantiated when restoring an existing adapter-v3 container."""
+
+    decode_only = True
+
+    def __init__(self, d_model, residual_dim):
+        super().__init__(d_model, residual_dim)
+        self.down = torch.nn.Linear(d_model + HISTORY_FEATURE_DIM, residual_dim)
+
+    def forward(self, packed):
+        return F.linear(packed[..., :self.in_features], self.weight, self.bias) + self.up(
+            F.gelu(self.down(packed), approximate="none"))
+
+    def forward_with_quality(self, hidden, qualities, active_mask):
+        return self(torch.cat((hidden, quality_history_features(qualities, active_mask)), dim=-1))
 
 
 def history_feature_schema():

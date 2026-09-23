@@ -11,7 +11,6 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .quality_history_features import HISTORY_FEATURE_DIM, quality_history_features
 
 from .fastq_stream import (
     BASE_ALPHABET_SIZE,
@@ -296,26 +295,15 @@ class ResidualOutputHead(nn.Linear):
     projection makes the initial function exactly the supplied linear head.
     """
 
-    def __init__(self, d_model: int, residual_dim: int, history_features: bool = False):
+    def __init__(self, d_model: int, residual_dim: int):
         super().__init__(d_model, QUALITY_ALPHABET_SIZE)
         self.down = nn.Linear(d_model, residual_dim)
         self.up = nn.Linear(residual_dim, QUALITY_ALPHABET_SIZE)
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
-        self.history_features = history_features
-        if history_features:
-            # Preserve the exact seeded h-only initialization for controlled
-            # comparisons. New feature columns start at zero but are trainable.
-            expanded = nn.Linear(d_model + HISTORY_FEATURE_DIM, residual_dim)
-            with torch.no_grad():
-                expanded.weight.zero_()
-                expanded.weight[:, :d_model].copy_(self.down.weight)
-                expanded.bias.copy_(self.down.bias)
-            self.down = expanded
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        linear_input = hidden[..., :self.in_features] if self.history_features else hidden
-        return F.linear(linear_input, self.weight, self.bias) + self.up(
+        return F.linear(hidden, self.weight, self.bias) + self.up(
             F.gelu(self.down(hidden), approximate="none")
         )
 
@@ -464,9 +452,11 @@ class DirectQualityTransformer(nn.Module):
 
     def _forward_impl(self, bases, qualities, lengths, active_mask):
         hidden = self._hidden_impl(bases, qualities, lengths, active_mask)
-        if getattr(self.output_head, "history_features", False):
-            hidden = torch.cat((hidden, quality_history_features(qualities, active_mask)), dim=-1)
-        logits = self.output_head(hidden)
+        # Historical container heads may require decoder-known context. Normal
+        # linear/residual heads never implement or execute this compatibility hook.
+        contextual_head = getattr(self.output_head, "forward_with_quality", None)
+        logits = (self.output_head(hidden) if contextual_head is None
+                  else contextual_head(hidden, qualities, active_mask))
         return logits * active_mask.unsqueeze(-1).to(logits.dtype)
 
     def forward_features(self, bases, qualities, lengths, active_mask):

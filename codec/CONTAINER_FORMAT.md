@@ -80,18 +80,19 @@ the complete existing prior profile is validated. Versions 1 and 2 reject any
 is unchanged. After loading the base checkpoint, both codec ends replace its
 output head with the exact stored parameters. The decoder never fits a model.
 
-Three head-adapter schemas are supported: adapter v1 replaces the linear weight
+Two head-adapter schemas are produced: adapter v1 replaces the linear weight
 and bias; adapter v2 replaces those plus a 256-to-r-to-42 residual MLP (the input
 dimension follows the checkpoint). The residual activation is exact GELU;
 the bounded width, all tensor shapes, ordering, and six FP32 tensors are
-transmitted. Adapter v3 additionally feeds eight strict-prefix Q features into
-the residual branch. Their order, normalization, missing-history behavior,
-window size and integer-prefix accumulation contract are versioned in
-`history_features`; down-projection width is `d_model+8`. The linear path and
-base checkpoint feature schema stay unchanged. All use physical container v3.
-Unknown adapter versions,
+transmitted. Both use physical container v3. Unknown adapter versions,
 activations or layouts are rejected, including by older decoders. External
 adapter JSON exports are not decoding dependencies. See `HEAD_ADAPTATION.md`.
+
+Historical adapter v3 (not expert profile v3) is decode-only. It widened the
+residual input by eight strict-prefix Q features and stored their exact schema
+in `history_features`. The isolated `_legacy_quality_history.py` module retains
+that numerical protocol to decode existing files. New training/encoding cannot
+select it, and exported Q-history artifacts are rejected by the encoder.
 
 Version 2 changes the probability protocol but not the four-section physical
 layout. The default prior is specified in `ONLINE_PRIOR_FORMAT.md`; the optional

@@ -328,6 +328,8 @@ def _encode_fastq_compat(
                 raise ValueError("invalid adapter artifact or base checkpoint mismatch")
             adapter = artifact["adapter"]
             if adapter is not None:
+                if isinstance(adapter, dict) and adapter.get("version") == 3:
+                    raise ValueError("Q-history adapters are retired: decode old containers only; use a linear or residual adapter")
                 apply_head_adapter(model, adapter, checkpoint_sha256)
             adaptation_report = {"accepted": adapter is not None, "reason": "loaded_artifact",
                                  "artifact_source": artifact.get("source"), "original_report": artifact["report"]}
@@ -616,6 +618,8 @@ class _NeuralEncoderParser(argparse.ArgumentParser):
         supplied = list(sys.argv[1:] if args is None else args)
         for token in supplied:
             option = token.split("=", 1)[0]
+            if option == "--head-history-features":
+                self.error("--head-history-features has been retired; use --head-type residual without Q-history features")
             if option in ("--adaptive-weights", "--probability-profile") or option.startswith("--prior-"):
                 self.error(f"{option} has been retired: encoding is pure neural. "
                            "Old expert containers remain decodable; historical v3 batch commands "
@@ -663,8 +667,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="fitted output head: linear baseline or linear + small GELU residual")
     parser.add_argument("--head-residual-dim", type=int, default=32,
         help="residual hidden width (1..128); requires --head-type residual")
-    parser.add_argument("--head-history-features", action="store_true",
-        help="append 8 strict-prefix Q features to the residual branch; requires --finetune-head --head-type residual")
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -684,12 +686,11 @@ def main() -> int:
                 symbols_per_step=args.head_symbols_per_step, learning_rate=args.head_learning_rate,
                 anchor_strength=args.head_anchor_strength, max_seconds=args.head_max_seconds,
                 min_gain_bits_per_quality=args.head_min_gain, seed=args.head_seed,
-                head_type=args.head_type, residual_dim=args.head_residual_dim,
-                history_features=args.head_history_features)
+                head_type=args.head_type, residual_dim=args.head_residual_dim)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
             "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",
-            "head_type", "head_residual_dim", "head_history_features")):
+            "head_type", "head_residual_dim")):
             raise ValueError("--head-* training options require --finetune-head")
         statistics = encode_fastq(
             args.input,

@@ -4,7 +4,7 @@ import unittest
 import numpy as np
 import torch
 
-from codec.quality_history_features import (
+from codec._legacy_quality_history import (
     history_feature_schema, quality_history_features, validate_history_feature_schema,
 )
 

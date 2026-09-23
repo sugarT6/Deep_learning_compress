@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import struct
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import zlib
@@ -24,7 +25,6 @@ from codec.head_adapter import (
 )
 from codec.model import DirectQualityModelConfig, DirectQualityTransformer, ResidualOutputHead, fastq_batch_to_tensors
 from codec.running_delta import RunningDeltaPriorConfig
-from codec.quality_history_features import quality_history_features
 
 
 def model_and_checkpoint(root):
@@ -272,8 +272,7 @@ class HeadAdapterTest(unittest.TestCase):
         for override in ({"steps": True}, {"max_seconds": float("nan")}, {"max_seconds": 0},
                          {"max_reads": 3}, {"learning_rate": 0}, {"anchor_strength": -1},
                          {"head_type": "unknown"}, {"residual_dim": 0}, {"residual_dim": 129},
-                         {"residual_dim": True}, {"history_features": True},
-                         {"head_type": "residual", "history_features": 1}):
+                         {"residual_dim": True}):
             with self.assertRaises(ValueError):
                 config(**override)
 
@@ -407,104 +406,63 @@ class HeadAdapterTest(unittest.TestCase):
             with mock.patch("sys.argv", common + flags), self.assertRaises(SystemExit):
                 main()
 
-    def test_history_head_initialization_and_wire_restore(self):
-        with tempfile.TemporaryDirectory() as directory:
-            model, ckpt = model_and_checkpoint(Path(directory))
-            torch.manual_seed(17)
-            baseline = ResidualOutputHead(8, 32)
-            torch.manual_seed(17)
-            head = ResidualOutputHead(8, 32, history_features=True)
-            for name in ("weight", "bias"):
-                self.assertTrue(torch.equal(getattr(baseline, name), getattr(head, name)))
-            self.assertTrue(torch.equal(baseline.down.weight, head.down.weight[:, :8]))
-            self.assertTrue(torch.equal(baseline.down.bias, head.down.bias))
-            self.assertEqual(int(torch.count_nonzero(head.down.weight[:, 8:])), 0)
-            h = torch.randn(4, 7, 8)
-            packed = torch.cat((h, torch.randn(4, 7, 8)), dim=-1)
-            self.assertTrue(torch.equal(baseline(h), head(packed)))
-            with torch.no_grad():
-                head.down.weight[:, 8:].normal_()
-                head.up.weight.normal_()
-            digest = sha256_file(ckpt)
-            adapter = serialize_head(head, digest)
-            self.assertEqual(adapter["version"], 3)
-            self.assertEqual(adapter["down_weight_shape"], [32, 16])
-            apply_head_adapter(model, adapter, digest)
-            self.assertTrue(torch.equal(head(packed), model.output_head(packed)))
-            self.assertEqual(adapter, serialize_head(model.output_head, digest))
-            self.assertEqual(serialize_head(ResidualOutputHead(256, 32, True), digest)["parameter_bytes"], 82640)
-
-    def test_history_fit_freezes_backbone_and_preserves_rng(self):
+    def test_retired_history_adapter_remains_decode_only(self):
+        # Build an old-format fixture independently of the production serializer.
+        from codec._legacy_quality_history import LegacyHistoryHead, history_feature_schema
+        from codec.encode import build_parser
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model, ckpt = model_and_checkpoint(root)
-            source, _ = source_file(root)
-            original, twin = copy.deepcopy(model), copy.deepcopy(model)
-            rng = torch.get_rng_state().clone()
-            kwargs = dict(device=torch.device("cpu"), batch_reads=8, total=65536,
-                          base_sha256=sha256_file(ckpt), config=config(head_type="residual", history_features=True))
-            adapter, report = adapt_output_head(model, source, **kwargs)
-            self.assertTrue(report["accepted"])
-            self.assertEqual(report["steps_completed"], 30)
-            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
-            self.assertTrue(all(p.requires_grad and p.grad is None for p in model.parameters()))
-            self.assertGreater(int(torch.count_nonzero(model.output_head.down.weight[:, 8:])), 0)
-            for name, value in original.state_dict().items():
-                if not name.startswith("output_head."):
-                    self.assertTrue(torch.equal(value, model.state_dict()[name]), name)
-            other, _ = adapt_output_head(twin, source, **kwargs)
-            self.assertEqual(adapter, other)
-            model.eval()
-            tensors = fastq_batch_to_tensors(next(iter_fastq_batches(source, batch_reads=8)), "cpu")
-            with torch.no_grad():
-                h = model.forward_features(**tensors)
-                s = quality_history_features(tensors["qualities"], tensors["active_mask"])
-                expected = model.output_head(torch.cat((h, s), -1)) * tensors["active_mask"].unsqueeze(-1)
-                self.assertTrue(torch.equal(model.forward_full(**tensors), expected))
-
-    def test_history_roundtrip_artifact_reuse_and_schema_rejection(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _, ckpt = model_and_checkpoint(root)
+            source, raw = source_file(root)
             digest = sha256_file(ckpt)
-            source, raw = source_file(root, compressed=True)
-            target, artifact = root / "history.fqdc", root / "head.json"
+            head = LegacyHistoryHead(8, 32)
+            with torch.no_grad():
+                head.up.weight.normal_(std=0.1)
+            parameters = (head.weight, head.bias, head.down.weight, head.down.bias, head.up.weight, head.up.bias)
+            data = b"".join(p.detach().numpy().astype("<f4").tobytes() for p in parameters)
+            adapter = dict(format="direct-quality-output-head", version=3, dtype="little_endian_float32",
+                           application="replace_output_head", layout="weight_bias_down_weight_down_bias_up_weight_up_bias",
+                           base_checkpoint_sha256=digest, residual_dim=32, activation="gelu_exact",
+                           history_features=history_feature_schema(), parameter_bytes=len(data),
+                           sha256=hashlib.sha256(data).hexdigest(), data_base64=base64.b64encode(data).decode())
+            for name, parameter in zip(("weight_shape", "bias_shape", "down_weight_shape", "down_bias_shape",
+                                        "up_weight_shape", "up_bias_shape"), parameters):
+                adapter[name] = list(parameter.shape)
+            apply_head_adapter(model, adapter, digest)
+            with self.assertRaisesRegex(ValueError, "decode-only"):
+                serialize_head(model.output_head, digest)
+            with self.assertRaisesRegex(ValueError, "cannot be fine-tuned"):
+                adapt_output_head(model, source, device=torch.device("cpu"), batch_reads=8,
+                                  total=65536, base_sha256=digest, config=config())
+            # Test-only injection writes arithmetic bytes with the legacy model;
+            # no production flag or artifact can select this head for encoding.
+            payload, container = root / "payload.fqdc", root / "legacy.fqdc"
             kwargs = dict(device=torch.device("cpu"), batch_reads=8, progress=False, verify_cdf=True)
-            stats = encode_fastq(source, target, ckpt, **kwargs,
-                                head_adaptation_config=config(head_type="residual", history_features=True),
-                                save_head_adapter_path=artifact)
-            self.assertTrue(stats.head_adaptation["accepted"])
-            self.assertEqual(read_container(target).metadata["head_adapter"]["version"], 3)
-            repeated = root / "repeat.fqdc"
-            encode_fastq(source, repeated, ckpt, **kwargs, head_adapter_path=artifact)
-            self.assertEqual(target.read_bytes(), repeated.read_bytes())
-            artifact.unlink()
+            with mock.patch("codec.encode.load_training_checkpoint", return_value=SimpleNamespace(model=model)):
+                encode_fastq(source, payload, ckpt, **kwargs)
+            rewrite_metadata(payload, container,
+                             lambda m: m.update(format_version=3, head_adapter=adapter, probability_profile=None), physical=3)
             restored = root / "out.fq"
-            decode_fastq(target, restored, ckpt, **kwargs)
-            self.assertEqual(raw, restored.read_bytes())
-            self.assertEqual(digest, sha256_file(ckpt))
-            changes = [lambda a: a.pop("history_features"), lambda a: a.update(version=2),
-                       lambda a: a["history_features"].update(window=16),
-                       lambda a: a["history_features"].update(version=True),
-                       lambda a: a["history_features"]["features"].reverse(),
-                       lambda a: a.update(down_weight_shape=[32, 8])]
-            for i, change in enumerate(changes):
+            decode_fastq(container, restored, ckpt, **kwargs)
+            self.assertEqual(restored.read_bytes(), raw)
+            artifact = root / "legacy.json"
+            artifact.write_text(json.dumps(dict(format="direct-quality-head-adaptation-artifact", version=1,
+                                               base_checkpoint_sha256=digest, adapter=adapter, report={})))
+            with self.assertRaisesRegex(ValueError, "retired"):
+                encode_fastq(source, root / "forbidden.fqdc", ckpt, **kwargs, head_adapter_path=artifact)
+            self.assertFalse((root / "forbidden.fqdc").exists())
+            for i, change in enumerate((lambda a: a.pop("history_features"),
+                                       lambda a: a["history_features"].update(window=16),
+                                       lambda a: a["history_features"].update(version=True),
+                                       lambda a: a.update(down_weight_shape=[32, 8]))):
                 bad = root / f"bad{i}.fqdc"
-                rewrite_metadata(target, bad, lambda m: change(m["head_adapter"]))
-                with self.subTest(change=i), self.assertRaises(ContainerError):
+                rewrite_metadata(container, bad, lambda m: change(m["head_adapter"]))
+                with self.assertRaises(ContainerError):
                     read_container(bad)
-
-    def test_history_cli_requires_residual_training(self):
-        common = ["codec.encode", "in.fq", "out.fqdc", "base.pt"]
-        with mock.patch("sys.argv", common + ["--finetune-head", "--head-type", "residual", "--head-history-features"]), \
-             mock.patch("codec.encode.encode_fastq") as encode, mock.patch("builtins.print"):
-            encode.return_value.to_dict.return_value = {}
-            main()
-            self.assertTrue(encode.call_args.kwargs["head_adaptation_config"].history_features)
-        for flags in (["--head-history-features"], ["--finetune-head", "--head-history-features"],
-                      ["--head-adapter", "head.json", "--head-history-features"]):
-            with mock.patch("sys.argv", common + flags), self.assertRaises(SystemExit):
-                main()
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            build_parser().parse_args(["a.fq", "b.fqdc", "base.pt", "--head-history-features"])
+        with self.assertRaises(TypeError):
+            config(head_type="residual", history_features=True)
 
 
 if __name__ == "__main__":
