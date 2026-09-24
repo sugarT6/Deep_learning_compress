@@ -14,7 +14,7 @@ import math
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -66,6 +66,7 @@ from .probability_quantization import (
     TOTAL,
     logits_symbols_bits,
     logits_to_cdfs,
+    logits_to_intervals,
     validate_total,
 )
 from .range_encoder import RangeEncoder
@@ -156,8 +157,9 @@ def _quantize_verified_batch(
     timings: Optional[Dict[str, float]] = None,
     verify_cdf: bool = True,
     report_neural_only_bits: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, float, float]:
-    """Return cycle-major symbols/CDFs, optionally cross-checking step inference."""
+    quantization_version: int = 1,
+) -> Tuple[np.ndarray, Any, float, float]:
+    """Return cycle-major symbols and CDFs (v1) or low/high/total arrays (v2)."""
 
     stage_started = time.perf_counter()
     tensors = fastq_batch_to_tensors(batch, device)
@@ -195,13 +197,23 @@ def _quantize_verified_batch(
             fused_logits = fuse_batch_logits(online_prior, active_logits, previous, cycles)
         _add_timing(timings, "prior_fusion", stage_started)
         stage_started = time.perf_counter()
-        cdfs = logits_to_cdfs(fused_logits, total=total)
+        encoded = (logits_to_intervals(fused_logits, symbols, total=total) if quantization_version == 2
+                   else logits_to_cdfs(fused_logits, total=total))
         _add_timing(timings, "cdf_quantization", stage_started)
         stage_started = time.perf_counter()
-        theoretical_bits = selected_quantized_bits(symbols, cdfs, total)
+        theoretical_bits = (float(-np.log2((encoded[1]-encoded[0]).astype(np.float64)/encoded[2]).sum())
+                            if quantization_version == 2 else selected_quantized_bits(symbols, encoded, total))
         _add_timing(timings, "quantized_bits", stage_started)
 
         if verify_cdf:
+            cdfs = (logits_to_cdfs(fused_logits, total=total, version=2)
+                    if quantization_version == 2 else encoded)
+            if quantization_version == 2:
+                indices = np.arange(symbols.size)
+                if not (np.array_equal(encoded[0], cdfs[indices, symbols])
+                        and np.array_equal(encoded[1], cdfs[indices, symbols+1])
+                        and np.array_equal(encoded[2], cdfs[:, -1])):
+                    raise CodecDeterminismError("direct interval/full CDF mismatch")
             offset = 0
             for cycle in range(batch.max_read_length):
                 _synchronize_device(device)
@@ -223,7 +235,7 @@ def _quantize_verified_batch(
                     step_scores = fuse_profile_positions(online_prior,
                         step_scores, batch.qualities, active_rows,
                         np.full(active_rows.size, cycle, dtype=np.int64))
-                step_cdfs = logits_to_cdfs(step_scores, total=total)
+                step_cdfs = logits_to_cdfs(step_scores, total=total, version=quantization_version)
                 stop = offset + active_rows.size
                 full_cycle_cdfs = cdfs[offset:stop]
                 if not np.array_equal(full_cycle_cdfs, step_cdfs):
@@ -238,7 +250,7 @@ def _quantize_verified_batch(
                 _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
             if offset != symbols.size:
                 raise ContainerError("CDF verification did not cover every quality")
-    return symbols, cdfs, theoretical_bits, neural_theoretical_bits
+    return symbols, encoded, theoretical_bits, neural_theoretical_bits
 
 
 def _encode_fastq_compat(
@@ -256,6 +268,7 @@ def _encode_fastq_compat(
     head_adaptation_config: Optional[HeadAdaptationConfig] = None,
     head_adapter_path: Optional[Path] = None,
     save_head_adapter_path: Optional[Path] = None,
+    quantization_version: int = 1,
 ) -> EncodeStatistics:
     """Shared engine; expert profiles are for historical decoder fixtures only."""
 
@@ -264,6 +277,10 @@ def _encode_fastq_compat(
     output_path = Path(output_path)
     checkpoint_path = Path(checkpoint_path)
     _validate_paths(input_path, output_path, checkpoint_path)
+    if type(quantization_version) is not int or quantization_version not in (1, 2):
+        raise ValueError("unsupported quantization version")
+    if quantization_version == 2 and online_prior_config is not None:
+        raise ValueError("floor quantizer is restricted to neural-only encoding")
     if head_adaptation_config is not None and not isinstance(head_adaptation_config, HeadAdaptationConfig):
         raise ValueError("invalid head_adaptation_config")
     if head_adaptation_config is not None and head_adapter_path is not None:
@@ -311,7 +328,7 @@ def _encode_fastq_compat(
             print("Adapting output head on a bounded prefix (experts disabled)...", file=sys.stderr)
             adapter, adaptation_report = adapt_output_head(model, input_path, device=device,
                 batch_reads=batch_reads, total=quantization_total, base_sha256=checkpoint_sha256,
-                config=head_adaptation_config)
+                config=replace(head_adaptation_config, quantization_version=quantization_version))
             if save_head_adapter_path is not None:
                 artifact = {"format": "direct-quality-head-adaptation-artifact", "version": 1,
                             "base_checkpoint_sha256": checkpoint_sha256, "adapter": adapter,
@@ -423,11 +440,13 @@ def _encode_fastq_compat(
                         timings=timings,
                         verify_cdf=verify_cdf,
                         report_neural_only_bits=report_neural_only_bits,
+                        quantization_version=quantization_version,
                     )
                     stage_started = time.perf_counter()
-                    range_encoder.encode_prevalidated_batch(
-                        symbols, cdfs, total=quantization_total
-                    )
+                    if quantization_version == 2:
+                        range_encoder.encode_prevalidated_intervals(*cdfs)
+                    else:
+                        range_encoder.encode_prevalidated_batch(symbols, cdfs, total=quantization_total)
                     _add_timing(timings, "range_encode", stage_started)
                     if online_prior is not None:
                         stage_started = time.perf_counter()
@@ -478,7 +497,7 @@ def _encode_fastq_compat(
                     "quality_line_ending_location": "plus_gzip",
                 },
                 "probability_quantization": {
-                    "version": QUANTIZATION_VERSION,
+                    "version": quantization_version,
                     "total": quantization_total,
                     "quality_alphabet_size": QUALITY_ALPHABET_SIZE,
                     "phred_offset": PHRED_OFFSET,
@@ -602,6 +621,7 @@ def encode_fastq(
     head_adaptation_config: Optional[HeadAdaptationConfig] = None,
     head_adapter_path: Optional[Path] = None,
     save_head_adapter_path: Optional[Path] = None,
+    quantization_version: int = 1,
 ) -> EncodeStatistics:
     """Encode only neural probabilities; legacy experts cannot be selected here."""
     return _encode_fastq_compat(
@@ -610,6 +630,7 @@ def encode_fastq(
         online_prior_config=None, report_neural_only_bits=report_neural_only_bits,
         head_adaptation_config=head_adaptation_config, head_adapter_path=head_adapter_path,
         save_head_adapter_path=save_head_adapter_path,
+        quantization_version=quantization_version,
     )
 
 
@@ -638,6 +659,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-reads", type=int, default=DEFAULT_BATCH_READS)
     parser.add_argument("--quantization-total", type=int, default=TOTAL)
+    parser.add_argument("--quantizer", choices=("largest-remainder", "floor"), default="largest-remainder",
+                        help="floor: no remainder sorting, variable totals and direct symbol intervals")
     parser.add_argument(
         "--verify-cdf",
         action="store_true",
@@ -713,6 +736,7 @@ def main() -> int:
             device=choose_device(args.device),
             batch_reads=args.batch_reads,
             quantization_total=args.quantization_total,
+            quantization_version=2 if args.quantizer == "floor" else 1,
             progress=not args.no_progress,
             verify_cdf=args.verify_cdf,
             report_neural_only_bits=args.report_neural_only_bits,

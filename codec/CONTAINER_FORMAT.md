@@ -173,6 +173,16 @@ have an ending. Only the final quality line may omit its ending.
 
 ## Quality stream and batching
 
+Probability quantizer version 2 is an opt-in no-sort floor protocol. For CPU
+float64 softmax p, f[q]=1+floor(p[q]*(total-42)). Metadata `total` is a cap;
+the actual arithmetic denominator is sum(f) at each position. Decoder computes
+that sum rather than using the cap. The neural encoder can pass only selected
+low/high/denominator intervals without materializing a full CDF. The range
+stream remains v1; its integer interval update already supports variable
+totals. Physical container versions and symbol order are unchanged. See
+`FAST_QUANTIZATION.md` for operation order and tests. V1 quantization retains
+its previous fixed-total largest-remainder rule. Older decoders reject v2.
+
 The quality section is the standalone single range stream documented in
 `RANGE_CODER_FORMAT.md`. The inner range-stream symbol count and meaningful bit
 count must match the outer metadata. Its CRC is checked both as a container

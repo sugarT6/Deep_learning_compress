@@ -207,15 +207,23 @@ def logits_to_cdf(
 
 
 def logits_to_cdfs(
-    logits: Sequence[Sequence[float]], *, total: int = TOTAL
+    logits: Sequence[Sequence[float]], *, total: int = TOTAL, version: int = 1
 ) -> np.ndarray:
     """Batch-quantize ``[N, 42]`` logits into an ``int64 [N, 43]`` CDF array.
 
     This is the production equivalent of calling :func:`logits_to_cdf` for
     every row.  Float64 softmax, largest-remainder allocation, stable quality-id
     tie breaking, and the minimum frequency of one are applied along each row.
+    Version 2 instead uses floor frequencies and variable row totals.
     """
 
+    if type(version) is not int or version not in (1, 2):
+        raise ProbabilityQuantizationError("unsupported quantization version")
+    if version == 2:
+        frequencies = floor_frequencies(logits, total=total)
+        cdfs = np.zeros((len(frequencies), QUALITY_ALPHABET_SIZE + 1), dtype=np.int64)
+        cdfs[:, 1:] = np.cumsum(frequencies, axis=1, dtype=np.int64)
+        return cdfs
     normalized_total = _validate_total(total)
     try:
         matrix = np.asarray(logits, dtype=np.float64)
@@ -294,6 +302,55 @@ def logits_to_cdfs(
         )
     cdfs[:, 1:] = np.cumsum(frequencies, axis=1, dtype=np.int64)
     return cdfs
+
+
+def floor_frequencies(logits, *, total=TOTAL):
+    """V2: 1 + floor(softmax64(logits) * (total-42)); no remainder sorting.
+
+    `total` is a cap, not the actual per-row sum. CPU float64 operation order
+    is fixed: subtract max, exp, sum, divide, multiply, floor, add one.
+    """
+    cap = _validate_total(total)
+    matrix = np.asarray(logits, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[1] != QUALITY_ALPHABET_SIZE:
+        raise ProbabilityQuantizationError("logits must have shape [N, 42]")
+    if not np.isfinite(matrix).all():
+        raise ProbabilityQuantizationError("logits must be finite")
+    weights = np.exp(matrix - matrix.max(axis=1, keepdims=True))
+    weights /= weights.sum(axis=1, dtype=np.float64, keepdims=True)
+    weights *= float(cap - QUALITY_ALPHABET_SIZE)
+    np.floor(weights, out=weights)
+    frequencies = weights.astype(np.int64) + 1
+    if np.any(frequencies.sum(axis=1, dtype=np.int64) > cap):
+        raise ProbabilityQuantizationError("floor frequency sum exceeds cap")
+    return frequencies
+
+
+def logits_to_intervals(logits, symbols, *, total=TOTAL, chunk_rows=4096):
+    """V2 encoder path: selected low/high/actual-total, without a full CDF.
+
+    Bound temporary N*42 arrays to chunk_rows; integer sums are exact.
+    """
+    _validate_total(total)
+    matrix, symbols = np.asarray(logits), np.asarray(symbols)
+    if matrix.ndim != 2 or matrix.shape[1] != QUALITY_ALPHABET_SIZE:
+        raise ProbabilityQuantizationError("logits must have shape [N, 42]")
+    if (symbols.shape != (len(matrix),) or symbols.dtype.kind not in "iu"
+            or np.any(symbols < 0) or np.any(symbols >= QUALITY_ALPHABET_SIZE)):
+        raise ProbabilityQuantizationError("invalid quality symbols")
+    if type(chunk_rows) is not int or chunk_rows < 1:
+        raise ProbabilityQuantizationError("invalid chunk_rows")
+    low, high, totals = (np.empty(len(matrix), dtype=np.int64) for _ in range(3))
+    classes = np.arange(QUALITY_ALPHABET_SIZE)[None, :]
+    for begin in range(0, len(matrix), chunk_rows):
+        stop = min(begin + chunk_rows, len(matrix))
+        y = symbols[begin:stop]
+        freq = floor_frequencies(matrix[begin:stop], total=total)
+        lo = np.sum(freq, axis=1, dtype=np.int64, where=classes < y[:, None])
+        low[begin:stop] = lo
+        high[begin:stop] = lo + freq[np.arange(len(y)), y]
+        totals[begin:stop] = freq.sum(axis=1, dtype=np.int64)
+    return low, high, totals
 
 
 def logits_symbols_bits(
@@ -418,6 +475,8 @@ __all__ = [
     "logits_symbols_bits",
     "logits_to_cdf",
     "logits_to_cdfs",
+    "logits_to_intervals",
+    "floor_frequencies",
     "logits_to_frequencies",
     "probabilities_to_cdf",
     "probabilities_to_frequencies",

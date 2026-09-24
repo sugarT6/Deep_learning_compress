@@ -48,8 +48,11 @@ class HeadAdaptationConfig:
     lora_rank: int = 4
     lora_steps: int = 1000
     lora_learning_rate: float = 0.0003
+    quantization_version: int = 1
 
     def __post_init__(self):
+        if type(self.quantization_version) is not int or self.quantization_version not in (1, 2):
+            raise ValueError("invalid quantization_version")
         if type(self.lora) is not bool or (self.lora and not self.cross_layer):
             raise ValueError("lora requires cross_layer and a boolean flag")
         if type(self.lora_rank) is not int or not 1 <= self.lora_rank <= 16:
@@ -406,8 +409,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
                         inputs = inputs[:, :model.config.d_model]
                     logits = candidate(inputs).cpu().numpy()
                     targets = val_y[begin:begin + 4096].cpu().numpy()
-                    cdfs = logits_to_cdfs(logits, total=total)
-                    bits += selected_quantized_bits(targets, cdfs, total)
+                    cdfs = logits_to_cdfs(logits, total=total, version=config.quantization_version)
+                    bits += selected_quantized_bits(targets, cdfs, cdfs[:, -1])
             return bits / val_y.numel()
 
         before, after = score(model.output_head), score(wire_head)

@@ -277,7 +277,8 @@ def adapt_last_layer(model, source, *, device, batch_reads, total, base_sha256, 
                 _, y, active = chunk
                 scores = logits(chunk, wire_head, wire_weight)[active].cpu().numpy()
                 targets = y[active].cpu().numpy()
-                bits += selected_quantized_bits(targets, logits_to_cdfs(scores, total=total), total)
+                cdfs = logits_to_cdfs(scores, total=total, version=config.quantization_version)
+                bits += selected_quantized_bits(targets, cdfs, cdfs[:, -1])
                 count += targets.size
         report["lora_stage_seconds"]["wire_validation"] = time.perf_counter()-validation_started
         after = bits/count

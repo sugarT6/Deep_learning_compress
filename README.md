@@ -40,6 +40,13 @@ The 8000-read LoRA pilot showed a small gain over 1000 head updates but was
 weaker than spending the same time budget on additional head-only updates;
 it is experimental and remains disabled by default.
 
+The opt-in `--quantizer floor` uses CPU float64 floor frequencies
+without largest-remainder sorting, variable per-position totals, and direct
+symbol intervals on the encoder. The default largest-remainder path remains
+available for paired comparisons and old files remain decodable. See
+[codec/FAST_QUANTIZATION.md](codec/FAST_QUANTIZATION.md) for the 2000-update
+compression command, protocol and small-sample timing results.
+
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
 `k=2,3,4`, complete decoder-known base reads, position/read length, and an
 active mask. `forward_full` performs causal teacher-forced prediction for

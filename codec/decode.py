@@ -119,8 +119,10 @@ def _validate_codec_metadata(
     if int(gzip_streams["record_schema_version"]) != 1:
         raise ContainerError("unsupported gzip side-stream record schema")
     quantization = metadata["probability_quantization"]
-    if int(quantization["version"]) != QUANTIZATION_VERSION:
+    if int(quantization["version"]) not in (1, 2):
         raise ContainerError("unsupported probability quantization version")
+    if int(quantization["version"]) == 2 and metadata.get("probability_profile") is not None:
+        raise ContainerError("floor quantizer requires neural-only probabilities")
     if int(quantization["quality_alphabet_size"]) != QUALITY_ALPHABET_SIZE:
         raise ContainerError("container quality alphabet is not Q0-Q41")
     if int(quantization["phred_offset"]) != PHRED_OFFSET:
@@ -213,6 +215,7 @@ def _decode_quality_batch(
     timings: Dict[str, float],
     verify_cdf: bool,
     online_prior: OnlinePriorState | MixturePriorState | None,
+    quantization_version: int = 1,
 ) -> Tuple[np.ndarray, int]:
     stage_started = time.perf_counter()
     bases, lengths, active_mask = _batch_tensors(base_records, device)
@@ -260,12 +263,13 @@ def _decode_quality_batch(
             cycle_cdfs = logits_to_cdfs(
                 active_logits,
                 total=quantization_total,
+                version=quantization_version,
             )
             _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
 
             stage_started = time.perf_counter()
             cycle_symbols = range_decoder.decode_prevalidated_batch(
-                cycle_cdfs, total=quantization_total
+                cycle_cdfs, total=quantization_total if quantization_version == 1 else None
             )
             if isinstance(online_prior, AdaptivePriorState):
                 online_prior.observe_symbols(np.asarray(cycle_symbols, dtype=np.int64))
@@ -298,6 +302,7 @@ def _decode_quality_batch(
             full_cdfs = logits_to_cdfs(
                 active_full_logits,
                 total=quantization_total,
+                version=quantization_version,
             )
             step_cdfs = (
                 np.concatenate(verification_cdfs, axis=0)
@@ -452,6 +457,7 @@ def _decode_to_handle(
                 timings=timings,
                 verify_cdf=verify_cdf,
                 online_prior=online_prior,
+                quantization_version=int(metadata["probability_quantization"]["version"]),
             )
             decoded_symbols += batch_symbols
             stage_started = time.perf_counter()

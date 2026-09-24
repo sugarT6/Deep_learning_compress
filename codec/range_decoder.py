@@ -78,13 +78,13 @@ class RangeDecoder:
         return self._decode_prevalidated(normalized_cdf, normalized_cdf[-1])
 
     def decode_prevalidated_batch(
-        self, cdfs: Sequence[Sequence[int]], *, total: int
+        self, cdfs: Sequence[Sequence[int]], *, total: int = None
     ) -> List[int]:
         """Decode codec-internal CDFs without repeating public validation."""
 
         if len(cdfs) > self._metadata.symbol_count - self._decoded_count:
             raise RangeCodingError("range stream has too few undecoded symbols")
-        return [self._decode_prevalidated(cdf, total) for cdf in cdfs]
+        return [self._decode_prevalidated(cdf, int(cdf[-1]) if total is None else total) for cdf in cdfs]
 
     def _decode_prevalidated(self, cdf: Sequence[int], total: int) -> int:
         """Decode one symbol from an already validated fixed-total CDF."""
