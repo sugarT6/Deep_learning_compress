@@ -108,6 +108,7 @@ class EncodeStatistics:
     online_adaptation: Optional[Dict[str, Any]]
     head_adaptation: Optional[Dict[str, Any]]
     quality_and_adapter_bytes: int
+    coder_backend: str
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -269,6 +270,7 @@ def _encode_fastq_compat(
     head_adapter_path: Optional[Path] = None,
     save_head_adapter_path: Optional[Path] = None,
     quantization_version: int = 1,
+    coder_backend: str = "auto",
 ) -> EncodeStatistics:
     """Shared engine; expert profiles are for historical decoder fixtures only."""
 
@@ -301,6 +303,8 @@ def _encode_fastq_compat(
     ):
         raise ValueError("online_prior_config must be a supported prior config or None")
 
+    range_encoder = RangeEncoder(backend=coder_backend)
+    print(f"Range coder backend: {range_encoder.backend} (single-threaded)", file=sys.stderr)
     timings = {
         "checkpoint_hash_and_load": 0.0,
         "fastq_parse": 0.0,
@@ -370,7 +374,6 @@ def _encode_fastq_compat(
     quality_symbols = 0
     quantized_theoretical_bits = 0.0
     neural_only_theoretical_bits = 0.0
-    range_encoder = RangeEncoder()
     online_prior = make_prior_state(online_prior_config) if online_prior_config is not None else None
     progress_bar = None
     if progress and tqdm is not None:
@@ -610,6 +613,7 @@ def _encode_fastq_compat(
         head_adaptation=adaptation_report,
         quality_and_adapter_bytes=range_stream_bytes + (
             adaptation_report["container_adapter_bytes"] if adaptation_report else 0),
+        coder_backend=range_encoder.backend,
     )
 
 
@@ -622,6 +626,7 @@ def encode_fastq(
     head_adapter_path: Optional[Path] = None,
     save_head_adapter_path: Optional[Path] = None,
     quantization_version: int = 1,
+    coder_backend: str = "auto",
 ) -> EncodeStatistics:
     """Encode only neural probabilities; legacy experts cannot be selected here."""
     return _encode_fastq_compat(
@@ -631,6 +636,7 @@ def encode_fastq(
         head_adaptation_config=head_adaptation_config, head_adapter_path=head_adapter_path,
         save_head_adapter_path=save_head_adapter_path,
         quantization_version=quantization_version,
+        coder_backend=coder_backend,
     )
 
 
@@ -661,6 +667,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quantization-total", type=int, default=TOTAL)
     parser.add_argument("--quantizer", choices=("largest-remainder", "floor"), default="largest-remainder",
                         help="floor: no remainder sorting, variable totals and direct symbol intervals")
+    parser.add_argument("--coder-backend", choices=("auto", "python", "native"), default="auto",
+                        help="native: require the single-threaded C++ coder; build with python -m codec.build_native")
     parser.add_argument(
         "--verify-cdf",
         action="store_true",
@@ -737,6 +745,7 @@ def main() -> int:
             batch_reads=args.batch_reads,
             quantization_total=args.quantization_total,
             quantization_version=2 if args.quantizer == "floor" else 1,
+            coder_backend=args.coder_backend,
             progress=not args.no_progress,
             verify_cdf=args.verify_cdf,
             report_neural_only_bits=args.report_neural_only_bits,

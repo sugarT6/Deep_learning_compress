@@ -54,7 +54,18 @@ class _BitWriter:
 class RangeEncoder:
     """Encode symbols sequentially with a potentially different CDF each time."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, backend: str = "auto") -> None:
+        if backend not in ("auto", "python", "native"):
+            raise RangeCodingError("coder backend must be auto, python, or native")
+        self._native = None
+        if backend != "python":
+            from ._native_range import NativeRangeUnavailable, load_native_kernel
+            try:
+                self._native = load_native_kernel()
+            except NativeRangeUnavailable:
+                if backend == "native":
+                    raise
+        self.backend = "native" if self._native is not None else "python"
         self._low = 0
         self._high = MAX_CODE
         self._pending_underflow_bits = 0
@@ -123,6 +134,9 @@ class RangeEncoder:
             raise RangeCodingError("cannot encode after finalization")
         # Keep the hot arithmetic/bit state in locals across the whole batch.
         # The scalar public path remains the reference implementation.
+        if self._native is not None:
+            self._native.encode_cdfs(self, symbols, cdfs, total)
+            return
         low, high = self._low, self._high
         pending = self._pending_underflow_bits
         writer = self._writer
@@ -181,6 +195,9 @@ class RangeEncoder:
             raise RangeCodingError("cannot encode after finalization")
         if not len(lower) == len(upper) == len(totals):
             raise RangeCodingError("interval array lengths differ")
+        if self._native is not None:
+            self._native.encode_intervals(self, lower, upper, totals)
+            return
         low, high, pending = self._low, self._high, self._pending_underflow_bits
         writer = self._writer
         byte, used, bit_count = writer._current_byte, writer._bits_in_current_byte, writer.bit_count

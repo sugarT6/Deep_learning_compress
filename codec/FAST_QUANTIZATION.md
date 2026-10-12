@@ -44,8 +44,9 @@ quantizer; no re-training is required for a controlled coding comparison.
 
 The existing `cdf_quantization` timer now measures frequency/direct-interval
 construction in floor mode; `range_encode` remains arithmetic encoding. This
-preserves comparable report fields. No C++/JIT migration, multiprocessing or
-side-stream optimization is included.
+preserves comparable report fields. That quantizer change did not include
+C++/JIT migration, multiprocessing or side-stream optimization. The later
+single-threaded C++ coder is documented in [NATIVE_RANGE_CODER.md](NATIVE_RANGE_CODER.md).
 
 ## Reusable floor workspace (2026-10-12)
 
