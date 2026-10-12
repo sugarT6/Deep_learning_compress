@@ -16,6 +16,42 @@ from test_head_adapter import model_and_checkpoint, source_file, config
 
 
 class FloorQuantizationTest(unittest.TestCase):
+    def test_workspace_matches_original_v2_across_chunks_and_layouts(self):
+        rng = np.random.default_rng(12102026)
+        original = rng.normal(size=(8195, 42)).astype(np.float32) * 6
+        symbols = rng.integers(0, 42, len(original), dtype=np.uint64)
+        for logits in (original, original.astype(np.float64),
+                       np.asfortranarray(original), original[::-1, ::-1]):
+            before = logits.copy()
+            logits.flags.writeable = False
+            for cap in (42, 65536, 1 << 30):
+                # Independent expression from the original v2 protocol, rather
+                # than comparing two users of the new workspace helper.
+                matrix = np.asarray(logits, dtype=np.float64)
+                weights = np.exp(matrix - matrix.max(axis=1, keepdims=True))
+                weights /= weights.sum(axis=1, dtype=np.float64, keepdims=True)
+                weights *= float(cap - 42)
+                expected = np.floor(weights).astype(np.int64) + 1
+                self.assertTrue(np.array_equal(floor_frequencies(logits, total=cap), expected))
+                prefix = np.cumsum(expected, axis=1, dtype=np.int64)
+                upper = prefix[np.arange(len(symbols)), symbols]
+                lower = upper - expected[np.arange(len(symbols)), symbols]
+                totals = prefix[:, -1]
+                for chunk in (1024, 2048, 4096, 8192, 16384):
+                    actual = logits_to_intervals(logits, symbols, total=cap, chunk_rows=chunk)
+                    for got, wanted in zip(actual, (lower, upper, totals)):
+                        self.assertTrue(np.array_equal(got, wanted), (cap, chunk))
+            self.assertTrue(np.array_equal(logits, before))
+
+    def test_late_chunk_nonfinite_and_invalid_chunk_sizes(self):
+        logits = np.zeros((257, 42), dtype=np.float32)
+        logits[-1, -1] = np.nan
+        with self.assertRaisesRegex(ValueError, "finite"):
+            logits_to_intervals(logits, np.zeros(len(logits), dtype=int), chunk_rows=128)
+        for chunk in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                logits_to_intervals(np.zeros((1, 42)), np.array([0]), chunk_rows=chunk)
+
     def test_integer_intervals_match_full_and_scalar_cdfs(self):
         rng = np.random.default_rng(19)
         logits = rng.normal(size=(213, 42)) * 8

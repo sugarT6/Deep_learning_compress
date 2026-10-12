@@ -27,7 +27,7 @@ Metadata records `probability_quantization.version=2`, `total=cap`, the same
 container and range stream versions do not change. Old decoders reject v2;
 the updated decoder reads v1 and v2. FP32/GPU softmax is not substituted.
 
-The encoder works on chunks of at most 4096 positions and outputs only:
+The encoder works on chunks of at most 16384 positions and outputs only:
 `low=sum(f[:symbol])`, `high=low+f[symbol]`, and `T`. It does not build a full
 43-column CDF in production. The arithmetic encoder consumes these arrays,
 using bulk `.tolist()` conversion instead of NumPy scalar indexing for every
@@ -46,6 +46,75 @@ The existing `cdf_quantization` timer now measures frequency/direct-interval
 construction in floor mode; `range_encode` remains arithmetic encoding. This
 preserves comparable report fields. No C++/JIT migration, multiprocessing or
 side-stream optimization is included.
+
+## Reusable floor workspace (2026-10-12)
+
+The floor path allocates its float64 weights, int64 frequencies, Boolean mask,
+row reductions and gather indices once per call, reusing the buffers for every
+chunk and its tail. Softmax still subtracts max, exponentiates, sums, divides,
+multiplies and floors in the original order. Integer row totals are computed
+once for both cap validation and the returned intervals. The finite-check mask
+is then reused for the existing masked lower-interval sum. Input logits are
+never overwritten. The public floor/CDF path retains int64 outputs, and the
+quantization and range protocol versions are unchanged.
+
+The default `DEFAULT_FLOOR_CHUNK_ROWS` is now 16384. This is a count of quality
+positions, not reads or neural inference batches. With 256 reads of 150 bases,
+38400 positions are quantized in chunks of 16384, 16384 and 5632. Larger chunks
+use more bounded scratch memory; they do not change probabilities or coder
+states. The default workspace's main buffers occupy about 12.1 MB, excluding
+the input and returned arrays. The masked sum remains in use; no cumsum-based
+lower implementation is selected by this change.
+
+Single-thread CPU measurements reused a saved 2000-step cross adapter and the
+same real logits for reads 8001--9024 of CNR0847462 (153600 qualities, four
+256-read batches). Each case was warmed, then measured in 12 alternating
+forward/reverse rounds. Prediction, equality checks and range coding were
+outside the quantization timers:
+
+| Path / chunk positions | Median quantization seconds |
+| --- | ---: |
+| Commit 99c8956 floor / 4096 | 0.236728 |
+| Workspace / 1024 | 0.244637 |
+| Workspace / 2048 | 0.234772 |
+| Workspace / 4096 | 0.227080 |
+| Workspace / 8192 | 0.223314 |
+| Workspace / 16384 | 0.223239 |
+| Workspace / 32768 | 0.225189 |
+| Workspace / 65536 | 0.227277 |
+
+16384 had the lowest median in three runs, with 8192 very close. The final
+measurement is about 5.7% less quantization time than the old floor path;
+this is not an end-to-end speed claim or a universal chunk optimum. Every
+tested chunk produced identical integer intervals and identical 42858-byte
+range streams. Results and cached logits are local, untracked artifacts in
+`codec/runs/floor_workspace_20261012_v1/`; final report is
+`chunks_final/report.json`.
+
+Validation: 209 repository tests passed in 27.369 seconds, including
+read-only/strided/Fortran arrays, float32/float64 inputs, chunk tails and cap
+boundaries. Nine real 150-base reads also passed CPU full/step integer-CDF
+verification and byte-exact FASTQ roundtrip. Their complete containers were
+byte-identical with the old and optimized interval implementations when using
+the same model, adapter and runtime (`cpu_roundtrip/report.json`).
+
+Reproduce without training or a full-file compression (choose a new output
+directory):
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+python -m codec.benchmark_floor_chunks \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  codec/runs/direct_quality_balanced_b256_s40000_v1/best.pt \
+  codec/output/CNR0847462_head8k_s2000_res64_cross16_floor_20260924.adapter.json \
+  codec/runs/NEW_floor_chunks_run
+```
+
+The reference source is loaded read-only from local Git commit `99c8956`.
+`--logits-cache PREVIOUS_RUN/real_logits.npz` skips model prediction for repeats;
+keep the source, adapter and read-range arguments the same. GPU verification
+and full-file speed comparison must be performed separately on an available
+GPU, reusing one adapter for a strict coding comparison.
 
 ## Full compression command (8000 reads, 2000 head updates)
 

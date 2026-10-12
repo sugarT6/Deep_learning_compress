@@ -21,6 +21,7 @@ QUALITY_ALPHABET_SIZE = 42
 QUANTIZATION_VERSION = 1
 TOTAL = 1 << 16
 MAX_TOTAL = 1 << 30
+DEFAULT_FLOOR_CHUNK_ROWS = 16384
 
 
 class ProbabilityQuantizationError(ValueError):
@@ -304,6 +305,31 @@ def logits_to_cdfs(
     return cdfs
 
 
+def _floor_frequencies_into(logits, cap, weights, frequencies, totals, row_work, mask):
+    """Fill caller-owned buffers in the v2 float64 operation order.
+
+    The finite-check mask is reused for the selected-interval sum by the
+    encoder. Compute integer totals once, for both cap validation and coding.
+    Never use logits as a work buffer: callers may reuse or share that array.
+    """
+    np.copyto(weights, logits, casting="unsafe")
+    np.isfinite(weights, out=mask)
+    if not mask.all():
+        raise ProbabilityQuantizationError("logits must be finite")
+    np.max(weights, axis=1, keepdims=True, out=row_work)
+    np.subtract(weights, row_work, out=weights)
+    np.exp(weights, out=weights)
+    np.sum(weights, axis=1, dtype=np.float64, keepdims=True, out=row_work)
+    np.divide(weights, row_work, out=weights)
+    np.multiply(weights, float(cap - QUALITY_ALPHABET_SIZE), out=weights)
+    np.floor(weights, out=weights)
+    np.copyto(frequencies, weights, casting="unsafe")
+    np.add(frequencies, 1, out=frequencies)
+    np.sum(frequencies, axis=1, dtype=np.int64, out=totals)
+    if np.any(totals > cap):
+        raise ProbabilityQuantizationError("floor frequency sum exceeds cap")
+
+
 def floor_frequencies(logits, *, total=TOTAL):
     """V2: 1 + floor(softmax64(logits) * (total-42)); no remainder sorting.
 
@@ -314,24 +340,22 @@ def floor_frequencies(logits, *, total=TOTAL):
     matrix = np.asarray(logits, dtype=np.float64)
     if matrix.ndim != 2 or matrix.shape[1] != QUALITY_ALPHABET_SIZE:
         raise ProbabilityQuantizationError("logits must have shape [N, 42]")
-    if not np.isfinite(matrix).all():
-        raise ProbabilityQuantizationError("logits must be finite")
-    weights = np.exp(matrix - matrix.max(axis=1, keepdims=True))
-    weights /= weights.sum(axis=1, dtype=np.float64, keepdims=True)
-    weights *= float(cap - QUALITY_ALPHABET_SIZE)
-    np.floor(weights, out=weights)
-    frequencies = weights.astype(np.int64) + 1
-    if np.any(frequencies.sum(axis=1, dtype=np.int64) > cap):
-        raise ProbabilityQuantizationError("floor frequency sum exceeds cap")
+    frequencies = np.empty_like(matrix, dtype=np.int64)
+    _floor_frequencies_into(
+        matrix, cap, np.empty_like(matrix), frequencies,
+        np.empty(len(matrix), dtype=np.int64),
+        np.empty((len(matrix), 1), dtype=np.float64),
+        np.empty_like(matrix, dtype=np.bool_),
+    )
     return frequencies
 
 
-def logits_to_intervals(logits, symbols, *, total=TOTAL, chunk_rows=4096):
+def logits_to_intervals(logits, symbols, *, total=TOTAL, chunk_rows=DEFAULT_FLOOR_CHUNK_ROWS):
     """V2 encoder path: selected low/high/actual-total, without a full CDF.
 
     Bound temporary N*42 arrays to chunk_rows; integer sums are exact.
     """
-    _validate_total(total)
+    cap = _validate_total(total)
     matrix, symbols = np.asarray(logits), np.asarray(symbols)
     if matrix.ndim != 2 or matrix.shape[1] != QUALITY_ALPHABET_SIZE:
         raise ProbabilityQuantizationError("logits must have shape [N, 42]")
@@ -341,15 +365,30 @@ def logits_to_intervals(logits, symbols, *, total=TOTAL, chunk_rows=4096):
     if type(chunk_rows) is not int or chunk_rows < 1:
         raise ProbabilityQuantizationError("invalid chunk_rows")
     low, high, totals = (np.empty(len(matrix), dtype=np.int64) for _ in range(3))
+    capacity = min(chunk_rows, len(matrix))
+    # Preserve the input's row/column memory order, as the reference NumPy
+    # row reductions do. Allocate the large buffers once, including the tail.
+    weights = np.empty_like(matrix[:capacity], dtype=np.float64)
+    frequencies = np.empty_like(weights, dtype=np.int64)
+    mask = np.empty_like(weights, dtype=np.bool_)
+    row_work = np.empty((capacity, 1), dtype=np.float64)
+    row_offsets = np.arange(capacity, dtype=np.int64) * QUALITY_ALPHABET_SIZE
+    selected_indices = np.empty(capacity, dtype=np.int64)
     classes = np.arange(QUALITY_ALPHABET_SIZE)[None, :]
     for begin in range(0, len(matrix), chunk_rows):
         stop = min(begin + chunk_rows, len(matrix))
+        count = stop - begin
         y = symbols[begin:stop]
-        freq = floor_frequencies(matrix[begin:stop], total=total)
-        lo = np.sum(freq, axis=1, dtype=np.int64, where=classes < y[:, None])
-        low[begin:stop] = lo
-        high[begin:stop] = lo + freq[np.arange(len(y)), y]
-        totals[begin:stop] = freq.sum(axis=1, dtype=np.int64)
+        freq, active_mask = frequencies[:count], mask[:count]
+        _floor_frequencies_into(
+            matrix[begin:stop], cap, weights[:count], freq, totals[begin:stop],
+            row_work[:count], active_mask,
+        )
+        np.less(classes, y[:, None], out=active_mask)
+        np.sum(freq, axis=1, dtype=np.int64, where=active_mask, out=low[begin:stop])
+        np.add(row_offsets[:count], y, out=selected_indices[:count], casting="unsafe")
+        np.take(freq, selected_indices[:count], out=high[begin:stop])
+        np.add(low[begin:stop], high[begin:stop], out=high[begin:stop])
     return low, high, totals
 
 
