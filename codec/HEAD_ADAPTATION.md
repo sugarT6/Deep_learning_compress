@@ -291,12 +291,13 @@ python -m codec.encode \
   --backbone-patience 6 --backbone-max-reads 32000 \
   --backbone-max-symbols 4800000 \
   --save-head-adapter "$TEST_LORA/head.adapter.json" \
-  > "$TEST_LORA/metrics.json" 2> "$TEST_LORA/encode.log"
+  > "$TEST_LORA/metrics.json"
 ```
 
-`encode.log` contains validation progress and the final selected model;
-`metrics.json` contains measured sizes and estimated savings. The encoding
-stage always measures the trained model instead of automatically reverting.
+Validation messages and the live `encode FASTQ` progress bar stay on terminal
+stderr. Redirect only stdout to `metrics.json` for measured sizes and estimated
+savings; redirecting stderr to a log hides the terminal progress bar. The
+encoding stage always measures the trained model instead of automatically reverting.
 
 ## Optional final-block Q/V LoRA
 
