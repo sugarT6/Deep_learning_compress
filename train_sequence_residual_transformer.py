@@ -21,7 +21,6 @@ except ImportError:  # pragma: no cover
     tqdm = None
 
 from sequence_residual_transformer_model import (
-    COMPACT_PRIOR,
     DEFAULT_BASE_CONV_KERNELS,
     DEFAULT_MER_STRIDE,
     DEFAULT_MER_VOCAB_SIZE,
@@ -34,13 +33,9 @@ from sequence_residual_transformer_model import (
     DEFAULT_QMER_KS,
     DEFAULT_RMER_KS,
     DIRECT_LOGITS,
-    FULL_PRIOR,
     H5_ALPHABET_SIZE,
-    LOG_P0_PLUS_DELTA,
     OUTPUT_PARAMETERIZATIONS,
     PAD_TARGET,
-    PLATFORM_NAMES,
-    PLATFORM_TO_ID,
     PREDICTION_TARGETS,
     PRIOR_FEATURE_MODES,
     QUALITY_TARGET,
@@ -86,56 +81,6 @@ def parse_int_list(text: str) -> tuple[int, ...]:
     return values
 
 
-def resolve_platform_map(files: list[Path], text: str) -> dict[str, str]:
-    """Resolve comma-separated accession-pattern=platform entries by basename."""
-
-    entries: list[tuple[str, str]] = []
-    for raw_entry in text.split(","):
-        entry = raw_entry.strip()
-        if not entry or "=" not in entry:
-            raise ValueError(
-                "--platform-map entries must use accession-pattern=platform"
-            )
-        pattern, platform = (part.strip() for part in entry.split("=", 1))
-        canonical = next(
-            (name for name in PLATFORM_NAMES if name.lower() == platform.lower()),
-            None,
-        )
-        if not pattern or canonical is None:
-            raise ValueError(
-                f"invalid platform mapping {entry!r}; platform must be one of "
-                f"{PLATFORM_NAMES}"
-            )
-        entries.append((pattern, canonical))
-
-    resolved: dict[str, str] = {}
-    for path in files:
-        matches = [platform for pattern, platform in entries if pattern in path.name]
-        if len(matches) != 1:
-            raise ValueError(
-                f"{path}: expected exactly one --platform-map match, got {len(matches)}"
-            )
-        resolved[path.name] = matches[0]
-    return resolved
-
-
-def platform_ids_for_batch(
-    batch_size: int,
-    path: Path,
-    platform_by_file: dict[str, str],
-    device: torch.device,
-) -> torch.Tensor:
-    """Return one file-level platform id repeated for every read in a batch."""
-
-    platform = platform_by_file[path.name]
-    return torch.full(
-        (batch_size,),
-        PLATFORM_TO_ID[platform],
-        dtype=torch.long,
-        device=device,
-    )
-
-
 @torch.no_grad()
 def evaluate_model(
     model: ResidualTransformer,
@@ -154,7 +99,6 @@ def evaluate_model(
     prior_feature_mode: str,
     prediction_target: str,
     quality_alphabet_size: int,
-    platform_by_file: dict[str, str] | None = None,
     quality_distributions_by_file: dict[Path, QualityDistributionInfo] | None = None,
 ) -> dict[str, float]:
     """Evaluate compression metrics on a deterministic read split."""
@@ -200,16 +144,6 @@ def evaluate_model(
             quality_alphabet_size=quality_alphabet_size,
         ):
             tensors = batch_to_torch(batch, device)
-            platform_id = (
-                platform_ids_for_batch(
-                    batch_size=int(tensors["continuous"].shape[0]),
-                    path=path,
-                    platform_by_file=platform_by_file,
-                    device=device,
-                )
-                if platform_by_file is not None
-                else None
-            )
             # 模型输出checkpoint配置的body-quality类别；旧 residual checkpoint
             # 仍可通过 prediction_target=residual 使用 189 类。
             logits = model(
@@ -220,7 +154,6 @@ def evaluate_model(
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
                 base_ids=tensors["base_ids"],
-                platform_id=platform_id,
                 quality_distribution_log_probs=quality_distribution_log_probs,
                 lengths=tensors["lengths"],
             )
@@ -348,10 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=PRIOR_FEATURE_MODES,
         default=DEFAULT_PRIOR_FEATURE_MODE,
         help=(
-            "qhat_only uses the H5 matrix only to derive q_hat/residual; "
-            "compact_prior adds top-1 confidence, top-1/top-2 log-prob margin, "
-            "and normalized entropy; "
-            "full_prior also feeds log P0_r and probability summaries to the model"
+            "qhat_only uses the H5 matrix only to derive q_hat/residual"
         ),
     )
     parser.add_argument("--epochs", type=int, default=5)
@@ -403,20 +333,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-conv-channels", type=int, default=16)
     parser.add_argument("--base-context-dim", type=int, default=32)
-    parser.add_argument(
-        "--platform-embed-dim",
-        type=int,
-        default=0,
-        help="file-level platform embedding width; 0 disables platform conditioning",
-    )
-    parser.add_argument(
-        "--platform-map",
-        default="",
-        help=(
-            "comma-separated accession-pattern=platform mappings; platforms are "
-            "BGISEQ, Illumina, and IonTorrent"
-        ),
-    )
     parser.add_argument(
         "--quality-distribution-prior",
         action="store_true",
@@ -493,14 +409,6 @@ def main() -> int:
         raise SystemExit("--feedforward-dim and --context-length must be positive")
     if args.mer_stride <= 0:
         raise SystemExit("--mer-stride must be positive")
-    if args.output_parameterization == LOG_P0_PLUS_DELTA and (
-        args.prior_feature_mode != FULL_PRIOR
-        or args.prediction_target != RESIDUAL_TARGET
-    ):
-        raise SystemExit(
-            "--output-parameterization log_p0_plus_delta requires "
-            "full_prior and residual target"
-        )
     if args.qmer_vocab_size <= 0 or args.rmer_vocab_size <= 0:
         raise SystemExit("Q/R-mer vocabulary sizes must be positive")
     if args.qmer_embed_dim <= 0 or args.rmer_embed_dim <= 0:
@@ -511,12 +419,6 @@ def main() -> int:
         or args.base_context_dim <= 0
     ):
         raise SystemExit("base embedding, convolution, and context dimensions must be positive")
-    if args.platform_embed_dim < 0:
-        raise SystemExit("--platform-embed-dim must be non-negative")
-    if bool(args.platform_embed_dim) != bool(args.platform_map.strip()):
-        raise SystemExit(
-            "--platform-embed-dim and --platform-map must be enabled together"
-        )
     if args.quality_distribution_prior:
         if args.prediction_target != QUALITY_TARGET:
             raise SystemExit(
@@ -570,14 +472,6 @@ def main() -> int:
             "dataset_platform_by_file": {},
             "fastq_by_file": {},
         }
-    try:
-        platform_by_file = (
-            resolve_platform_map(files, args.platform_map)
-            if args.platform_embed_dim > 0
-            else None
-        )
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
     infos = [inspect_h5(path) for path in files]
     for info in infos:
         if info.alphabet_size != H5_ALPHABET_SIZE:
@@ -620,12 +514,8 @@ def main() -> int:
     # 保存完整配置，后续 predict 脚本会从 checkpoint 里恢复模型结构。
     if args.prediction_target == QUALITY_TARGET:
         model_type = f"causal_transformer_{args.prior_feature_mode}_direct_quality_base_conv"
-    elif args.output_parameterization == LOG_P0_PLUS_DELTA:
-        model_type = "causal_transformer_log_p0_delta_residual_base_conv"
     else:
         model_type = f"causal_transformer_{args.prior_feature_mode}_direct_residual_base_conv"
-    if platform_by_file is not None:
-        model_type += "_platform"
     if args.quality_distribution_prior:
         model_type += "_quality_distribution_prior"
     config = {
@@ -640,21 +530,11 @@ def main() -> int:
             else "residual_-94_94"
         ),
         "prior_feature_mode": args.prior_feature_mode,
-        "prior_summary_features": (
-            [
-                "top1_confidence",
-                "top1_top2_log_probability_margin",
-                "normalized_entropy",
-            ]
-            if args.prior_feature_mode == COMPACT_PRIOR
-            else []
-        ),
         "output_parameterization": args.output_parameterization,
         "uses_qr_mer": bool(args.qmer_ks or args.rmer_ks),
         "uses_q_hat": True,
         "uses_residual_history": True,
         "uses_base_context": True,
-        "uses_platform_embedding": platform_by_file is not None,
         "quality_distribution_prior": args.quality_distribution_prior,
         "quality_distribution_scope": (
             "full_h5_body_per_file" if args.quality_distribution_prior else "disabled"
@@ -679,16 +559,6 @@ def main() -> int:
                 for path in files
             }
             if quality_distributions_by_file is not None
-            else {}
-        ),
-        "platform_names": list(PLATFORM_NAMES),
-        "platform_by_file": platform_by_file or {},
-        "platform_id_by_file": (
-            {
-                basename: PLATFORM_TO_ID[platform]
-                for basename, platform in platform_by_file.items()
-            }
-            if platform_by_file is not None
             else {}
         ),
         "base_context_is_bidirectional": True,
@@ -739,7 +609,6 @@ def main() -> int:
         "base_conv_kernels": list(args.base_conv_kernels),
         "base_conv_channels": args.base_conv_channels,
         "base_context_dim": args.base_context_dim,
-        "platform_embed_dim": args.platform_embed_dim,
         "d_model": args.d_model,
         "num_heads": args.num_heads,
         "num_layers": args.num_layers,
@@ -785,7 +654,6 @@ def main() -> int:
         base_conv_kernels=args.base_conv_kernels,
         base_conv_channels=args.base_conv_channels,
         base_context_dim=args.base_context_dim,
-        platform_embed_dim=args.platform_embed_dim,
         quality_distribution_prior=args.quality_distribution_prior,
         quality_distribution_embed_dim=(
             args.quality_distribution_embed_dim
@@ -879,16 +747,6 @@ def main() -> int:
             for step in step_iter:
                 batch, batch_path = sampler.sample()
                 tensors = batch_to_torch(batch, device)
-                platform_id = (
-                    platform_ids_for_batch(
-                        batch_size=int(tensors["continuous"].shape[0]),
-                        path=batch_path,
-                        platform_by_file=platform_by_file,
-                        device=device,
-                    )
-                    if platform_by_file is not None
-                    else None
-                )
                 quality_distribution_log_probs = (
                     quality_distribution_tensors_by_file[batch_path.resolve()]
                     if quality_distribution_tensors_by_file is not None
@@ -906,7 +764,6 @@ def main() -> int:
                     qmer_tokens=tensors["qmer_tokens"],
                     rmer_tokens=tensors["rmer_tokens"],
                     base_ids=tensors["base_ids"],
-                    platform_id=platform_id,
                     quality_distribution_log_probs=quality_distribution_log_probs,
                     lengths=tensors["lengths"],
                 )
@@ -975,7 +832,6 @@ def main() -> int:
                 prior_feature_mode=args.prior_feature_mode,
                 prediction_target=args.prediction_target,
                 quality_alphabet_size=selected_quality_alphabet_size,
-                platform_by_file=platform_by_file,
                 quality_distributions_by_file=quality_distributions_by_file,
             )
             elapsed = time.time() - started

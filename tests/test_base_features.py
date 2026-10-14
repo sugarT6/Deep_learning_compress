@@ -123,8 +123,6 @@ class BaseFeatureTest(unittest.TestCase):
         self.assertEqual(int(batch.base_ids[0, 3]), BASE_T_TOKEN)
         self.assertEqual(int(batch.base_ids[0, 4]), BASE_PAD_TOKEN)
         self.assertEqual(int(batch.base_ids[1, 4]), BASE_T_TOKEN)
-        self.assertEqual(batch.exact_q_lags.shape, (2, 3, 0))
-        self.assertEqual(batch.exact_r_lags.shape, (2, 3, 0))
         self.assertEqual(batch.continuous.shape[-1], QHAT_ONLY_CONTINUOUS_FEATURE_DIM)
 
     def test_base_conv_model_forward_and_checkpoint_shapes(self) -> None:
@@ -156,8 +154,6 @@ class BaseFeatureTest(unittest.TestCase):
             q_hat=tensors["q_hat"],
             prev_q=tensors["prev_q"],
             prev_r=tensors["prev_r"],
-            exact_q_lags=tensors["exact_q_lags"],
-            exact_r_lags=tensors["exact_r_lags"],
             qmer_tokens=tensors["qmer_tokens"],
             rmer_tokens=tensors["rmer_tokens"],
             base_ids=tensors["base_ids"],
@@ -171,8 +167,6 @@ class BaseFeatureTest(unittest.TestCase):
                 q_hat=tensors["q_hat"],
                 prev_q=tensors["prev_q"],
                 prev_r=tensors["prev_r"],
-                exact_q_lags=tensors["exact_q_lags"],
-                exact_r_lags=tensors["exact_r_lags"],
                 qmer_tokens=tensors["qmer_tokens"],
                 rmer_tokens=tensors["rmer_tokens"],
                 lengths=tensors["lengths"],

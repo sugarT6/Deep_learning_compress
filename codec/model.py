@@ -469,11 +469,7 @@ class DirectQualityTransformer(nn.Module):
         hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask)
                   if isinstance(self.output_head, CrossLayerOutputHead)
                   else self._hidden_impl(bases, qualities, lengths, active_mask))
-        # Historical container heads may require decoder-known context. Normal
-        # linear/residual heads never implement or execute this compatibility hook.
-        contextual_head = getattr(self.output_head, "forward_with_quality", None)
-        logits = (self.output_head(hidden) if contextual_head is None
-                  else contextual_head(hidden, qualities, active_mask))
+        logits = self.output_head(hidden)
         return logits * active_mask.unsqueeze(-1).to(logits.dtype)
 
     def forward_features(self, bases, qualities, lengths, active_mask):

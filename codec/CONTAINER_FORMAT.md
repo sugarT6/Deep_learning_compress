@@ -96,11 +96,10 @@ rules and branch width. Physical container version remains 3. The normalization
 is performed when extracting features on both codec ends, not learned during
 decoding. Older adapters keep their original probability paths.
 
-Historical adapter v3 (not expert profile v3) is decode-only. It widened the
-residual input by eight strict-prefix Q features and stored their exact schema
-in `history_features`. The isolated `_legacy_quality_history.py` module retains
-that numerical protocol to decode existing files. New training/encoding cannot
-select it, and exported Q-history artifacts are rejected by the encoder.
+Adapter v3 used eight experimental Q-history features and is no longer
+supported. Its feature construction and compatibility loader were removed
+during the 2026-10-14 cleanup. Version 3 must not be reused for a new adapter
+protocol. Physical container version 3 remains supported for current heads.
 
 Adapter v5 was an unsuccessful eight-Q sequence-branch experiment and is no
 longer supported. Use original commit `d73c8b8` for any experimental v5 files;

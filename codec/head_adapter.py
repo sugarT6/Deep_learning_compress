@@ -106,8 +106,6 @@ def _new_head(d_model, residual_dim, *, device, dtype, seed=0, cross_dim=None):
 
 
 def serialize_head(head, base_sha256):
-    if getattr(head, "decode_only", False):
-        raise ValueError("Q-history adapters are retired and decode-only")
     arrays = [p.detach().cpu().numpy().astype("<f4", copy=False) for p in _head_parameters(head)]
     if not all(np.isfinite(a).all() for a in arrays):
         raise ValueError("adapter parameters must be finite")
@@ -144,20 +142,15 @@ def validate_head_adapter(metadata, d_model, base_sha256):
     if not isinstance(metadata, dict):
         raise ValueError("adapter fields missing or unknown")
     version = metadata.get("version")
-    if type(version) is not int or version not in (1, 2, 3, 4):
+    if type(version) is not int or version not in (1, 2, 4):
         raise ValueError("unsupported adapter version")
     if version >= 2:
         keys.update(("residual_dim", "activation", "down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"))
-    if version == 3:
-        keys.add("history_features")
     if version == 4:
         keys.update(("cross_dim", "source_layer", "source_normalization", "source_eps",
                      "cross_down_weight_shape", "cross_down_bias_shape", "cross_up_weight_shape", "cross_up_bias_shape"))
     if set(metadata) != keys:
         raise ValueError("adapter fields missing or unknown")
-    if version == 3:
-        from ._legacy_quality_history import validate_history_feature_schema
-        validate_history_feature_schema(metadata["history_features"])
     layout = ("weight_row_major_then_bias" if version == 1 else
               "weight_bias_down_weight_down_bias_up_weight_up_bias")
     if version == 4:
@@ -173,8 +166,7 @@ def validate_head_adapter(metadata, d_model, base_sha256):
         width = metadata["residual_dim"]
         if type(width) is not int or not 1 <= width <= 128 or metadata["activation"] != "gelu_exact":
             raise ValueError("invalid residual head width or activation")
-        input_dim = d_model + (8 if version == 3 else 0)
-        shapes.extend((("down_weight_shape", [width, input_dim]), ("down_bias_shape", [width]),
+        shapes.extend((("down_weight_shape", [width, d_model]), ("down_bias_shape", [width]),
                        ("up_weight_shape", [42, width]), ("up_bias_shape", [42])))
     if version == 4:
         width = metadata["cross_dim"]
@@ -210,14 +202,8 @@ def validate_head_adapter(metadata, d_model, base_sha256):
 
 def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
     values = validate_head_adapter(metadata, d_model, base_sha256)
-    if metadata["version"] == 3:
-        from ._legacy_quality_history import LegacyHistoryHead
-        with torch.random.fork_rng(devices=[]):
-            head = LegacyHistoryHead(d_model, metadata["residual_dim"])
-        head = head.to(device=device, dtype=dtype)
-    else:
-        head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype,
-                         cross_dim=metadata.get("cross_dim"))
+    head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype,
+                     cross_dim=metadata.get("cross_dim"))
     offset = 0
     with torch.no_grad():
         for parameter in _head_parameters(head):
@@ -256,8 +242,6 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         from .lora_adapter import adapt_last_layer
         return adapt_last_layer(model, source, device=device, batch_reads=batch_reads,
                                total=total, base_sha256=base_sha256, config=config)
-    if getattr(model.output_head, "decode_only", False):
-        raise ValueError("Q-history adapters are retired and cannot be fine-tuned")
     if config.cross_layer and model.config.num_layers < 4:
         raise ValueError("cross-layer adaptation requires at least 4 Transformer layers")
     started = time.perf_counter()

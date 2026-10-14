@@ -1,17 +1,11 @@
 import unittest
-from unittest import mock
 
 import numpy as np
 
-import sequence_residual_transformer_model as residual_model
 from predict_sequence_residual_transformer import mer_params_from_config
 from sequence_residual_transformer_model import (
     ALPHABET_SIZE,
-    COMPACT_PRIOR,
-    COMPACT_PRIOR_CONTINUOUS_FEATURE_DIM,
     DEFAULT_QUALITY_ALPHABET_SIZE,
-    FULL_PRIOR,
-    FULL_PRIOR_CONTINUOUS_FEATURE_DIM,
     QHAT_ONLY,
     QHAT_ONLY_CONTINUOUS_FEATURE_DIM,
     QUALITY_TARGET,
@@ -51,84 +45,24 @@ class PriorFeatureModeTest(unittest.TestCase):
         np.testing.assert_allclose(batch.continuous[0, :, 1], np.asarray([0.0002, 0.0002]))
         np.testing.assert_array_equal(batch.targets[0], self.observed[:2])
 
-    def test_qhat_only_does_not_construct_log_probability_matrix(self) -> None:
-        with mock.patch.object(
-            residual_model,
-            "_quality_probs",
-            side_effect=AssertionError("full prior path was used"),
-        ):
-            self.build(QHAT_ONLY)
+    def test_distribution_shape_cannot_enter_qhat_only_features(self) -> None:
+        before = self.build(QHAT_ONLY)
+        self.freqs[:, 0] += 1  # Change distribution shape, preserving every argmax.
+        after = self.build(QHAT_ONLY)
+        np.testing.assert_array_equal(before.continuous, after.continuous)
+        np.testing.assert_array_equal(before.q_hat, after.q_hat)
+        np.testing.assert_array_equal(before.prev_r, after.prev_r)
+        self.assertNotEqual(before.baseline_bits, after.baseline_bits)
 
-    def test_compact_prior_contains_three_distribution_summaries(self) -> None:
-        batch = self.build(COMPACT_PRIOR)
-        self.assertEqual(
-            batch.continuous.shape,
-            (2, 2, COMPACT_PRIOR_CONTINUOUS_FEATURE_DIM),
-        )
+    def test_retired_features_are_rejected_without_affecting_qhat_checkpoints(self) -> None:
+        for mode in ("full_prior", "compact_prior"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.build(mode)
+        for fields in ({"continuous_dim": 194}, {"exact_q_lags": [2]},
+                       {"exact_r_lags": [3]}, {"platform_embed_dim": 8}):
+            with self.subTest(fields=fields), self.assertRaisesRegex(ValueError, "retired"):
+                mer_params_from_config(fields)
 
-        row = self.freqs[0].astype(np.float64)
-        probabilities = row / row.sum()
-        expected_confidence = probabilities[30]
-        expected_margin = np.log(30.0 / 1.0)
-        expected_entropy = -np.sum(probabilities * np.log(probabilities)) / np.log(95.0)
-        np.testing.assert_allclose(
-            batch.continuous[0, 0, :],
-            np.asarray(
-                [expected_confidence, expected_margin, expected_entropy, 0.0, 0.0002]
-            ),
-            rtol=1e-6,
-            atol=1e-7,
-        )
-        np.testing.assert_allclose(
-            batch.continuous[0, 1, 3:],
-            np.asarray([1.0, 0.0002]),
-        )
-        np.testing.assert_array_equal(batch.q_hat[0], np.asarray([30, 31]))
-        np.testing.assert_array_equal(batch.targets[0], self.observed[:2])
-
-    def test_compact_prior_shares_targets_and_baseline(self) -> None:
-        qhat_only = self.build(QHAT_ONLY)
-        compact_prior = self.build(COMPACT_PRIOR)
-
-        np.testing.assert_array_equal(qhat_only.q_hat, compact_prior.q_hat)
-        np.testing.assert_array_equal(qhat_only.targets, compact_prior.targets)
-        np.testing.assert_allclose(qhat_only.h5_true_prob, compact_prior.h5_true_prob)
-        self.assertAlmostEqual(qhat_only.baseline_bits, compact_prior.baseline_bits)
-
-    def test_full_prior_and_qhat_only_share_targets_and_baseline(self) -> None:
-        qhat_only = self.build(QHAT_ONLY)
-        full_prior = self.build(FULL_PRIOR)
-
-        self.assertEqual(
-            full_prior.continuous.shape,
-            (2, 2, FULL_PRIOR_CONTINUOUS_FEATURE_DIM),
-        )
-        np.testing.assert_array_equal(qhat_only.q_hat, full_prior.q_hat)
-        np.testing.assert_array_equal(qhat_only.targets, full_prior.targets)
-        np.testing.assert_allclose(qhat_only.h5_true_prob, full_prior.h5_true_prob)
-        self.assertAlmostEqual(qhat_only.baseline_bits, full_prior.baseline_bits)
-
-        for read_idx, length in enumerate(full_prior.lengths):
-            for pos in range(int(length)):
-                q_hat = int(full_prior.q_hat[read_idx, pos])
-                observed = int(full_prior.targets[read_idx, pos])
-                residual_class = observed - q_hat - RESIDUAL_MIN
-                log_p0_true = float(
-                    full_prior.continuous[read_idx, pos, residual_class]
-                )
-                self.assertAlmostEqual(
-                    float(np.exp(log_p0_true)),
-                    float(full_prior.h5_true_prob[read_idx, pos]),
-                    places=6,
-                )
-        self.assertEqual(full_prior.continuous.shape[-1], RESIDUAL_CLASSES + 5)
-
-    def test_old_checkpoint_without_mode_is_inferred_as_full_prior(self) -> None:
-        old_config = {"continuous_dim": FULL_PRIOR_CONTINUOUS_FEATURE_DIM}
-        params = mer_params_from_config(old_config)
-        self.assertEqual(params["prior_feature_mode"], FULL_PRIOR)
-        self.assertEqual(params["prediction_target"], RESIDUAL_TARGET)
-        self.assertEqual(params["quality_alphabet_size"], ALPHABET_SIZE)
 
     def test_prediction_restores_new_42_class_checkpoint_alphabet(self) -> None:
         params = mer_params_from_config(

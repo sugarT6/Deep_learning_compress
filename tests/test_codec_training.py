@@ -25,6 +25,7 @@ from codec.model import (
     fastq_batch_to_tensors, masked_cross_entropy,
 )
 from codec.train import BalancedTrainingSampler, run_training
+from codec.training_control import TrainingControlConfig
 from codec.training_cache import create_training_cache, default_cache_path
 
 
@@ -317,6 +318,102 @@ class DirectQualityTrainingTest(unittest.TestCase):
             for key in a["model_state_dict"]:
                 torch.testing.assert_close(a["model_state_dict"][key], b["model_state_dict"][key], rtol=0, atol=0)
             self.assertEqual(load_training_checkpoint(root / "resumed/best.pt").payload["epoch"], 1)
+
+    def _control_training_kwargs(self, root):
+        dataset = TRAIN_DATASETS[0]
+        self._create_dataset_cache(root, dataset, read_count=640)
+        return dict(cache_dir=root, model_config=replace(tiny_config(), dropout=.2),
+                    steps_per_epoch=1, batch_reads=256, train_fraction=.9,
+                    validation_max_reads_per_file=2, learning_rate=.001,
+                    weight_decay=0., grad_clip=1., device=torch.device("cpu"),
+                    seed=12, train_datasets=[dataset], progress=False)
+
+    @staticmethod
+    def _validation(bits):
+        return [], {"dataset_macro_bits_per_quality": bits,
+                    "symbol_micro_bits_per_quality": bits}
+
+    def test_lr_reductions_resume_with_identical_model_optimizer_and_sampling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kwargs = self._control_training_kwargs(root)
+            kwargs["control_config"] = TrainingControlConfig(
+                lr_scheduler="plateau", lr_patience=0, min_lr=1e-4)
+            scores = [self._validation(v) for v in (1., 1.2, 1.3, .9)]
+            with mock.patch.object(train_module, "evaluate_validation", side_effect=scores):
+                run_training(output_dir=root / "whole", epochs=4, **kwargs)
+            with mock.patch.object(train_module, "evaluate_validation", side_effect=scores[:2]):
+                run_training(output_dir=root / "first", epochs=2, **kwargs)
+            with mock.patch.object(train_module, "evaluate_validation", side_effect=scores[2:]):
+                run_training(output_dir=root / "resumed", epochs=4,
+                             resume=root / "first/last.pt", **kwargs)
+            a = load_training_checkpoint(root / "whole/last.pt").payload
+            b = load_training_checkpoint(root / "resumed/last.pt").payload
+            self.assertEqual(a["sampler_state"], b["sampler_state"])
+            self.assertEqual(a["training_state"]["control_state"], b["training_state"]["control_state"])
+            self.assertEqual(a["optimizer_state_dict"]["param_groups"], b["optimizer_state_dict"]["param_groups"])
+            for key in a["model_state_dict"]:
+                torch.testing.assert_close(a["model_state_dict"][key], b["model_state_dict"][key], rtol=0, atol=0)
+            for key, state in a["optimizer_state_dict"]["state"].items():
+                for name, value in state.items():
+                    torch.testing.assert_close(value, b["optimizer_state_dict"]["state"][key][name], rtol=0, atol=0)
+            logs = [json.loads(line) for line in (root / "whole/training_log.jsonl").read_text().splitlines()]
+            self.assertEqual([x["learning_rate"] for x in logs], [.001, .001, .0005, .00025])
+            self.assertFalse(json.loads((root / "whole/training_summary.json").read_text())["stopped_early"])
+
+    def test_early_stop_state_resumes_and_strict_improvements_still_save_best(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kwargs = self._control_training_kwargs(root)
+            kwargs["control_config"] = TrainingControlConfig(
+                lr_scheduler="plateau", lr_patience=0,
+                early_stopping_patience=2, min_delta=.01)
+            scores = [self._validation(v) for v in (1., .995, .994)]
+            with mock.patch.object(train_module, "evaluate_validation", side_effect=scores):
+                run_training(output_dir=root / "whole", epochs=10, **kwargs)
+            with mock.patch.object(train_module, "evaluate_validation", side_effect=scores[:2]):
+                run_training(output_dir=root / "first", epochs=2, **kwargs)
+            with mock.patch.object(train_module, "evaluate_validation", side_effect=scores[2:]):
+                run_training(output_dir=root / "resumed", epochs=10,
+                             resume=root / "first/last.pt", **kwargs)
+            for name in ("whole", "resumed"):
+                summary = json.loads((root / name / "training_summary.json").read_text())
+                self.assertTrue(summary["stopped_early"])
+                self.assertEqual(summary["completed_epoch"], 3)
+                self.assertEqual(load_training_checkpoint(root / name / "best.pt").payload["epoch"], 3)
+
+    def test_legacy_checkpoint_can_start_controls_but_new_resume_must_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kwargs = self._control_training_kwargs(root)
+            with mock.patch.object(train_module, "evaluate_validation", return_value=self._validation(1.)):
+                run_training(output_dir=root / "legacy", epochs=1, **kwargs)
+            for name in ("best.pt", "last.pt"):
+                path = root / "legacy" / name
+                payload = torch.load(path)
+                payload["training_state"]["version"] = 1
+                payload["training_state"].pop("control_state")
+                payload["training_state"]["run_config"].pop("training_control")
+                torch.save(payload, path)
+            controls = TrainingControlConfig(lr_scheduler="plateau", lr_patience=0)
+            with mock.patch.object(train_module, "evaluate_validation", return_value=self._validation(1.1)):
+                run_training(output_dir=root / "upgraded", epochs=2,
+                             resume=root / "legacy/last.pt", control_config=controls, **kwargs)
+            payload = load_training_checkpoint(root / "upgraded/last.pt").payload
+            self.assertEqual(payload["global_step"], 2)
+            self.assertEqual(payload["training_state"]["version"], 2)
+            self.assertEqual(payload["optimizer_state_dict"]["param_groups"][0]["lr"], .0005)
+            with self.assertRaisesRegex(ValueError, "controls do not match"):
+                run_training(output_dir=root / "mismatch", epochs=3,
+                             resume=root / "upgraded/last.pt",
+                             control_config=replace(controls, lr_patience=1), **kwargs)
+
+    def test_invalid_training_controls_are_rejected(self):
+        for fields in ({"lr_scheduler": "unknown"}, {"lr_factor": 1.},
+                       {"lr_patience": -1}, {"min_lr": float("nan")},
+                       {"min_delta": -.1}, {"early_stopping_patience": True}):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                TrainingControlConfig(**fields)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ from .model import (
     masked_cross_entropy,
 )
 from .fastq_stream import FastqBatch
+from .training_control import TrainingControl, TrainingControlConfig
 from .training_cache import (
     CACHE_FORMAT,
     CACHE_SCHEMA_VERSION,
@@ -84,7 +85,7 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 def _resume_contract(config: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         key: value for key, value in config.items()
-        if key not in ("epochs", "resume_from")
+        if key not in ("epochs", "resume_from", "training_control")
     }
 
 
@@ -414,6 +415,7 @@ def run_training(
     unseen_datasets: Sequence[DirectQualityDataset] = UNSEEN_DATASETS,
     progress: bool = True,
     resume: Optional[Path] = None,
+    control_config: Optional[TrainingControlConfig] = None,
 ) -> Path:
     """Train and select checkpoints using only train-source validation reads."""
 
@@ -421,8 +423,12 @@ def run_training(
         raise ValueError("epochs and steps_per_epoch must be positive")
     if validation_max_reads_per_file < 0:
         raise ValueError("validation_max_reads_per_file must be nonnegative")
-    if learning_rate <= 0 or weight_decay < 0 or grad_clip <= 0:
+    if (not all(math.isfinite(value) for value in (learning_rate, weight_decay, grad_clip))
+            or learning_rate <= 0 or weight_decay < 0 or grad_clip <= 0):
         raise ValueError("invalid optimizer configuration")
+    control_config = control_config or TrainingControlConfig()
+    if control_config.lr_scheduler == "plateau" and control_config.min_lr > learning_rate:
+        raise ValueError("min_lr must not exceed learning_rate")
 
     random.seed(seed)
     np.random.seed(seed)
@@ -443,6 +449,8 @@ def run_training(
     global_step = 0
     best_path = output_dir / "best.pt"
     start_epoch = 1
+    restored_control_state = None
+    stopped_early = False
 
     with BalancedTrainingSampler(
         train_datasets,
@@ -486,6 +494,7 @@ def run_training(
             "selection_metric": SELECTION_METRIC,
             "device": str(device),
             "seed": seed,
+            "training_control": control_config.to_dict(),
         }
         if resume is not None:
             loaded = load_training_checkpoint(resume, device=device)
@@ -494,10 +503,16 @@ def run_training(
             if not payload.get("sampler_state") or not saved_training:
                 raise ValueError("checkpoint lacks resumable training/sampler state")
             previous_config = saved_training["run_config"]
-            if saved_training.get("version") != 1:
+            if saved_training.get("version") not in (1, 2):
                 raise ValueError("unsupported training state version")
             if _resume_contract(previous_config) != _resume_contract(run_config):
                 raise ValueError("resume run configuration does not match checkpoint")
+            if saved_training["version"] == 2:
+                if previous_config.get("training_control") != control_config.to_dict():
+                    raise ValueError("resume training controls do not match checkpoint")
+                restored_control_state = saved_training.get("control_state")
+                if restored_control_state is None:
+                    raise ValueError("checkpoint lacks training control state")
             if payload.get("selection_metric") != SELECTION_METRIC:
                 raise ValueError("resume checkpoint selection metric mismatch")
             start_epoch = payload["epoch"] + 1
@@ -533,10 +548,14 @@ def run_training(
             if device.type == "cuda":
                 torch.cuda.set_rng_state_all([s.cpu() for s in saved_training["cuda_rng"]])
             run_config["resume_from"] = str(Path(resume).resolve())
+        control = TrainingControl(optimizer, control_config, best_bits=best_validation_bits)
+        if restored_control_state is not None:
+            control.load_state_dict(restored_control_state)
         _write_json_atomic(output_dir / "run_config.json", run_config)
 
         for epoch in range(start_epoch, epochs + 1):
             model.train()
+            epoch_learning_rate = optimizer.param_groups[0]["lr"]
             epoch_nats = 0.0
             epoch_symbols = 0
             step_iter = range(1, steps_per_epoch + 1)
@@ -585,6 +604,7 @@ def run_training(
             validation_bits = validation_summary[SELECTION_METRIC]
             if not math.isfinite(validation_bits):
                 raise ValueError("validation dataset macro must be finite")
+            stopped_early = control.step(validation_bits)
             sampling_statistics = sampler.statistics_dict()
             train_loss = epoch_nats / epoch_symbols
             train_bits = train_loss / math.log(2.0)
@@ -594,6 +614,10 @@ def run_training(
                 "train_loss": train_loss,
                 "train_bits_per_quality": train_bits,
                 "validation": validation_summary,
+                "learning_rate": epoch_learning_rate,
+                "next_learning_rate": optimizer.param_groups[0]["lr"],
+                "early_stopping_bad_epochs": control.bad_epochs,
+                "stopped_early": stopped_early,
             }
             with (output_dir / "training_log.jsonl").open(
                 "a", encoding="utf-8"
@@ -616,7 +640,8 @@ def run_training(
                 "selection_metric": SELECTION_METRIC,
                 "sampler_state": sampler.state_dict(),
                 "training_state": {
-                    "version": 1,
+                    "version": 2,
+                    "control_state": control.state_dict(),
                     "run_config": run_config,
                     "python_rng": random.getstate(),
                     "numpy_rng": np.random.get_state(),
@@ -636,11 +661,24 @@ def run_training(
                     f"val_family_macro={validation_summary['platform_family_macro_bits_per_quality']:.4f} "
                     f"val_worst={validation_summary['worst_dataset']['bits_per_quality']:.4f} "
                     f"best_val_bits={best_validation_bits:.4f}",
+                    f"lr={epoch_learning_rate:.6g} next_lr={optimizer.param_groups[0]['lr']:.6g}",
                     flush=True,
                 )
+            if stopped_early:
+                if progress:
+                    print(f"early stopping after epoch {epoch}", flush=True)
+                break
         _write_json_atomic(
             output_dir / "sampling_statistics.json", sampler.statistics_dict()
         )
+        _write_json_atomic(output_dir / "training_summary.json", {
+            "start_epoch": start_epoch, "completed_epoch": epoch,
+            "requested_epochs": epochs, "global_step": global_step,
+            "stopped_early": stopped_early,
+            "best_validation_bits_per_quality": best_validation_bits,
+            "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "final_learning_rate": optimizer.param_groups[0]["lr"],
+        })
     return best_path
 
 
@@ -665,6 +703,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--lr-scheduler", choices=("none", "plateau"), default="none")
+    parser.add_argument("--lr-factor", type=float, default=0.5)
+    parser.add_argument("--lr-patience", type=int, default=2,
+                        help="plateau epochs tolerated before reducing LR on the next non-improvement")
+    parser.add_argument("--min-lr", type=float, default=1e-5)
+    parser.add_argument("--early-stopping-patience", type=int, default=0,
+                        help="stop after this many epochs without a min-delta improvement; 0 disables")
+    parser.add_argument("--min-delta", type=float, default=1e-4,
+                        help="absolute macro BPQ improvement for scheduling/stopping, not best.pt selection")
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=4)
@@ -705,6 +752,12 @@ def main() -> int:
             seed=args.seed,
             progress=not args.no_progress,
             resume=args.resume,
+            control_config=TrainingControlConfig(
+                lr_scheduler=args.lr_scheduler, lr_factor=args.lr_factor,
+                lr_patience=args.lr_patience, min_lr=args.min_lr,
+                early_stopping_patience=args.early_stopping_patience,
+                min_delta=args.min_delta,
+            ),
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

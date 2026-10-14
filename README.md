@@ -24,7 +24,7 @@ and features. Its full parameters are embedded as adapter v2 inside container
 v3; update the decoder as well. No separate adapter JSON is needed to decode.
 The unsuccessful `--head-history-features` experiment has been retired. Its
 training/encoding path and standalone feature module were removed; existing
-adapter-v3 Q-history containers remain readable via decode-only compatibility.
+adapter-v3 Q-history compatibility has also been removed.
 `--head-cross-layer --head-cross-dim 16` optionally adds a small branch from
 the frozen third Transformer block to the residual head (adapter v4). It caches
 both layer representations for fitting and transmits the full head for decoding.
@@ -60,6 +60,12 @@ block). `best.pt` uses validation dataset-macro bits/Q. Full sampler rules,
 coverage calculations, checkpoint resume instructions, and the **40,000-step
 and 70,320-step formal training commands** are in
 [codec/TRAINING_SAMPLER.md](codec/TRAINING_SAMPLER.md).
+
+The current compression-ratio comparison continues the existing 4-layer model
+to 80,000 total updates and trains a 6-layer, 3,297,946-parameter model from
+scratch for 80,000 updates. Both use 40 epochs of 2,000 steps. See the sampler
+document for commands, validation-driven LR reduction, optional early stopping
+and exact checkpoint continuation. The fixed-budget commands disable stopping.
 
 Historical completed batch-64 run command (the old sampler behavior is retained
 in its original code commit, not selected by the current command):
@@ -223,26 +229,8 @@ r_j = q_j - q_hat_j, for already decoded positions j < i
 P_model(q_true_i | q_hat_i, position, bases, decoded q/r history before i)
 ```
 
-Three prior-feature modes are available:
-
-```text
-qhat_only (default): use the matrix only for q_hat and H5 baseline
-compact_prior:       additionally input three compact distribution summaries
-full_prior:          additionally input log P0_r and probability summaries
-```
-
-`compact_prior` adds the top-1 probability, the natural-log probability margin
-between the top-1 and top-2 classes, and entropy normalized by `log(95)`. Its
-five continuous inputs are those three summaries, relative position, and
-normalized read length. This mode preserves the direct-quality target and all
-causal history/base features while testing whether a small amount of prior
-shape information recovers signal discarded by `qhat_only`.
-
-`full_prior` reproduces the previous input. It normalizes H5 counts into
-`P0(q)`, clamps probabilities to `1e-12`, and applies the natural logarithm
-before mapping them into the 189 residual classes. `log_p0_plus_delta` remains
-available only for historical `full_prior + residual` runs; direct 42-class
-body-quality logits are the current default.
+The H5 training tool supports only `qhat_only`: the matrix supplies q_hat
+and report-only baseline probabilities, not probability-summary inputs.
 
 The two alphabets are deliberately separate. `/freqs` remains `[N, 95]`, and
 `q_hat` is still the argmax of all 95 upstream columns. The direct model output
@@ -270,17 +258,10 @@ Residual-mer history embeddings for k = 2,3,4
 bidirectional local base context from complete DNA read
 ```
 
-`compact_prior` adds top-1 confidence, top-1/top-2 log-probability margin, and
-normalized H5 entropy. `full_prior` adds 189-dimensional `log P0_r(r)`, H5 max
-probability, normalized H5 entropy, and normalized H5 expected quality.
-Exact-lag support remains for historical checkpoint compatibility.
-
-An optional file-level platform embedding is independent of the prior mode.
-Training requires an explicit mapping for every input file; the resolved
-basename-to-platform name and stable platform id are stored in the checkpoint,
-so prediction restores them automatically. The current platform vocabulary is
-`BGISEQ=0`, `Illumina=1`, and `IonTorrent=2`. The platform value must be
-available as file/container metadata to both the encoder and decoder.
+Retired exact-lag, full/compact-prior and platform-embedding implementations
+have been removed. Historical checkpoints using these inputs are rejected;
+qhat-only checkpoints without them and the independent `codec` model remain
+supported. No datasets or existing artifacts are removed.
 
 ## Registered multi-platform datasets
 
@@ -990,75 +971,6 @@ This run uses 64 reads and 2,000 optimizer updates per epoch. Relative to the
 previous 128-read experiment at the same step count, it samples half as many
 reads per epoch but preserves the same number of optimizer updates.
 
-To test the three compact prior summaries against the current six-dataset
-2,600-step baseline while keeping every other setting fixed:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
-  h5 \
-  --epochs 15 \
-  --steps-per-epoch 2600 \
-  --batch-reads 64 \
-  --eval-batch-reads 64 \
-  --eval-max-reads-per-file 5000 \
-  --num-layers 4 \
-  --prediction-target quality \
-  --quality-alphabet-size 95 \
-  --prior-feature-mode compact_prior \
-  --qmer-ks 2,3,4 \
-  --rmer-ks 2,3,4 \
-  --base-sidecar-dir base_sidecars \
-  --base-conv-kernels 3,5,7 \
-  --output-parameterization direct_logits \
-  --output-dir runs/transformer_quality_4layer_compactprior_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197
-```
-
-Then run the full held-out prediction:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
-  runs/transformer_quality_4layer_compactprior_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/best.pt \
-  h5 \
-  --batch-reads 64 \
-  --base-sidecar-dir base_sidecars \
-  --output-csv runs/transformer_quality_4layer_compactprior_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/predict_metrics.csv
-```
-
-To test only an 8-dimensional platform embedding on the `qhat_only` baseline:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python train_sequence_residual_transformer.py \
-  h5 \
-  --epochs 15 \
-  --steps-per-epoch 2600 \
-  --batch-reads 64 \
-  --eval-batch-reads 64 \
-  --eval-max-reads-per-file 5000 \
-  --num-layers 4 \
-  --prediction-target quality \
-  --quality-alphabet-size 95 \
-  --prior-feature-mode qhat_only \
-  --platform-embed-dim 8 \
-  --platform-map ERR2755197=BGISEQ,SRR1238539=IonTorrent,SRR3066199=Illumina,SRR5867380=IonTorrent,SRR622457=Illumina,SRR6691666=Illumina \
-  --qmer-ks 2,3,4 \
-  --rmer-ks 2,3,4 \
-  --base-sidecar-dir base_sidecars \
-  --base-conv-kernels 3,5,7 \
-  --output-parameterization direct_logits \
-  --output-dir runs/transformer_quality_4layer_qhatonly_platform8_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197
-```
-
-Prediction reads the mapping from the checkpoint:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python predict_sequence_residual_transformer.py \
-  runs/transformer_quality_4layer_qhatonly_platform8_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/best.pt \
-  h5 \
-  --batch-reads 64 \
-  --base-sidecar-dir base_sidecars \
-  --output-csv runs/transformer_quality_4layer_qhatonly_platform8_qrmer234_baseconv357_b64_e15_s2600_srr5_err2755197/predict_metrics.csv
-```
-
 To reproduce the previous qhat-only residual target with the same code, change
 the target, output parameterization, and output directory:
 
@@ -1137,7 +1049,7 @@ python predict_sequence_residual_transformer.py \
   --quality-prob-log-rows 1000
 ```
 
-The prediction target, body-quality alphabet, prior-feature, historical exact-lag,
+The prediction target, body-quality alphabet, qhat-only,
 output-parameterization, Q/R-mer, and base-branch settings are restored from
 the checkpoint; no prediction-side switch is needed. Exact-lag support remains
 only for loading the completed ablation checkpoint and is disabled in current

@@ -402,13 +402,10 @@ training option. On CNR0847462 (2M reads / 300M qualities, 8000-read prefix,
 - Q-history added 6223 bytes: 4538 quality-stream bytes and 1685 adapter bytes.
   The roughly 6.5-second timing difference is not evidence of a reliable speedup.
 
-The `history_features` fitting configuration, feature-cache concatenation,
-CLI flag and training-specific tests were removed. `--head-history-features`
-and loading a Q-history artifact for new encoding fail explicitly. Current
-heads use only the original 256-dimensional frozen features. Existing adapter
-v3 containers are still decoded with the unchanged feature formulas in the
-isolated `_legacy_quality_history.py` compatibility module. Its regression
-tests remain; no generated containers/artifacts or user data were deleted.
+The fitting path, feature formulas, CLI option, adapter-v3 compatibility
+loader and associated tests have all been removed. Current linear, residual
+and cross-layer heads are unchanged. Existing experimental v3 adapters are
+unsupported; no generated containers, artifacts or user data were deleted.
 The complete historical implementation remains in Git commit `d9bedd4`.
 
 Next proposed ablation (not run or promoted to a default): compare residual

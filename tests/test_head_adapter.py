@@ -6,12 +6,10 @@ import json
 from pathlib import Path
 import struct
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 import zlib
 
-import numpy as np
 import torch
 
 from codec.checkpoint import save_training_checkpoint
@@ -74,6 +72,32 @@ def rewrite_metadata(source, target, change, physical=None):
 
 
 class HeadAdapterTest(unittest.TestCase):
+    def test_six_layer_backbone_cross_head_floor_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, ckpt = model_and_checkpoint(root, num_layers=6)
+            source, raw = source_file(root, count=17, compressed=True)
+            head = CrossLayerOutputHead(8, 32, 16)
+            with torch.no_grad():
+                head.up.weight.normal_(std=.03)
+                head.cross_up.weight.normal_(std=.03)
+            digest = sha256_file(ckpt)
+            adapter = serialize_head(head, digest)
+            artifact = root / "head.json"
+            artifact.write_text(json.dumps(dict(format="direct-quality-head-adaptation-artifact",
+                                               version=1, base_checkpoint_sha256=digest,
+                                               adapter=adapter, report={})))
+            target = root / "six.fqdc"
+            kwargs = dict(device=torch.device("cpu"), batch_reads=8, progress=False, verify_cdf=True)
+            encode_fastq(source, target, ckpt, head_adapter_path=artifact,
+                         quantization_version=2, **kwargs)
+            restored = root / "restored.fq"
+            decode_fastq(target, restored, ckpt, **kwargs)
+            self.assertEqual(restored.read_bytes(), raw)
+            old_adapter = {**adapter, "version": 3}
+            with self.assertRaisesRegex(ValueError, "unsupported adapter version"):
+                validate_head_adapter(old_adapter, 8, digest)
+
     def test_lora_wire_roundtrip_idempotence_and_rejection(self):
         from codec.lora_adapter import QVLoRA, serialize_lora
         from codec.head_adapter import _new_head
@@ -591,64 +615,6 @@ class HeadAdapterTest(unittest.TestCase):
                       ["--finetune-head", "--head-residual-dim", "16"]):
             with mock.patch("sys.argv", common + flags), self.assertRaises(SystemExit):
                 main()
-
-    def test_retired_history_adapter_remains_decode_only(self):
-        # Build an old-format fixture independently of the production serializer.
-        from codec._legacy_quality_history import LegacyHistoryHead, history_feature_schema
-        from codec.encode import build_parser
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            model, ckpt = model_and_checkpoint(root)
-            source, raw = source_file(root)
-            digest = sha256_file(ckpt)
-            head = LegacyHistoryHead(8, 32)
-            with torch.no_grad():
-                head.up.weight.normal_(std=0.1)
-            parameters = (head.weight, head.bias, head.down.weight, head.down.bias, head.up.weight, head.up.bias)
-            data = b"".join(p.detach().numpy().astype("<f4").tobytes() for p in parameters)
-            adapter = dict(format="direct-quality-output-head", version=3, dtype="little_endian_float32",
-                           application="replace_output_head", layout="weight_bias_down_weight_down_bias_up_weight_up_bias",
-                           base_checkpoint_sha256=digest, residual_dim=32, activation="gelu_exact",
-                           history_features=history_feature_schema(), parameter_bytes=len(data),
-                           sha256=hashlib.sha256(data).hexdigest(), data_base64=base64.b64encode(data).decode())
-            for name, parameter in zip(("weight_shape", "bias_shape", "down_weight_shape", "down_bias_shape",
-                                        "up_weight_shape", "up_bias_shape"), parameters):
-                adapter[name] = list(parameter.shape)
-            apply_head_adapter(model, adapter, digest)
-            with self.assertRaisesRegex(ValueError, "decode-only"):
-                serialize_head(model.output_head, digest)
-            with self.assertRaisesRegex(ValueError, "cannot be fine-tuned"):
-                adapt_output_head(model, source, device=torch.device("cpu"), batch_reads=8,
-                                  total=65536, base_sha256=digest, config=config())
-            # Test-only injection writes arithmetic bytes with the legacy model;
-            # no production flag or artifact can select this head for encoding.
-            payload, container = root / "payload.fqdc", root / "legacy.fqdc"
-            kwargs = dict(device=torch.device("cpu"), batch_reads=8, progress=False, verify_cdf=True)
-            with mock.patch("codec.encode.load_training_checkpoint", return_value=SimpleNamespace(model=model)):
-                encode_fastq(source, payload, ckpt, **kwargs)
-            rewrite_metadata(payload, container,
-                             lambda m: m.update(format_version=3, head_adapter=adapter, probability_profile=None), physical=3)
-            restored = root / "out.fq"
-            decode_fastq(container, restored, ckpt, **kwargs)
-            self.assertEqual(restored.read_bytes(), raw)
-            artifact = root / "legacy.json"
-            artifact.write_text(json.dumps(dict(format="direct-quality-head-adaptation-artifact", version=1,
-                                               base_checkpoint_sha256=digest, adapter=adapter, report={})))
-            with self.assertRaisesRegex(ValueError, "retired"):
-                encode_fastq(source, root / "forbidden.fqdc", ckpt, **kwargs, head_adapter_path=artifact)
-            self.assertFalse((root / "forbidden.fqdc").exists())
-            for i, change in enumerate((lambda a: a.pop("history_features"),
-                                       lambda a: a["history_features"].update(window=16),
-                                       lambda a: a["history_features"].update(version=True),
-                                       lambda a: a.update(down_weight_shape=[32, 8]))):
-                bad = root / f"bad{i}.fqdc"
-                rewrite_metadata(container, bad, lambda m: change(m["head_adapter"]))
-                with self.assertRaises(ContainerError):
-                    read_container(bad)
-        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
-            build_parser().parse_args(["a.fq", "b.fqdc", "base.pt", "--head-history-features"])
-        with self.assertRaises(TypeError):
-            config(head_type="residual", history_features=True)
 
 
 if __name__ == "__main__":

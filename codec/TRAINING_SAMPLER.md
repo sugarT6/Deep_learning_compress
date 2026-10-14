@@ -83,8 +83,9 @@ source-hashed data splits. New training checkpoints additionally contain:
 - sampler version, full configuration and state: schedule RNG and cursor,
   extra-slot cursor, per-file block order/round/cursor and counts;
 - the primary selection metric and complete validation report;
-- optimizer state and versioned training state with run configuration and
-  Python, NumPy, Torch CPU and CUDA RNG states.
+- optimizer state and versioned training state with run configuration,
+  learning-rate/early-stopping state, and Python, NumPy, Torch CPU and CUDA RNG
+  states.
 
 The outer checkpoint schema remains 1 for codec inference compatibility.
 Old checkpoints still load for inference, but cannot resume this sampler
@@ -97,36 +98,91 @@ beside the source checkpoint. The previous best is copied to the new output
 before continuation, so a run with no further improvement still has its best.
 `--epochs` is the total target epoch, not the number of additional epochs.
 Configuration, data hashes, batch size, steps per epoch and device must match;
-only the target epoch count and output location may change. Sampler state can
+the target epoch count and output location may change. Training-state-v1
+checkpoints can enable the new controls when first resumed; patience counters
+start fresh against the previous best metric, and the original optimizer LR
+and sampler cursor are retained. Subsequent v2 resumes require identical
+control configuration and restore their counters/scheduler exactly. Sampler state can
 also be serialized/restored mid-epoch via its public state methods; the CLI
 currently writes checkpoints only at completed epochs. Reproducible model
 updates require the same numerical runtime/hardware as well as RNG state.
 
-## Formal commands (run manually)
+## Learning-rate reduction and stopping
 
-Run these from the repository root. Choose new empty output directories; never
-overwrite an old run. Both commands preserve the existing architecture and
-optimizer defaults. They are documented commands, not part of automated tests.
+Controls are opt-in; old commands keep constant LR and no early stopping.
 
-40,000 steps, 20 epochs of 2000 steps, batch 256:
+- `--lr-scheduler plateau`: monitor the same validation macro BPQ used for
+  checkpoint selection. With `--lr-patience 2`, tolerate two non-improving
+  epochs and halve LR after the third, using `--lr-factor 0.5`.
+- `--min-lr 1e-5`: the LR floor. The controls never use the nine comparison
+  files to choose LR or stop training.
+- `--min-delta 1e-4`: minimum absolute macro BPQ improvement for scheduling
+  and optional stopping. Any strict BPQ improvement still updates `best.pt`.
+- `--early-stopping-patience 0`: disabled, ensuring the requested step budget
+  completes. A positive value stops after that many validations without a
+  min-delta improvement. The final completed epoch always saves `last.pt`.
+
+Each log row records LR used and LR for the next epoch, patience count, and
+whether stopping occurred. `training_summary.json` records completed epoch,
+global steps, parameter count, final LR and best validation macro BPQ.
+
+## Current 80,000-step comparison (run manually)
+
+Both models use the same ten training caches, seed, validation cap, batch 256,
+and 2,000-step validation interval. Each completes a total of 80,000 updates
+(40 logging epochs), covering the 18M-read training pool once and starting a
+second pass. This budget does not by itself establish convergence.
+
+Run commands sequentially on an available GPU; change GPU index 0 as needed.
+`mktemp` creates a new empty run directory without overwriting checkpoints,
+caches, or user output.
+
+First, continue the existing 4-layer, 2,243,738-parameter model from its
+40,000-step checkpoint for **another 40,000 updates**. `--epochs 40` is the
+total target, so this runs epochs 21–40, not 40 extra epochs:
 
 ```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+RUN4=$(mktemp -d codec/runs/direct_quality_4layer_resume80k_20261014_XXXXXX)
 CUDA_VISIBLE_DEVICES=0 python -m codec.train \
   --cache-dir data/2nd/training_cache \
-  --epochs 20 --steps-per-epoch 2000 --batch-reads 256 \
+  --resume codec/runs/direct_quality_balanced_b256_s40000_v1/last.pt \
+  --epochs 40 --steps-per-epoch 2000 --batch-reads 256 \
   --train-fraction 0.9 --validation-max-reads-per-file 5000 \
-  --num-layers 4 \
-  --output-dir codec/runs/direct_quality_balanced_b256_s40000_v1
+  --d-model 256 --num-heads 4 --num-layers 4 --feedforward-dim 512 \
+  --context-length 256 --dropout 0.1 \
+  --learning-rate 0.001 --weight-decay 1e-5 --grad-clip 1 \
+  --lr-scheduler plateau --lr-factor 0.5 --lr-patience 2 \
+  --min-lr 1e-5 --min-delta 1e-4 --early-stopping-patience 0 \
+  --seed 20260909 --device cuda --output-dir "$RUN4"
 ```
 
-One complete 18M-read pass: 20 epochs of 3516 steps = 70,320 steps. Rotating
-the six extra slots per epoch gives exactly 7032 blocks per file after epoch 20:
+Then train the chosen **6-layer, 3,297,946-parameter** model from scratch for
+80,000 updates. Width 256, FFN 512, heads and features stay the same. Do not
+pass the 4-layer checkpoint with `--resume`: the architectures differ.
 
 ```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+RUN6=$(mktemp -d codec/runs/direct_quality_6layer_80k_20261014_XXXXXX)
 CUDA_VISIBLE_DEVICES=0 python -m codec.train \
   --cache-dir data/2nd/training_cache \
-  --epochs 20 --steps-per-epoch 3516 --batch-reads 256 \
+  --epochs 40 --steps-per-epoch 2000 --batch-reads 256 \
   --train-fraction 0.9 --validation-max-reads-per-file 5000 \
-  --num-layers 4 \
-  --output-dir codec/runs/direct_quality_balanced_b256_fullpass_v1
+  --d-model 256 --num-heads 4 --num-layers 6 --feedforward-dim 512 \
+  --context-length 256 --dropout 0.1 \
+  --learning-rate 0.001 --weight-decay 1e-5 --grad-clip 1 \
+  --lr-scheduler plateau --lr-factor 0.5 --lr-patience 2 \
+  --min-lr 1e-5 --min-delta 1e-4 --early-stopping-patience 0 \
+  --seed 20260909 --device cuda --output-dir "$RUN6"
 ```
+
+The old 4-layer run used constant LR for its first 40k updates; the new model
+has plateau control from the start. This is a practical continued-training
+comparison, not an isolated capacity ablation with identical LR histories.
+If necessary after measuring results, train a fresh 4-layer control using
+the 6-layer command with only `--num-layers 4` and a new directory.
+
+Both backbones support existing residual/cross-layer head adaptation. The
+cross branch still reads block 3; Q/V LoRA remains a four-layer-only experiment
+and should not be enabled for the six-layer run. Old adapters are bound to
+their original checkpoint SHA and must be fitted again for new weights.

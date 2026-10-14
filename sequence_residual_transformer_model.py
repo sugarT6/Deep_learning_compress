@@ -4,8 +4,7 @@
 This module implements the shared pieces for stage 4:
 
 * read-level HDF5 discovery and inspection;
-* q_hat extraction from H5 quality frequencies, with optional compact prior
-  summaries or historical full-prior residual probability features;
+* q_hat extraction from H5 quality frequencies;
 * aligned full-read base side information from independent HDF5 sidecars;
 * a lightweight bidirectional local base-motif encoder;
 * causal history tokens for previous quality and previous residual;
@@ -50,10 +49,6 @@ R_TOKEN_COUNT = RESIDUAL_CLASSES + 1
 
 DEFAULT_QMER_KS = (2, 3, 4)
 DEFAULT_RMER_KS = (2, 3, 4)
-# Retained only so checkpoints from the completed exact-lag ablation remain
-# loadable. Current training does not enable exact lags.
-DEFAULT_EXACT_Q_LAGS: tuple[int, ...] = ()
-DEFAULT_EXACT_R_LAGS: tuple[int, ...] = ()
 DEFAULT_MER_STRIDE = 1
 DEFAULT_MER_VOCAB_SIZE = 4096
 
@@ -67,17 +62,11 @@ BASE_PAD_TOKEN = 6
 BASE_TOKEN_COUNT = 7
 DEFAULT_BASE_CONV_KERNELS = (3, 5, 7)
 
-PLATFORM_NAMES = ("BGISEQ", "Illumina", "IonTorrent")
-PLATFORM_TO_ID = {name: index for index, name in enumerate(PLATFORM_NAMES)}
-PLATFORM_COUNT = len(PLATFORM_NAMES)
-
 DIRECT_RESIDUAL_LOGITS = "direct_residual_logits"
 DIRECT_LOGITS = "direct_logits"
-LOG_P0_PLUS_DELTA = "log_p0_plus_delta"
 OUTPUT_PARAMETERIZATIONS = (
     DIRECT_LOGITS,
     DIRECT_RESIDUAL_LOGITS,
-    LOG_P0_PLUS_DELTA,
 )
 
 QUALITY_TARGET = "quality"
@@ -103,22 +92,11 @@ DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM = 64
 DEFAULT_QUALITY_DELTA_LIMIT = 4.0
 QUALITY_DISTRIBUTION_ADD_ALPHA = 1.0
 
-FULL_PRIOR = "full_prior"
 QHAT_ONLY = "qhat_only"
-COMPACT_PRIOR = "compact_prior"
-PRIOR_FEATURE_MODES = (QHAT_ONLY, COMPACT_PRIOR, FULL_PRIOR)
+PRIOR_FEATURE_MODES = (QHAT_ONLY,)
 DEFAULT_PRIOR_FEATURE_MODE = QHAT_ONLY
-
-# full_prior 连续输入：189 维 log P0_r、max_prob、entropy、expected_q、
-# rel_pos、read_len_norm。qhat_only 只保留与概率矩阵无关的位置和长度特征；
-# compact_prior 输入 top-1 confidence、top-1/top-2 log-prob margin、
-# normalized entropy、位置和长度。q_hat 始终通过独立 embedding 输入。
-FULL_PRIOR_CONTINUOUS_FEATURE_DIM = RESIDUAL_CLASSES + 5
 QHAT_ONLY_CONTINUOUS_FEATURE_DIM = 2
-COMPACT_PRIOR_CONTINUOUS_FEATURE_DIM = 5
-# Historical public name retained for old checkpoints/tests that explicitly
-# construct the full-prior architecture.
-CONTINUOUS_FEATURE_DIM = FULL_PRIOR_CONTINUOUS_FEATURE_DIM
+CONTINUOUS_FEATURE_DIM = QHAT_ONLY_CONTINUOUS_FEATURE_DIM
 PAD_TARGET = -100
 EPS = 1e-12
 
@@ -169,11 +147,6 @@ class SequenceBatch:
         Previous decoded quality token. Position 0 uses Q_BOS_TOKEN.
     prev_r:
         Previous decoded residual-class token. Position 0 uses R_BOS_TOKEN.
-    exact_q_lags / exact_r_lags:
-        Exact decoded history tokens for the configured lags, shape
-        [batch, max_len, num_lags]. Missing read-prefix history uses BOS.
-        These fields are empty in the current no-exact-lag experiment and are
-        retained for historical checkpoint compatibility.
     targets:
         True quality id (current default) or historical residual class for the
         current position, and PAD_TARGET on padding.
@@ -208,8 +181,6 @@ class SequenceBatch:
     q_hat: np.ndarray
     prev_q: np.ndarray
     prev_r: np.ndarray
-    exact_q_lags: np.ndarray
-    exact_r_lags: np.ndarray
     targets: np.ndarray
     valid_mask: np.ndarray
     lengths: np.ndarray
@@ -460,58 +431,6 @@ def split_reads(read_count: int, train_fraction: float) -> tuple[int, int]:
     return train_reads, read_count - train_reads
 
 
-def _quality_probs(freqs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # H5 里存的是频数，不一定已经归一化；这里转成概率 P0(q)。
-    freqs_f = freqs.astype(np.float32, copy=False)
-    row_sum = freqs_f.sum(axis=1, keepdims=True)
-    probs = freqs_f / np.maximum(row_sum, EPS)
-    log_probs = np.log(np.maximum(probs, EPS))
-    return freqs_f, probs, log_probs
-
-
-def _residual_log_probs(probs: np.ndarray, q_hat: np.ndarray) -> np.ndarray:
-    """Map P0(q) to residual-class order for each row.
-
-    For a fixed row and residual r, q = q_hat + r. If q is outside [0, 94],
-    the residual is physically impossible and receives only EPS as an input
-    feature. The output logits are masked separately before the loss/softmax.
-    """
-
-    # 对每个 residual r，找到它对应的质量值 q = q_hat + r。
-    # 合法 q 落在 0..94；非法 residual 只是占位，后面 logits 会再 mask。
-    residual_values = np.arange(RESIDUAL_MIN, RESIDUAL_MAX + 1, dtype=np.int64)
-    q_index = q_hat[:, None] + residual_values[None, :]
-    valid = (q_index >= 0) & (q_index < ALPHABET_SIZE)
-    clipped = np.clip(q_index, 0, ALPHABET_SIZE - 1)
-    gathered = np.take_along_axis(probs, clipped, axis=1)
-    gathered = np.where(valid, gathered, EPS)
-    return np.log(np.maximum(gathered, EPS)).astype(np.float32, copy=False)
-
-
-def _compact_prior_summaries(
-    probs: np.ndarray,
-    log_probs: np.ndarray,
-    q_hat: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return confidence, top-1/top-2 log margin, and normalized entropy."""
-
-    row_indices = np.arange(probs.shape[0])
-    top1_confidence = probs[row_indices, q_hat].astype(np.float32, copy=False)
-    # The second-largest probability remains well-defined when several classes
-    # tie for first place. Clamping makes all-zero/zero-runner-up rows finite.
-    top2_probability = np.partition(
-        probs,
-        ALPHABET_SIZE - 2,
-        axis=1,
-    )[:, ALPHABET_SIZE - 2]
-    top1_top2_log_margin = (
-        np.log(np.maximum(top1_confidence, EPS))
-        - np.log(np.maximum(top2_probability, EPS))
-    ).astype(np.float32, copy=False)
-    normalized_entropy = (
-        -(probs * log_probs).sum(axis=1) / math.log(ALPHABET_SIZE)
-    ).astype(np.float32, copy=False)
-    return top1_confidence, top1_top2_log_margin, normalized_entropy
 
 
 def continuous_feature_dim(prior_feature_mode: str) -> int:
@@ -519,10 +438,6 @@ def continuous_feature_dim(prior_feature_mode: str) -> int:
 
     if prior_feature_mode == QHAT_ONLY:
         return QHAT_ONLY_CONTINUOUS_FEATURE_DIM
-    if prior_feature_mode == COMPACT_PRIOR:
-        return COMPACT_PRIOR_CONTINUOUS_FEATURE_DIM
-    if prior_feature_mode == FULL_PRIOR:
-        return FULL_PRIOR_CONTINUOUS_FEATURE_DIM
     raise ValueError(
         f"prior_feature_mode must be one of {PRIOR_FEATURE_MODES}, "
         f"got {prior_feature_mode!r}"
@@ -551,37 +466,6 @@ def normalize_mer_ks(values: Iterable[int] | None) -> tuple[int, ...]:
     if values is None:
         return tuple()
     return tuple(int(value) for value in values if int(value) > 0)
-
-
-def normalize_exact_lags(values: Iterable[int] | None) -> tuple[int, ...]:
-    """Validate exact history lags, which start after the existing lag-1 token."""
-
-    if values is None:
-        return tuple()
-    lags = tuple(int(value) for value in values)
-    if any(lag < 2 for lag in lags):
-        raise ValueError("exact history lags must be at least 2")
-    if len(set(lags)) != len(lags):
-        raise ValueError("exact history lags must be unique")
-    return lags
-
-
-def build_exact_lag_tokens_for_read(
-    values: np.ndarray,
-    lags: tuple[int, ...],
-    bos_token: int,
-) -> np.ndarray:
-    """Build exact causal history tokens for one read."""
-
-    values_i = np.asarray(values, dtype=np.int64)
-    if values_i.ndim != 1:
-        raise ValueError("exact-lag values must be a 1-D array")
-    normalized_lags = normalize_exact_lags(lags)
-    tokens = np.full((values_i.size, len(normalized_lags)), bos_token, dtype=np.int64)
-    for lag_index, lag in enumerate(normalized_lags):
-        if values_i.size > lag:
-            tokens[lag:, lag_index] = values_i[:-lag]
-    return tokens
 
 
 def quality_to_bucket(q: np.ndarray) -> np.ndarray:
@@ -675,8 +559,6 @@ def build_sequence_batch(
     base_local_offsets: np.ndarray | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
-    exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
-    exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -744,8 +626,6 @@ def build_sequence_batch(
 
     qmer_ks_t = normalize_mer_ks(qmer_ks)
     rmer_ks_t = normalize_mer_ks(rmer_ks)
-    exact_q_lags_t = normalize_exact_lags(exact_q_lags)
-    exact_r_lags_t = normalize_exact_lags(exact_r_lags)
     continuous_dim = continuous_feature_dim(prior_feature_mode)
     quality_alphabet_size = normalize_quality_alphabet_size(quality_alphabet_size)
     prediction_output_dim(prediction_target, quality_alphabet_size)
@@ -770,21 +650,6 @@ def build_sequence_batch(
     # q_hat 是 H5 predictor 的中心预测，即 P0(q) 的 argmax。当前实验直接
     # 预测 quality，但仍保留 q_hat embedding 和可解码的 residual 历史。
     q_hat = np.argmax(freqs_f, axis=1).astype(np.int64)
-
-    if prior_feature_mode in (COMPACT_PRIOR, FULL_PRIOR):
-        _, probs, log_probs = _quality_probs(freqs_f)
-        max_prob, top1_top2_log_margin, entropy = _compact_prior_summaries(
-            probs,
-            log_probs,
-            q_hat,
-        )
-
-    if prior_feature_mode == FULL_PRIOR:
-        q_axis = np.arange(H5_ALPHABET_SIZE, dtype=np.float32)
-        expected_q = (
-            (probs * q_axis[None, :]).sum(axis=1) / (H5_ALPHABET_SIZE - 1)
-        ).astype(np.float32)
-        log_p0_r = _residual_log_probs(probs, q_hat)
 
     # Residual history is retained even when the current prediction target is
     # the direct quality id: at decode time all earlier q values and q_hat
@@ -815,12 +680,6 @@ def build_sequence_batch(
     q_hat_tokens = np.zeros((batch_size, max_len), dtype=np.int64)
     prev_q_tokens = np.full((batch_size, max_len), Q_BOS_TOKEN, dtype=np.int64)
     prev_r_tokens = np.full((batch_size, max_len), R_BOS_TOKEN, dtype=np.int64)
-    exact_q_lag_tokens = np.full(
-        (batch_size, max_len, len(exact_q_lags_t)), Q_BOS_TOKEN, dtype=np.int64
-    )
-    exact_r_lag_tokens = np.full(
-        (batch_size, max_len, len(exact_r_lags_t)), R_BOS_TOKEN, dtype=np.int64
-    )
     qmer_tokens = np.zeros((batch_size, max_len, len(qmer_ks_t)), dtype=np.int64)
     rmer_tokens = np.zeros((batch_size, max_len, len(rmer_ks_t)), dtype=np.int64)
     targets = np.full((batch_size, max_len), PAD_TARGET, dtype=np.int64)
@@ -853,22 +712,8 @@ def build_sequence_batch(
         rel_pos = np.arange(length, dtype=np.float32) / max(length - 1, 1)
         read_len_norm = np.full(length, min(length, 10_000) / 10_000.0, dtype=np.float32)
 
-        if prior_feature_mode == FULL_PRIOR:
-            continuous[read_idx, :length, :RESIDUAL_CLASSES] = log_p0_r[start_i:end_i]
-            continuous[read_idx, :length, RESIDUAL_CLASSES] = max_prob[start_i:end_i]
-            continuous[read_idx, :length, RESIDUAL_CLASSES + 1] = entropy[start_i:end_i]
-            continuous[read_idx, :length, RESIDUAL_CLASSES + 2] = expected_q[start_i:end_i]
-            continuous[read_idx, :length, RESIDUAL_CLASSES + 3] = rel_pos
-            continuous[read_idx, :length, RESIDUAL_CLASSES + 4] = read_len_norm
-        elif prior_feature_mode == COMPACT_PRIOR:
-            continuous[read_idx, :length, 0] = max_prob[start_i:end_i]
-            continuous[read_idx, :length, 1] = top1_top2_log_margin[start_i:end_i]
-            continuous[read_idx, :length, 2] = entropy[start_i:end_i]
-            continuous[read_idx, :length, 3] = rel_pos
-            continuous[read_idx, :length, 4] = read_len_norm
-        else:
-            continuous[read_idx, :length, 0] = rel_pos
-            continuous[read_idx, :length, 1] = read_len_norm
+        continuous[read_idx, :length, 0] = rel_pos
+        continuous[read_idx, :length, 1] = read_len_norm
 
         q_hat_tokens[read_idx, :length] = q_hat[start_i:end_i]
         targets[read_idx, :length] = targets_flat[start_i:end_i]
@@ -906,12 +751,6 @@ def build_sequence_batch(
             prev_r_tokens[read_idx, 1:length] = residual_classes_flat[
                 start_i : end_i - 1
             ]
-        exact_q_lag_tokens[read_idx, :length, :] = build_exact_lag_tokens_for_read(
-            observed_i[start_i:end_i], exact_q_lags_t, Q_BOS_TOKEN
-        )
-        exact_r_lag_tokens[read_idx, :length, :] = build_exact_lag_tokens_for_read(
-            residual_classes_flat[start_i:end_i], exact_r_lags_t, R_BOS_TOKEN
-        )
     # H5 baseline bits 用于和神经模型 bits 对比：
     #   bits_i = -log2 P0(q_true_i)
     true_freq = freqs_f[np.arange(freqs_f.shape[0]), observed_i]
@@ -938,8 +777,6 @@ def build_sequence_batch(
         q_hat=q_hat_tokens,
         prev_q=prev_q_tokens,
         prev_r=prev_r_tokens,
-        exact_q_lags=exact_q_lag_tokens,
-        exact_r_lags=exact_r_lag_tokens,
         targets=targets,
         valid_mask=valid_mask,
         lengths=read_lengths,
@@ -971,8 +808,6 @@ class ContiguousReadBatchSampler:
         base_sidecar_dir: Path | None = None,
         qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
         rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
-        exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
-        exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
         mer_stride: int = DEFAULT_MER_STRIDE,
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
         rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -986,8 +821,6 @@ class ContiguousReadBatchSampler:
         self.rng = random.Random(seed)
         self.qmer_ks = normalize_mer_ks(qmer_ks)
         self.rmer_ks = normalize_mer_ks(rmer_ks)
-        self.exact_q_lags = normalize_exact_lags(exact_q_lags)
-        self.exact_r_lags = normalize_exact_lags(exact_r_lags)
         self.mer_stride = int(mer_stride)
         self.qmer_vocab_size = int(qmer_vocab_size)
         self.rmer_vocab_size = int(rmer_vocab_size)
@@ -1031,8 +864,6 @@ class ContiguousReadBatchSampler:
                         base_sidecar_path=self.base_sidecars[file_index],
                         qmer_ks=self.qmer_ks,
                         rmer_ks=self.rmer_ks,
-                        exact_q_lags=self.exact_q_lags,
-                        exact_r_lags=self.exact_r_lags,
                         mer_stride=self.mer_stride,
                         qmer_vocab_size=self.qmer_vocab_size,
                         rmer_vocab_size=self.rmer_vocab_size,
@@ -1056,8 +887,6 @@ def read_h5_read_range(
     base_sidecar_path: Path | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
-    exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
-    exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -1109,8 +938,6 @@ def read_h5_read_range(
         base_local_offsets=base_local_offsets,
         qmer_ks=qmer_ks,
         rmer_ks=rmer_ks,
-        exact_q_lags=exact_q_lags,
-        exact_r_lags=exact_r_lags,
         mer_stride=mer_stride,
         qmer_vocab_size=qmer_vocab_size,
         rmer_vocab_size=rmer_vocab_size,
@@ -1129,8 +956,6 @@ def iter_read_batches(
     base_sidecar_path: Path | None = None,
     qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
     rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
-    exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
-    exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
     mer_stride: int = DEFAULT_MER_STRIDE,
     qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
     rmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -1166,8 +991,6 @@ def iter_read_batches(
                 base_sidecar_path=base_sidecar_path,
                 qmer_ks=qmer_ks,
                 rmer_ks=rmer_ks,
-                exact_q_lags=exact_q_lags,
-                exact_r_lags=exact_r_lags,
                 mer_stride=mer_stride,
                 qmer_vocab_size=qmer_vocab_size,
                 rmer_vocab_size=rmer_vocab_size,
@@ -1247,9 +1070,6 @@ class ResidualTransformer(nn.Module):
 
     ``direct_logits`` and legacy ``direct_residual_logits`` use the output head
     as the final logits.
-    ``log_p0_plus_delta`` treats the output head as a correction and adds it to
-    the first 189 continuous features, which contain ``log P0_r``.
-
     The optional file-quality-distribution mode instead uses an add-one-
     smoothed body-quality histogram with the same width as the output head as
     a file-level embedding and output prior. Its zero-initialized head learns a
@@ -1262,8 +1082,6 @@ class ResidualTransformer(nn.Module):
         q_hat_embed_dim: int = 16,
         prev_q_embed_dim: int = 16,
         prev_r_embed_dim: int = 32,
-        exact_q_lags: Iterable[int] | None = DEFAULT_EXACT_Q_LAGS,
-        exact_r_lags: Iterable[int] | None = DEFAULT_EXACT_R_LAGS,
         qmer_ks: Iterable[int] | None = DEFAULT_QMER_KS,
         rmer_ks: Iterable[int] | None = DEFAULT_RMER_KS,
         qmer_vocab_size: int = DEFAULT_MER_VOCAB_SIZE,
@@ -1274,7 +1092,6 @@ class ResidualTransformer(nn.Module):
         base_conv_kernels: Iterable[int] | None = None,
         base_conv_channels: int = 0,
         base_context_dim: int = 0,
-        platform_embed_dim: int = 0,
         quality_distribution_prior: bool = False,
         quality_distribution_embed_dim: int = 0,
         quality_distribution_hidden_dim: int = DEFAULT_QUALITY_DISTRIBUTION_HIDDEN_DIM,
@@ -1302,23 +1119,11 @@ class ResidualTransformer(nn.Module):
                 "output_parameterization must be one of "
                 f"{OUTPUT_PARAMETERIZATIONS}, got {output_parameterization!r}"
             )
-        if output_parameterization == LOG_P0_PLUS_DELTA:
-            if continuous_dim < RESIDUAL_CLASSES:
-                raise ValueError(
-                    "log_p0_plus_delta requires the first 189 continuous features "
-                    "to contain log P0_r"
-                )
-            if output_dim != RESIDUAL_CLASSES:
-                raise ValueError(
-                    "log_p0_plus_delta requires output_dim == RESIDUAL_CLASSES"
-                )
 
         self.continuous_dim = int(continuous_dim)
         self.d_model = int(d_model)
         self.context_length = int(context_length)
         self.output_parameterization = output_parameterization
-        self.exact_q_lags = normalize_exact_lags(exact_q_lags)
-        self.exact_r_lags = normalize_exact_lags(exact_r_lags)
         self.qmer_ks = normalize_mer_ks(qmer_ks)
         self.rmer_ks = normalize_mer_ks(rmer_ks)
         self.base_conv_kernels = (
@@ -1327,9 +1132,6 @@ class ResidualTransformer(nn.Module):
             else tuple()
         )
         self.base_context_dim = int(base_context_dim)
-        self.platform_embed_dim = int(platform_embed_dim)
-        if self.platform_embed_dim < 0:
-            raise ValueError("platform_embed_dim must be non-negative")
         self.quality_distribution_prior = bool(quality_distribution_prior)
         self.quality_distribution_embed_dim = int(quality_distribution_embed_dim)
         self.quality_distribution_hidden_dim = int(quality_distribution_hidden_dim)
@@ -1367,11 +1169,6 @@ class ResidualTransformer(nn.Module):
         self.rmer_embeddings = nn.ModuleList(
             [nn.Embedding(rmer_vocab_size, rmer_embed_dim) for _ in self.rmer_ks]
         )
-        self.platform_embedding = (
-            nn.Embedding(PLATFORM_COUNT, self.platform_embed_dim)
-            if self.platform_embed_dim > 0
-            else None
-        )
         self.quality_distribution_encoder = (
             nn.Sequential(
                 nn.Linear(output_dim, self.quality_distribution_hidden_dim),
@@ -1402,12 +1199,9 @@ class ResidualTransformer(nn.Module):
             + q_hat_embed_dim
             + prev_q_embed_dim
             + prev_r_embed_dim
-            + len(self.exact_q_lags) * prev_q_embed_dim
-            + len(self.exact_r_lags) * prev_r_embed_dim
             + len(self.qmer_ks) * qmer_embed_dim
             + len(self.rmer_ks) * rmer_embed_dim
             + self.base_context_dim
-            + self.platform_embed_dim
             + self.quality_distribution_embed_dim
         )
         self.input_projection = nn.Sequential(
@@ -1430,9 +1224,8 @@ class ResidualTransformer(nn.Module):
             norm=nn.LayerNorm(d_model),
         )
         self.output_head = nn.Linear(d_model, output_dim)
-        if self.output_parameterization == LOG_P0_PLUS_DELTA or self.quality_distribution_prior:
-            # An untrained correction model reproduces its H5/file-histogram
-            # prior exactly. Training then learns which logits to raise/lower.
+        if self.quality_distribution_prior:
+            # The untrained correction reproduces the file-histogram prior.
             nn.init.zeros_(self.output_head.weight)
             nn.init.zeros_(self.output_head.bias)
 
@@ -1469,12 +1262,9 @@ class ResidualTransformer(nn.Module):
         q_hat: torch.Tensor,
         prev_q: torch.Tensor,
         prev_r: torch.Tensor,
-        exact_q_lags: torch.Tensor | None = None,
-        exact_r_lags: torch.Tensor | None = None,
         qmer_tokens: torch.Tensor | None = None,
         rmer_tokens: torch.Tensor | None = None,
         base_ids: torch.Tensor | None = None,
-        platform_id: torch.Tensor | None = None,
         quality_distribution_log_probs: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -1484,20 +1274,6 @@ class ResidualTransformer(nn.Module):
             self.prev_q_embedding(prev_q),
             self.prev_r_embedding(prev_r),
         ]
-        if self.exact_q_lags:
-            if exact_q_lags is None:
-                raise ValueError("exact_q_lags are required by this checkpoint")
-            if exact_q_lags.shape[-1] != len(self.exact_q_lags):
-                raise ValueError("exact_q_lags width does not match checkpoint configuration")
-            for lag_index in range(len(self.exact_q_lags)):
-                pieces.append(self.prev_q_embedding(exact_q_lags[:, :, lag_index]))
-        if self.exact_r_lags:
-            if exact_r_lags is None:
-                raise ValueError("exact_r_lags are required by this checkpoint")
-            if exact_r_lags.shape[-1] != len(self.exact_r_lags):
-                raise ValueError("exact_r_lags width does not match checkpoint configuration")
-            for lag_index in range(len(self.exact_r_lags)):
-                pieces.append(self.prev_r_embedding(exact_r_lags[:, :, lag_index]))
         if self.qmer_embeddings:
             if qmer_tokens is None:
                 raise ValueError("qmer_tokens are required by this checkpoint")
@@ -1517,15 +1293,6 @@ class ResidualTransformer(nn.Module):
                 raise ValueError("complete base reads are shorter than padded body qualities")
             base_context = self.base_encoder(base_ids)
             pieces.append(base_context[:, : continuous.shape[1], :])
-        if self.platform_embedding is not None:
-            if platform_id is None:
-                raise ValueError("platform_id is required by this checkpoint")
-            if platform_id.ndim != 1 or platform_id.shape[0] != continuous.shape[0]:
-                raise ValueError("platform_id must have shape [batch]")
-            platform_context = self.platform_embedding(platform_id.long())
-            pieces.append(
-                platform_context.unsqueeze(1).expand(-1, continuous.shape[1], -1)
-            )
         expanded_quality_distribution: torch.Tensor | None = None
         if self.quality_distribution_encoder is not None:
             if quality_distribution_log_probs is None:
@@ -1590,9 +1357,6 @@ class ResidualTransformer(nn.Module):
                 output_logits / self.quality_delta_limit
             )
             return expanded_quality_distribution.unsqueeze(1) + bounded_delta
-        if self.output_parameterization == LOG_P0_PLUS_DELTA:
-            log_p0_r = continuous[..., :RESIDUAL_CLASSES]
-            return log_p0_r + output_logits
         return output_logits
 
 
@@ -1604,8 +1368,6 @@ def batch_to_torch(batch: SequenceBatch, device: torch.device) -> dict[str, torc
         "q_hat": torch.from_numpy(batch.q_hat).to(device),
         "prev_q": torch.from_numpy(batch.prev_q).to(device),
         "prev_r": torch.from_numpy(batch.prev_r).to(device),
-        "exact_q_lags": torch.from_numpy(batch.exact_q_lags).to(device),
-        "exact_r_lags": torch.from_numpy(batch.exact_r_lags).to(device),
         "targets": torch.from_numpy(batch.targets).to(device),
         "valid_mask": torch.from_numpy(batch.valid_mask).to(device),
         "lengths": torch.from_numpy(batch.lengths).to(device),
@@ -1646,16 +1408,24 @@ def save_json(path: Path, payload: dict[str, object]) -> None:
         handle.write("\n")
 
 
+def validate_active_feature_config(config: dict[str, object]) -> None:
+    """Reject retired experimental inputs instead of silently dropping them."""
+    if (config.get("prior_feature_mode", QHAT_ONLY) != QHAT_ONLY
+            or int(config.get("continuous_dim", CONTINUOUS_FEATURE_DIM)) != CONTINUOUS_FEATURE_DIM
+            or config.get("exact_q_lags") or config.get("exact_r_lags")
+            or int(config.get("platform_embed_dim", 0)) != 0):
+        raise ValueError("checkpoint uses retired prior, exact-lag, or platform features")
+
+
 def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransformer, dict[str, object]]:
     checkpoint = torch.load(path, map_location=device)
     config = checkpoint["config"]
+    validate_active_feature_config(config)
     model = ResidualTransformer(
         continuous_dim=int(config["continuous_dim"]),
         q_hat_embed_dim=int(config["q_hat_embed_dim"]),
         prev_q_embed_dim=int(config["prev_q_embed_dim"]),
         prev_r_embed_dim=int(config["prev_r_embed_dim"]),
-        exact_q_lags=config.get("exact_q_lags", []),
-        exact_r_lags=config.get("exact_r_lags", []),
         qmer_ks=config.get("qmer_ks", []),
         rmer_ks=config.get("rmer_ks", []),
         qmer_vocab_size=int(config.get("qmer_vocab_size", DEFAULT_MER_VOCAB_SIZE)),
@@ -1666,7 +1436,6 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ResidualTransform
         base_conv_kernels=config.get("base_conv_kernels", []),
         base_conv_channels=int(config.get("base_conv_channels", 0)),
         base_context_dim=int(config.get("base_context_dim", 0)),
-        platform_embed_dim=int(config.get("platform_embed_dim", 0)),
         quality_distribution_prior=bool(
             config.get("quality_distribution_prior", False)
         ),
