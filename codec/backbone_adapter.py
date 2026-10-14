@@ -1,4 +1,4 @@
-"""Dense adaptation of a Transformer suffix and its output head.
+"""Dense or low-rank adaptation of a Transformer suffix and its output head.
 
 The frozen prefix remains unchanged. Complete reads are sampled across the
 input, and inference uses the exact transmitted FP32 replacement parameters.
@@ -275,17 +275,31 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     started = time.perf_counter()
     deadline = started + config.max_seconds if config.max_seconds else float("inf")
     warm, warm_report = adapt_output_head(model, source, device=device, batch_reads=batch_reads,
-        total=total, base_sha256=base_sha256, config=replace(config, backbone_layers=0))
+        total=total, base_sha256=base_sha256,
+        config=replace(config, backbone_layers=0, backbone_lora_rank=0))
     report = dict(warm_report)
+    # Candidate sizes below refer to the joint stage, not the warm-up candidate.
+    report.pop("candidate_parameter_bytes", None)
+    report.pop("candidate_metadata_bytes", None)
     report.update(config=asdict(config), warmup_report=warm_report,
                   backbone_accepted=False, backbone_steps_completed=0, backbone_selected_step=0,
                   backbone_validation_history=[], backbone_stage_seconds={},
+                  backbone_adaptation_type="lora" if config.backbone_lora_rank else "dense",
+                  backbone_lora_rank=config.backbone_lora_rank,
                   backbone_validation_scope="random_read_holdout_after_warmup_prefix")
 
     def finish(adapter, reason):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         report.update(reason=reason, accepted=adapter is not None,
+                      selected_adapter_type=("suffix_lora" if adapter and adapter["version"] == 8
+                          else "dense_suffix" if adapter and adapter["version"] == 7
+                          else "output_head" if adapter else "base_model"),
+                      backbone_fallback=not report["backbone_accepted"],
+                      parameter_bytes=adapter["parameter_bytes"] if adapter else 0,
+                      container_adapter_bytes=adapter_container_bytes(adapter),
+                      metadata_bytes=len(json.dumps(adapter, sort_keys=True,
+                          separators=(",", ":")).encode()) if adapter else 0,
                       seconds=time.perf_counter() - started)
         report["budget_exceeded"] = bool(config.max_seconds and report["seconds"] > config.max_seconds)
         return adapter, report
@@ -310,8 +324,12 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
             candidate.output_head.weight.copy_(old_head.weight)
             candidate.output_head.bias.copy_(old_head.bias)
     first = model.config.num_layers - config.backbone_layers
-    for layer in candidate.transformer.layers[first:]:
-        layer.requires_grad_(True)
+    if config.backbone_lora_rank:
+        from .suffix_lora_adapter import install_suffix_lora
+        install_suffix_lora(candidate, config.backbone_layers, config.backbone_lora_rank, config.seed)
+    else:
+        for layer in candidate.transformer.layers[first:]:
+            layer.requires_grad_(True)
     candidate.transformer.norm.requires_grad_(True)
     candidate.output_head.requires_grad_(True)
     backbone = [p for name, p in candidate.named_parameters() if p.requires_grad and not name.startswith("output_head.")]
@@ -335,6 +353,8 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
         min_lr=min(config.learning_rate, config.backbone_learning_rate) * .01,
         early_stopping_patience=config.backbone_patience), best_bits=best_loss)
     report["backbone_validation_history"].append(dict(step=0, bits_per_quality=best_loss))
+    report["backbone_trainable_parameters"] = sum(p.numel() for p in backbone)
+    report["head_trainable_parameters"] = sum(p.numel() for p in head)
     rng = random.Random(config.seed)
     optimization_started = time.perf_counter()
     for step in range(1, config.backbone_steps + 1):
@@ -378,9 +398,14 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
         for name, parameter in trainable.items():
             parameter.copy_(best[name])
     serialization_started = time.perf_counter()
-    adapter = serialize_backbone(candidate, config.backbone_layers, base_sha256, base_model=model)
+    if config.backbone_lora_rank:
+        from .suffix_lora_adapter import serialize_suffix_lora
+        adapter = serialize_suffix_lora(candidate, config.backbone_layers,
+            config.backbone_lora_rank, base_sha256, base_model=model)
+    else:
+        adapter = serialize_backbone(candidate, config.backbone_layers, base_sha256, base_model=model)
     wire = copy.deepcopy(model)
-    apply_backbone_adapter(wire, adapter, base_sha256)
+    apply_head_adapter(wire, adapter, base_sha256)
     wire.eval()
     report["backbone_stage_seconds"]["serialization"] = time.perf_counter() - serialization_started
     validation_started = time.perf_counter()
@@ -388,6 +413,8 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     after = score_model(wire, validation, quantized=True, **common)
     report["backbone_stage_seconds"]["wire_validation"] = time.perf_counter() - validation_started
     report.update(candidate_parameter_bytes=adapter["parameter_bytes"],
+                  candidate_metadata_bytes=len(json.dumps(adapter, sort_keys=True,
+                      separators=(",", ":")).encode()),
                   candidate_container_adapter_bytes=adapter_container_bytes(adapter),
                   candidate_backbone_raw_bytes=adapter["raw_bytes"],
                   backbone_before_validation_bits_per_quality=before,

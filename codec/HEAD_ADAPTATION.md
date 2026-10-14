@@ -216,6 +216,79 @@ python -m codec.encode \
   > "$TEST_LAST2/metrics.json"
 ```
 
+## Multi-layer LoRA adaptation
+
+Use `--finetune-last-layers 2 --backbone-lora-rank 8` to replace the dense joint
+stage with independent low-rank updates on **Q, K, V, O, FFN linear1 and FFN
+linear2 in each selected block**. This differs from the older `--head-lora`
+experiment, which updates only fourth-block Q/V on the warm-up prefix.
+Do not combine the two modes. Rank is bounded to 1..16; zero (the default)
+retains dense adaptation. Four- and six-layer base models are supported.
+
+The embeddings, input projection, earlier blocks, selected-block biases and
+selected-block LayerNorm parameters stay frozen. Final encoder LayerNorm and
+all output-head tensors train alongside the factors. Each matrix update is
+`W + B @ A`, with scaling exactly 1 (equivalent to alpha=rank). A is seeded
+normal with standard deviation .02; B starts at zero. Q/K/V have independent
+factors despite sharing PyTorch's packed projection tensor. No new input
+features or Header contents are used.
+
+The reservoir sample, train/validation split, full-read updates, best-state
+selection, plateau scheduler and weight-cost admission are identical to the
+dense stage. There is no frozen final-feature cache in this stage. Set
+`--head-max-seconds 0` to allow the complete configured training run. The
+example starts LoRA at `--backbone-learning-rate 0.0003`; head LR stays .001.
+These are experimental starting values, not a claimed optimum.
+
+Adapter v8 stores FP32 factors and exact final-norm values, byte-plane/zlib
+compressed and base64 encoded, plus the full head. Both codec ends merge each
+matrix on CPU in increasing rank order with FP64 accumulation and a single
+FP32 rounding. The reconstructed parameter SHA is verified before applying
+any update. Coding and final quantized admission use this merged wire model,
+not the training parametrizations. No training or extra branch is needed for
+decoding, and the original shared checkpoint remains required.
+
+For two D=256/FF=512 blocks, rank 8 uses **231424 raw bytes** (229376 factors
++ 2048 final norm); rank 16 uses **460800 raw bytes**. The res64/cross16 head
+adds 139192 raw bytes. Actual container overhead includes compression,
+base64 and JSON and is explicitly charged, rather than using these raw sizes.
+
+Inspect `backbone_adaptation_type=lora`, `backbone_lora_rank`,
+`backbone_accepted`, `selected_adapter_type`, and `backbone_fallback`.
+`accepted=true` alone means some adapter was selected; when LoRA is rejected,
+`selected_adapter_type=output_head` identifies the retained warm-up result.
+`estimated_quality_saving_bytes`, `incremental_adapter_bytes` and
+`estimated_net_saving_bytes` explain admission. These remain held-out sample
+estimates; compare measured full-file `quality_and_adapter_bytes` against
+the head-only baseline (CNR 4-layer-80k: 76426168 bytes).
+
+Run rank 8 first. To compare rank 16, change the rank argument and the output
+directory prefix; keep the rest of the command unchanged.
+
+```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+TEST_LORA=$(mktemp -d codec/output/time_baseline_nodsub/CNR_last2_lora8_XXXXXX)
+CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$TEST_LORA/time.txt" \
+python -m codec.encode \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  "$TEST_LORA/CNR0847462.fqdc" \
+  codec/runs/direct_quality_4layer_resume80k_20261014_sPfodw/best.pt \
+  --device cuda --batch-reads 256 --quantizer floor --coder-backend native \
+  --finetune-head --head-type residual --head-residual-dim 64 \
+  --head-cross-layer --head-cross-dim 16 \
+  --head-max-reads 8000 --head-max-symbols 1200000 --head-steps 2000 \
+  --head-max-seconds 0 --finetune-last-layers 2 --backbone-lora-rank 8 \
+  --backbone-steps 5000 --backbone-batch-reads 16 \
+  --backbone-learning-rate 0.0003 --backbone-eval-every 200 \
+  --backbone-patience 6 --backbone-max-reads 32000 \
+  --backbone-max-symbols 4800000 \
+  --save-head-adapter "$TEST_LORA/head.adapter.json" \
+  > "$TEST_LORA/metrics.json" 2> "$TEST_LORA/encode.log"
+```
+
+`encode.log` contains validation progress and an explicit final selection/
+fallback message; `metrics.json` contains size and admission fields.
+
 ## Optional final-block Q/V LoRA
 
 The unsuccessful small sequence branch and `--head-sequence-branch` have been

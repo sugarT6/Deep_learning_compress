@@ -57,12 +57,17 @@ class HeadAdaptationConfig:
     backbone_patience: int = 6
     backbone_max_reads: int = 32000
     backbone_max_symbols: int = 4800000
+    backbone_lora_rank: int = 0
 
     def __post_init__(self):
         if type(self.backbone_layers) is not int or not 0 <= self.backbone_layers <= 4:
             raise ValueError("backbone_layers must be in [0, 4]")
         if self.backbone_layers and self.lora:
-            raise ValueError("dense backbone adaptation cannot be combined with LoRA")
+            raise ValueError("backbone adaptation cannot be combined with legacy --head-lora")
+        if type(self.backbone_lora_rank) is not int or not 0 <= self.backbone_lora_rank <= 16:
+            raise ValueError("backbone_lora_rank must be in [0, 16]")
+        if self.backbone_lora_rank and not self.backbone_layers:
+            raise ValueError("backbone_lora_rank requires backbone_layers")
         for name in ("backbone_steps", "backbone_batch_reads", "backbone_eval_every",
                      "backbone_max_reads", "backbone_max_symbols"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
@@ -167,6 +172,9 @@ def adapter_container_bytes(adapter):
 
 def validate_head_adapter(metadata, d_model, base_sha256):
     """Validate bounded plain data before allocating model tensors; no pickle."""
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 8:
+        from .suffix_lora_adapter import validate_suffix_lora
+        return validate_suffix_lora(metadata, d_model, base_sha256)
     if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 6:
         from .lora_adapter import validate_lora_adapter
         return validate_lora_adapter(metadata, d_model, base_sha256)
@@ -250,6 +258,9 @@ def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
 
 
 def apply_head_adapter(model, metadata, base_sha256):
+    if isinstance(metadata, dict) and metadata.get("version") == 8:
+        from .suffix_lora_adapter import apply_suffix_lora
+        return apply_suffix_lora(model, metadata, base_sha256)
     if isinstance(metadata, dict) and metadata.get("version") == 7:
         from .backbone_adapter import apply_backbone_adapter
         return apply_backbone_adapter(model, metadata, base_sha256)

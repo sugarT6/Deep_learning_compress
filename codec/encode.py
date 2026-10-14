@@ -329,7 +329,9 @@ def _encode_fastq_compat(
     if head_adaptation_config is not None or head_adapter_path is not None:
         stage_started = time.perf_counter()
         if head_adaptation_config is not None:
-            scope = "Transformer suffix + output head" if head_adaptation_config.backbone_layers else "output head on a bounded prefix"
+            scope = ("Transformer suffix LoRA + output head" if head_adaptation_config.backbone_lora_rank
+                     else "Transformer suffix + output head" if head_adaptation_config.backbone_layers
+                     else "output head on a bounded prefix")
             print(f"Adapting {scope} (experts disabled)...", file=sys.stderr)
             adapter, adaptation_report = adapt_output_head(model, input_path, device=device,
                 batch_reads=batch_reads, total=quantization_total, base_sha256=checkpoint_sha256,
@@ -362,6 +364,14 @@ def _encode_fastq_compat(
             adaptation_report["container_adapter_bytes"] -= len('"probability_profile":null,')
         print(f"Head adaptation: {adaptation_report['reason']}; "
               f"accepted={adaptation_report['accepted']}; {timings['head_adaptation']:.3f}s", file=sys.stderr)
+        if "backbone_accepted" in adaptation_report:
+            print(f"Selected adapter: {adaptation_report['selected_adapter_type']}; "
+                  f"backbone_accepted={adaptation_report['backbone_accepted']}; "
+                  f"fallback={adaptation_report['backbone_fallback']}", file=sys.stderr)
+            if "estimated_net_saving_bytes" in adaptation_report:
+                print(f"Estimated quality saving={adaptation_report['estimated_quality_saving_bytes']:.0f} B; "
+                      f"extra adapter={adaptation_report['incremental_adapter_bytes']} B; "
+                      f"net saving={adaptation_report['estimated_net_saving_bytes']:.0f} B", file=sys.stderr)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     source_digest = hashlib.sha256()
@@ -710,6 +720,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="validation checks without a min-delta improvement before stopping; 0 disables")
     parser.add_argument("--backbone-max-reads", type=int, default=32000)
     parser.add_argument("--backbone-max-symbols", type=int, default=4800000)
+    parser.add_argument("--backbone-lora-rank", type=int, default=0,
+                        help="use rank 1..16 Q/K/V/O + FFN LoRA in selected final layers; 0 keeps dense updates")
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -729,7 +741,7 @@ def main() -> int:
             raise ValueError("--head-residual-dim requires --head-type residual")
         backbone_options = ("backbone_steps", "backbone_batch_reads", "backbone_learning_rate",
                             "backbone_eval_every", "backbone_patience", "backbone_max_reads",
-                            "backbone_max_symbols")
+                            "backbone_max_symbols", "backbone_lora_rank")
         if not args.finetune_last_layers and any(
                 getattr(args, name) != build_parser().get_default(name) for name in backbone_options):
             raise ValueError("--backbone-* requires --finetune-last-layers")
@@ -747,7 +759,8 @@ def main() -> int:
                 backbone_batch_reads=args.backbone_batch_reads,
                 backbone_learning_rate=args.backbone_learning_rate,
                 backbone_eval_every=args.backbone_eval_every, backbone_patience=args.backbone_patience,
-                backbone_max_reads=args.backbone_max_reads, backbone_max_symbols=args.backbone_max_symbols)
+                backbone_max_reads=args.backbone_max_reads, backbone_max_symbols=args.backbone_max_symbols,
+                backbone_lora_rank=args.backbone_lora_rank)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
             "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",

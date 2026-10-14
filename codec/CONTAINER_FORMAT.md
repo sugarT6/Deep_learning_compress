@@ -138,6 +138,31 @@ compressed payload/base64/framing, are charged to quality-plus-adapter size.
 The four physical sections and container version 3 are unchanged. Older
 readers reject unknown adapter v7 rather than silently using base weights.
 
+Adapter v8 uses `application=replace_head_and_suffix_lora` and
+`protocol=transformer_suffix_qkvo_ffn_rank_major_f64_merge_v1`. Its nested head
+is restricted to v1/v2/v4. The contiguous final 1..4 layer indices, layer count
+and FFN width are bound to the checkpoint architecture. Rank is an integer in
+1..16 and `scaling` is exactly integer 1. Canonical matrix descriptors list
+packed QKV (three independent parts), attention output, linear1 and linear2
+in each selected block. Each descriptor includes its base matrix shape.
+
+For a matrix with P parts and shape [P*R,C], raw FP32 values appear as A
+[P,rank,C] then B [P,R,rank]. After all matrices come final LayerNorm weight
+and bias [D]. The raw bytes are grouped into four byte planes, zlib compressed
+and base64 encoded. `sha256` verifies the uncompressed original factor/norm
+bytes, and bounded decompression rejects oversized output and trailing data.
+Nonfinite values, noncanonical matrix descriptors and recursive heads fail.
+
+For each part, compute the sum of B[:,k]*A[k,:] in increasing k order on CPU
+in FP64, add the pristine checkpoint matrix, and round once to FP32. Replace
+final norm with the transmitted values. `merged_sha256` verifies concatenated
+reconstructed matrix bytes in descriptor order, then norm weight/bias. All
+checks complete before modifying model weights. Biases and within-block norms
+are unchanged. Inference uses ordinary merged layers, not parametrizations.
+`raw_bytes` counts factors/norm, `parameter_bytes` includes the nested head,
+and actual JSON adapter bytes are charged to quality-plus-adapter size.
+Physical container version 3 and its four sections remain unchanged.
+
 Version 2 changes the probability protocol but not the four-section physical
 layout. The default prior is specified in `ONLINE_PRIOR_FORMAT.md`; the optional
 `causal_quality_mixture_v1` profile is specified in `FUSION_VALIDATION.md`.

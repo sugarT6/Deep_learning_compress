@@ -49,6 +49,16 @@ admission and final quality-plus-adapter bytes. See
 [codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md#dense-final-layer-adaptation)
 for the 4-layer-80k command and reporting fields.
 
+Add `--backbone-lora-rank 8` to adapt those selected blocks with independent
+Q/K/V/O and both FFN low-rank updates instead of dense weights. Final norm and
+output head also train; other backbone parameters stay frozen. Adapter v8
+transmits compressed FP32 factors and norm values and canonically merges the
+updates before coding. Rank 8 adds 231424 raw bytes for two D=256/FF=512 blocks
+and final norm, excluding the head. It uses the same whole-file sample, best
+validation state, and admission including weight cost. The log explicitly
+reports the selected adapter and any fallback. See the
+[multi-layer LoRA command](codec/HEAD_ADAPTATION.md#multi-layer-lora-adaptation).
+
 The opt-in `--quantizer floor` uses CPU float64 floor frequencies
 without largest-remainder sorting, variable per-position totals, and direct
 symbol intervals on the encoder. The default largest-remainder path remains
