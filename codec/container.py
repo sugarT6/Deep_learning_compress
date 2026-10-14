@@ -289,6 +289,11 @@ def _validate_metadata(
             from .head_adapter import validate_head_adapter
             validate_head_adapter(metadata.get("head_adapter"),
                                   checkpoint["model_config"].get("d_model"), checkpoint["sha256"])
+            adapter = metadata["head_adapter"]
+            if adapter.get("version") == 7 and (
+                    adapter["num_layers"] != checkpoint["model_config"].get("num_layers")
+                    or adapter["feedforward_dim"] != checkpoint["model_config"].get("feedforward_dim")):
+                raise ValueError("backbone adapter does not match checkpoint architecture")
         except ValueError as exc:
             raise ContainerError(f"invalid head_adapter: {exc}") from exc
     elif "head_adapter" in metadata:

@@ -139,6 +139,83 @@ CDF verification; 200 CPU regression tests passed. Local diagnostic script,
 JSON report and reusable adapters are in
 `codec/runs/cross_layer_comparison_20260923_z6R3u0/` (ignored run artifacts).
 
+## Dense final-layer adaptation
+
+`--finetune-head --finetune-last-layers 2` first fits the existing output head
+with its normal prefix configuration, then jointly trains the last two
+Transformer blocks, final LayerNorm, and output head. Token/base embeddings,
+input projection, and earlier blocks are frozen. This is dense full-parameter
+adaptation of the selected blocks, not Q/V LoRA. Do not combine it with
+`--head-lora`.
+
+`--head-max-seconds 0` disables the adaptation deadline. Warm-up still has a
+fixed `--head-steps` cap. The joint stage has its own maximum `--backbone-steps`
+(default 5000), validation interval 200, and early-stop patience of six
+validation checks. `--backbone-patience 0` disables early stopping. Plateau LR
+reduction remains enabled; strict improvements always replace the best state.
+
+The joint stage scans the entire input once, after warm-up, and reservoir-samples
+up to 32,000 complete nonempty reads outside the warm-up prefix. Reads over
+`--head-max-read-length` are excluded from adaptation, not compression. A
+separate 4,800,000-Q cap bounds the sample. The shuffled whole reads are split
+75/25 into training and held-out validation. Sampling never uses Header
+contents. This adds a full gzip scan; it does not expand the pretraining set.
+
+Training uses mini-batches of 16 full reads and recomputes the selected-layer
+features on each update. Final frozen features are not reused for trainable
+layers. Backbone Adam LR defaults to 1e-4, and the head uses
+`--head-learning-rate` (default 1e-3); both have gradient clipping and anchoring.
+Dropout stays disabled for this adaptation experiment. Full-read validation
+selects the best cross-entropy state, then actual wire-restored FP32 weights
+are evaluated using the selected integer quantizer.
+
+Adapter v7 transmits the head plus an exact bitwise XOR delta of the selected
+blocks/final norm against the shared base checkpoint. The uint32 delta bytes
+are grouped into four byte planes, zlib-compressed, and base64-encoded in
+container metadata. No precision is discarded. SHA-256 validates the delta
+payload and the reconstructed FP32 weights. Both encoder and decoder use
+the reconstructed parameters; the decoder never retrains. The original
+checkpoint and its SHA remain required. Exported artifacts support normal
+`--head-adapter` reuse.
+
+Admission requires held-out quantized BPQ improvement **and** estimated quality
+savings greater than the actual extra canonical adapter bytes relative to the
+warm-up head. The estimate extrapolates to eligible reads outside warm-up;
+effects on excluded reads are unmeasured. Full-file quality-plus-adapter bytes
+remain the final result, not a guaranteed gain. If admission fails, the encoder
+keeps the warm-up head. All transmitted model bytes are included in
+`quality_and_adapter_bytes`.
+
+Inspect `backbone_accepted`, `backbone_steps_completed`,
+`backbone_selected_step`, `backbone_sampling`, `backbone_validation_history`,
+`backbone_before_validation_bits_per_quality`,
+`backbone_after_validation_bits_per_quality`, `incremental_adapter_bytes`, and
+`estimated_net_saving_bytes`. The original `steps_completed` and prefix BPQs
+still describe warm-up; `warmup_report` retains that complete report.
+
+Example using the 4-layer 80k checkpoint (run manually, on an available GPU):
+
+```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+TEST_LAST2=$(mktemp -d codec/output/time_baseline_nodsub/CNR_last2_XXXXXX)
+CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$TEST_LAST2/time.txt" \
+python -m codec.encode \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  "$TEST_LAST2/CNR0847462.fqdc" \
+  codec/runs/direct_quality_4layer_resume80k_20261014_sPfodw/best.pt \
+  --device cuda --batch-reads 256 --quantizer floor --coder-backend native \
+  --finetune-head --head-type residual --head-residual-dim 64 \
+  --head-cross-layer --head-cross-dim 16 \
+  --head-max-reads 8000 --head-max-symbols 1200000 --head-steps 2000 \
+  --head-max-seconds 0 --finetune-last-layers 2 \
+  --backbone-steps 5000 --backbone-batch-reads 16 \
+  --backbone-learning-rate 0.0001 --backbone-eval-every 200 \
+  --backbone-patience 6 --backbone-max-reads 32000 \
+  --backbone-max-symbols 4800000 \
+  --save-head-adapter "$TEST_LAST2/head.adapter.json" \
+  > "$TEST_LAST2/metrics.json"
+```
+
 ## Optional final-block Q/V LoRA
 
 The unsuccessful small sequence branch and `--head-sequence-branch` have been

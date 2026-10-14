@@ -118,6 +118,26 @@ not an unmerged training graph, are used for wire validation and coding.
 No additional inference branch or decode-time training is needed. The nested
 head must be v4, preventing recursive envelopes. Physical container remains v3.
 
+Adapter v7 uses `application=replace_head_and_transformer_suffix` and
+`protocol=transformer_suffix_and_final_norm_xor32_byteplanes_zlib_v1`. Its
+nonrecursive nested head is v1, v2 or v4. `layers` is the contiguous final
+1..4 block indices, bound to the checkpoint's layer count and FFN width.
+Canonical tensor descriptors enumerate each block's QKV projection, output
+projection, two FFN matrices/biases, both normalizations, then final LayerNorm.
+
+Treat every selected FP32 value as a little-endian uint32. XOR it with the
+original checkpoint value; group delta byte 0 for all values, then bytes
+1, 2, and 3. Zlib-compress this byte-plane stream and base64-encode it.
+`raw_bytes` is the uncompressed byte-plane length. `delta_sha256` verifies
+that stream, and `sha256` verifies the reconstructed FP32 parameter bytes.
+The decompressor has a strict output bound and rejects trailing streams.
+Reconstruction uses only integer XOR, discards no precision, and rejects
+nonfinite weights before changing the model. `parameter_bytes` counts raw
+selected parameters plus the nested head; actual added JSON bytes, including
+compressed payload/base64/framing, are charged to quality-plus-adapter size.
+The four physical sections and container version 3 are unchanged. Older
+readers reject unknown adapter v7 rather than silently using base weights.
+
 Version 2 changes the probability protocol but not the four-section physical
 layout. The default prior is specified in `ONLINE_PRIOR_FORMAT.md`; the optional
 `causal_quality_mixture_v1` profile is specified in `FUSION_VALIDATION.md`.

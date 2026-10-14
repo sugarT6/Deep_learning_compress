@@ -113,6 +113,9 @@ def apply_lora_adapter(model, meta, digest):
     head.train(original.training)
     head.requires_grad_(original.weight.requires_grad)
     head.bias.requires_grad_(original.bias.requires_grad)
+    if hasattr(model, "_backbone_original_parameters"):
+        from .backbone_adapter import restore_backbone
+        restore_backbone(model)
     weight = model.transformer.layers[3].self_attn.in_proj_weight
     # Preserve base tensor for idempotent artifact application (not a checkpoint parameter).
     base = getattr(model, "_lora_original_qkv", weight.detach().cpu().clone())
@@ -128,7 +131,8 @@ def adapt_last_layer(model, source, *, device, batch_reads, total, base_sha256, 
     if model.config.num_layers != 4 or hasattr(model, "_lora_original_qkv"):
         raise ValueError("LoRA fitting requires a fresh four-layer base model")
     started = time.perf_counter()
-    deadline, work_deadline = started + config.max_seconds, started + 0.70 * config.max_seconds
+    deadline = started + config.max_seconds if config.max_seconds else float("inf")
+    work_deadline = started + 0.70 * config.max_seconds if config.max_seconds else float("inf")
     warm, warm_report = adapt_output_head(model, source, device=device, batch_reads=batch_reads,
         total=total, base_sha256=base_sha256, config=replace(config, lora=False))
     report = dict(warm_report)
@@ -140,7 +144,7 @@ def adapt_last_layer(model, source, *, device, batch_reads, total, base_sha256, 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         report.update(reason=reason, seconds=time.perf_counter()-started)
-        report["budget_exceeded"] = report["seconds"] > config.max_seconds
+        report["budget_exceeded"] = bool(config.max_seconds and report["seconds"] > config.max_seconds)
         return adapter, report
 
     if warm is None:

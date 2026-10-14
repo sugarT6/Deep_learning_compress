@@ -70,7 +70,7 @@ from .probability_quantization import (
     validate_total,
 )
 from .range_encoder import RangeEncoder
-from .head_adapter import HeadAdaptationConfig, adapt_output_head, apply_head_adapter
+from .head_adapter import HeadAdaptationConfig, adapt_output_head, apply_head_adapter, adapter_container_bytes
 
 
 SUPPORTED_INPUT_SUFFIXES = SUPPORTED_FASTQ_SUFFIXES
@@ -329,7 +329,8 @@ def _encode_fastq_compat(
     if head_adaptation_config is not None or head_adapter_path is not None:
         stage_started = time.perf_counter()
         if head_adaptation_config is not None:
-            print("Adapting output head on a bounded prefix (experts disabled)...", file=sys.stderr)
+            scope = "Transformer suffix + output head" if head_adaptation_config.backbone_layers else "output head on a bounded prefix"
+            print(f"Adapting {scope} (experts disabled)...", file=sys.stderr)
             adapter, adaptation_report = adapt_output_head(model, input_path, device=device,
                 batch_reads=batch_reads, total=quantization_total, base_sha256=checkpoint_sha256,
                 config=replace(head_adaptation_config, quantization_version=quantization_version))
@@ -356,11 +357,9 @@ def _encode_fastq_compat(
         _add_timing(timings, "head_adaptation", stage_started)
         adaptation_report["total_stage_seconds"] = timings["head_adaptation"]
         adaptation_report["parameter_bytes"] = adapter["parameter_bytes"] if adapter else 0
-        # Actual added canonical JSON member bytes (base64 and framing included).
-        adaptation_report["container_adapter_bytes"] = (len(json.dumps({"head_adapter": adapter},
-            sort_keys=True, separators=(",", ":")).encode()) - 1 if adapter else 0)
-        if adapter is not None and online_prior_config is None:
-            adaptation_report["container_adapter_bytes"] += len('"probability_profile":null,')
+        adaptation_report["container_adapter_bytes"] = adapter_container_bytes(adapter)
+        if adapter is not None and online_prior_config is not None:
+            adaptation_report["container_adapter_bytes"] -= len('"probability_profile":null,')
         print(f"Head adaptation: {adaptation_report['reason']}; "
               f"accepted={adaptation_report['accepted']}; {timings['head_adaptation']:.3f}s", file=sys.stderr)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -687,7 +686,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-symbols-per-step", type=int, default=8192)
     parser.add_argument("--head-learning-rate", type=float, default=0.001)
     parser.add_argument("--head-anchor-strength", type=float, default=0.01)
-    parser.add_argument("--head-max-seconds", type=float, default=20.0)
+    parser.add_argument("--head-max-seconds", type=float, default=20.0,
+                        help="total adaptation time budget; 0 disables the deadline")
     parser.add_argument("--head-min-gain", type=float, default=0.0)
     parser.add_argument("--head-seed", type=int, default=20260921)
     parser.add_argument("--head-type", choices=("linear", "residual"), default="linear",
@@ -700,6 +700,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-lora-rank", type=int, default=4)
     parser.add_argument("--head-lora-steps", type=int, default=1000, help="maximum extra sequence updates within total budget")
     parser.add_argument("--head-lora-learning-rate", type=float, default=0.0003)
+    parser.add_argument("--finetune-last-layers", type=int, default=0,
+                        help="jointly fit this many final Transformer layers, final norm, and head (1..4)")
+    parser.add_argument("--backbone-steps", type=int, default=5000)
+    parser.add_argument("--backbone-batch-reads", type=int, default=16)
+    parser.add_argument("--backbone-learning-rate", type=float, default=0.0001)
+    parser.add_argument("--backbone-eval-every", type=int, default=200)
+    parser.add_argument("--backbone-patience", type=int, default=6,
+                        help="validation checks without a min-delta improvement before stopping; 0 disables")
+    parser.add_argument("--backbone-max-reads", type=int, default=32000)
+    parser.add_argument("--backbone-max-symbols", type=int, default=4800000)
     parser.add_argument(
         "--report-neural-only-bits", action="store_true",
         help="extra diagnostic softmax pass; disabled by default for encoding speed",
@@ -717,6 +727,12 @@ def main() -> int:
             raise ValueError("--head-cross-dim requires --head-cross-layer")
         if args.head_residual_dim != 32 and args.head_type != "residual":
             raise ValueError("--head-residual-dim requires --head-type residual")
+        backbone_options = ("backbone_steps", "backbone_batch_reads", "backbone_learning_rate",
+                            "backbone_eval_every", "backbone_patience", "backbone_max_reads",
+                            "backbone_max_symbols")
+        if not args.finetune_last_layers and any(
+                getattr(args, name) != build_parser().get_default(name) for name in backbone_options):
+            raise ValueError("--backbone-* requires --finetune-last-layers")
         if args.finetune_head:
             head_config = HeadAdaptationConfig(max_reads=args.head_max_reads, max_symbols=args.head_max_symbols,
                 max_read_length=args.head_max_read_length, steps=args.head_steps,
@@ -726,13 +742,19 @@ def main() -> int:
                 head_type=args.head_type, residual_dim=args.head_residual_dim,
                 cross_layer=args.head_cross_layer, cross_dim=args.head_cross_dim,
                 lora=args.head_lora, lora_rank=args.head_lora_rank, lora_steps=args.head_lora_steps,
-                lora_learning_rate=args.head_lora_learning_rate)
+                lora_learning_rate=args.head_lora_learning_rate,
+                backbone_layers=args.finetune_last_layers, backbone_steps=args.backbone_steps,
+                backbone_batch_reads=args.backbone_batch_reads,
+                backbone_learning_rate=args.backbone_learning_rate,
+                backbone_eval_every=args.backbone_eval_every, backbone_patience=args.backbone_patience,
+                backbone_max_reads=args.backbone_max_reads, backbone_max_symbols=args.backbone_max_symbols)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
             "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",
             "head_type", "head_residual_dim", "head_cross_layer", "head_cross_dim",
-            "head_lora", "head_lora_rank", "head_lora_steps", "head_lora_learning_rate")):
-            raise ValueError("--head-* training options require --finetune-head")
+            "head_lora", "head_lora_rank", "head_lora_steps", "head_lora_learning_rate",
+            "finetune_last_layers", *backbone_options)):
+            raise ValueError("adaptation training options require --finetune-head")
         statistics = encode_fastq(
             args.input,
             args.output,

@@ -49,8 +49,32 @@ class HeadAdaptationConfig:
     lora_steps: int = 1000
     lora_learning_rate: float = 0.0003
     quantization_version: int = 1
+    backbone_layers: int = 0
+    backbone_steps: int = 5000
+    backbone_batch_reads: int = 16
+    backbone_learning_rate: float = 0.0001
+    backbone_eval_every: int = 200
+    backbone_patience: int = 6
+    backbone_max_reads: int = 32000
+    backbone_max_symbols: int = 4800000
 
     def __post_init__(self):
+        if type(self.backbone_layers) is not int or not 0 <= self.backbone_layers <= 4:
+            raise ValueError("backbone_layers must be in [0, 4]")
+        if self.backbone_layers and self.lora:
+            raise ValueError("dense backbone adaptation cannot be combined with LoRA")
+        for name in ("backbone_steps", "backbone_batch_reads", "backbone_eval_every",
+                     "backbone_max_reads", "backbone_max_symbols"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"invalid {name}")
+        if self.backbone_batch_reads > 256 or self.backbone_max_reads < 4:
+            raise ValueError("invalid backbone batch/sample size")
+        if type(self.backbone_patience) is not int or self.backbone_patience < 0:
+            raise ValueError("backbone_patience must be nonnegative; 0 disables stopping")
+        if (isinstance(self.backbone_learning_rate, bool)
+                or not isinstance(self.backbone_learning_rate, (int, float))
+                or not math.isfinite(self.backbone_learning_rate) or self.backbone_learning_rate <= 0):
+            raise ValueError("invalid backbone_learning_rate")
         if type(self.quantization_version) is not int or self.quantization_version not in (1, 2):
             raise ValueError("invalid quantization_version")
         if type(self.lora) is not bool or (self.lora and not self.cross_layer):
@@ -80,7 +104,7 @@ class HeadAdaptationConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"invalid head adaptation {name}")
-        if self.learning_rate <= 0 or self.max_seconds <= 0 or self.anchor_strength < 0 or self.min_gain_bits_per_quality < 0:
+        if self.learning_rate <= 0 or self.max_seconds < 0 or self.anchor_strength < 0 or self.min_gain_bits_per_quality < 0:
             raise ValueError("invalid head adaptation rate, time, anchor or gain")
 
 
@@ -132,11 +156,23 @@ def serialize_head(head, base_sha256):
     return metadata
 
 
+def adapter_container_bytes(adapter):
+    """Actual additional canonical JSON members for a pure-neural adapter."""
+    if adapter is None:
+        return 0
+    return (len(json.dumps({"head_adapter": adapter}, sort_keys=True,
+                           separators=(",", ":")).encode()) - 1
+            + len('"probability_profile":null,'))
+
+
 def validate_head_adapter(metadata, d_model, base_sha256):
     """Validate bounded plain data before allocating model tensors; no pickle."""
     if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 6:
         from .lora_adapter import validate_lora_adapter
         return validate_lora_adapter(metadata, d_model, base_sha256)
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 7:
+        from .backbone_adapter import validate_backbone_adapter
+        return validate_backbone_adapter(metadata, d_model, base_sha256)
     keys = {"format", "version", "dtype", "layout", "application", "base_checkpoint_sha256",
             "weight_shape", "bias_shape", "parameter_bytes", "sha256", "data_base64"}
     if not isinstance(metadata, dict):
@@ -214,6 +250,9 @@ def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
 
 
 def apply_head_adapter(model, metadata, base_sha256):
+    if isinstance(metadata, dict) and metadata.get("version") == 7:
+        from .backbone_adapter import apply_backbone_adapter
+        return apply_backbone_adapter(model, metadata, base_sha256)
     if isinstance(metadata, dict) and metadata.get("version") == 6:
         from .lora_adapter import apply_lora_adapter
         return apply_lora_adapter(model, metadata, base_sha256)
@@ -222,6 +261,9 @@ def apply_head_adapter(model, metadata, base_sha256):
     original = model.output_head
     head = _restore_head(metadata, model.config.d_model, base_sha256,
                          device=original.weight.device, dtype=original.weight.dtype)
+    if hasattr(model, "_backbone_original_parameters"):
+        from .backbone_adapter import restore_backbone
+        restore_backbone(model)
     head.train(original.training)
     head.requires_grad_(original.weight.requires_grad)
     head.bias.requires_grad_(original.bias.requires_grad)
@@ -238,6 +280,10 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
     Prefix split is by whole reads (first 75% train, last 25% validation).
     Admission tests neural quantized bits, not hybrid or whole-file savings.
     """
+    if config.backbone_layers:
+        from .backbone_adapter import adapt_backbone
+        return adapt_backbone(model, source, device=device, batch_reads=batch_reads,
+                              total=total, base_sha256=base_sha256, config=config)
     if config.lora:
         from .lora_adapter import adapt_last_layer
         return adapt_last_layer(model, source, device=device, batch_reads=batch_reads,
@@ -245,8 +291,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
     if config.cross_layer and model.config.num_layers < 4:
         raise ValueError("cross-layer adaptation requires at least 4 Transformer layers")
     started = time.perf_counter()
-    deadline = started + config.max_seconds
-    work_deadline = started + config.max_seconds * 0.70
+    deadline = started + config.max_seconds if config.max_seconds else float("inf")
+    work_deadline = started + config.max_seconds * 0.70 if config.max_seconds else float("inf")
     report = {"config": asdict(config), "accepted": False, "reason": "insufficient_prefix",
               "steps_completed": 0, "prefix_reads": 0, "prefix_symbols": 0,
               "train_reads": 0, "validation_reads": 0, "train_symbols": 0,
@@ -264,7 +310,7 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
     def finish(adapter=None):
         sync()
         report["seconds"] = time.perf_counter() - started
-        report["budget_exceeded"] = report["seconds"] > config.max_seconds
+        report["budget_exceeded"] = bool(config.max_seconds and report["seconds"] > config.max_seconds)
         report["stage_seconds"] = stages
         return adapter, report
 

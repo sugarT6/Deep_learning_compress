@@ -479,7 +479,7 @@ class HeadAdapterTest(unittest.TestCase):
                 config(**values)
 
     def test_invalid_config(self):
-        for override in ({"steps": True}, {"max_seconds": float("nan")}, {"max_seconds": 0},
+        for override in ({"steps": True}, {"max_seconds": float("nan")}, {"max_seconds": -1},
                          {"max_reads": 3}, {"learning_rate": 0}, {"anchor_strength": -1},
                          {"head_type": "unknown"}, {"residual_dim": 0}, {"residual_dim": 129},
                          {"residual_dim": True}):

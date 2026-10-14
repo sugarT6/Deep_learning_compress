@@ -40,6 +40,15 @@ The 8000-read LoRA pilot showed a small gain over 1000 head updates but was
 weaker than spending the same time budget on additional head-only updates;
 it is experimental and remains disabled by default.
 
+`--finetune-head --finetune-last-layers 2 --head-max-seconds 0` additionally
+fits the final two Transformer blocks and final norm, with a bounded sample
+from across the input file, validation-based selection, and no time deadline.
+Its exact FP32 updates are losslessly XOR-differenced against the shared base,
+compressed, and transmitted as adapter v7. Weight storage is included in
+admission and final quality-plus-adapter bytes. See
+[codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md#dense-final-layer-adaptation)
+for the 4-layer-80k command and reporting fields.
+
 The opt-in `--quantizer floor` uses CPU float64 floor frequencies
 without largest-remainder sorting, variable per-position totals, and direct
 symbol intervals on the encoder. The default largest-remainder path remains
