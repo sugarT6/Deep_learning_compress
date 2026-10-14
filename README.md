@@ -44,8 +44,9 @@ it is experimental and remains disabled by default.
 fits the final two Transformer blocks and final norm, with a bounded sample
 from across the input file, validation-based selection, and no time deadline.
 Its exact FP32 updates are losslessly XOR-differenced against the shared base,
-compressed, and transmitted as adapter v7. Weight storage is included in
-admission and final quality-plus-adapter bytes. See
+compressed, and transmitted as adapter v7. The best validated trained state
+is always used; predicted savings and weight cost never trigger a return to
+the warm-up head. Weight storage is included in final quality-plus-adapter bytes. See
 [codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md#dense-final-layer-adaptation)
 for the 4-layer-80k command and reporting fields.
 
@@ -55,8 +56,8 @@ output head also train; other backbone parameters stay frozen. Adapter v8
 transmits compressed FP32 factors and norm values and canonically merges the
 updates before coding. Rank 8 adds 231424 raw bytes for two D=256/FF=512 blocks
 and final norm, excluding the head. It uses the same whole-file sample, best
-validation state, and admission including weight cost. The log explicitly
-reports the selected adapter and any fallback. See the
+validation state, and always-use policy. Predicted savings and weight cost
+are diagnostics; actual compression determines the result. See the
 [multi-layer LoRA command](codec/HEAD_ADAPTATION.md#multi-layer-lora-adaptation).
 
 The opt-in `--quantizer floor` uses CPU float64 floor frequencies

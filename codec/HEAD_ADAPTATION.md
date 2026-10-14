@@ -178,13 +178,19 @@ the reconstructed parameters; the decoder never retrains. The original
 checkpoint and its SHA remain required. Exported artifacts support normal
 `--head-adapter` reuse.
 
-Admission requires held-out quantized BPQ improvement **and** estimated quality
-savings greater than the actual extra canonical adapter bytes relative to the
-warm-up head. The estimate extrapolates to eligible reads outside warm-up;
-effects on excluded reads are unmeasured. Full-file quality-plus-adapter bytes
-remain the final result, not a guaranteed gain. If admission fails, the encoder
-keeps the warm-up head. All transmitted model bytes are included in
-`quality_and_adapter_bytes`.
+The joint stage **always uses the best validated trained state**. There is no
+gain threshold or weight-cost admission gate, and step zero is excluded from
+best-state selection. Even worse held-out BPQ or negative estimated net
+savings does not return to the warm-up head. Sampling/validation timeout,
+insufficient eligible reads or nonfinite optimization fails explicitly instead
+of silently producing a head-only result. Ordinary head-only warm-up and its
+original admission behavior remain unchanged.
+
+Quantized BPQ, estimated quality savings, and actual extra canonical adapter
+bytes are still reported for analysis. The estimate extrapolates to eligible
+reads outside warm-up; effects on excluded reads are unmeasured. Full-file
+quality-plus-adapter bytes determine the result. All transmitted model bytes
+are included in `quality_and_adapter_bytes`.
 
 Inspect `backbone_accepted`, `backbone_steps_completed`,
 `backbone_selected_step`, `backbone_sampling`, `backbone_validation_history`,
@@ -234,7 +240,7 @@ factors despite sharing PyTorch's packed projection tensor. No new input
 features or Header contents are used.
 
 The reservoir sample, train/validation split, full-read updates, best-state
-selection, plateau scheduler and weight-cost admission are identical to the
+selection, plateau scheduler and always-use policy are identical to the
 dense stage. There is no frozen final-feature cache in this stage. Set
 `--head-max-seconds 0` to allow the complete configured training run. The
 example starts LoRA at `--backbone-learning-rate 0.0003`; head LR stays .001.
@@ -244,7 +250,7 @@ Adapter v8 stores FP32 factors and exact final-norm values, byte-plane/zlib
 compressed and base64 encoded, plus the full head. Both codec ends merge each
 matrix on CPU in increasing rank order with FP64 accumulation and a single
 FP32 rounding. The reconstructed parameter SHA is verified before applying
-any update. Coding and final quantized admission use this merged wire model,
+any update. Coding and final quantized diagnostics use this merged wire model,
 not the training parametrizations. No training or extra branch is needed for
 decoding, and the original shared checkpoint remains required.
 
@@ -255,11 +261,13 @@ base64 and JSON and is explicitly charged, rather than using these raw sizes.
 
 Inspect `backbone_adaptation_type=lora`, `backbone_lora_rank`,
 `backbone_accepted`, `selected_adapter_type`, and `backbone_fallback`.
-`accepted=true` alone means some adapter was selected; when LoRA is rejected,
-`selected_adapter_type=output_head` identifies the retained warm-up result.
+On successful joint training, `backbone_accepted=true`,
+`selected_adapter_type=suffix_lora`, and `backbone_fallback=false`.
+`backbone_selected_step` is a validated positive training step, even when
+all trained states are worse than step zero.
 `estimated_quality_saving_bytes`, `incremental_adapter_bytes` and
-`estimated_net_saving_bytes` explain admission. These remain held-out sample
-estimates; compare measured full-file `quality_and_adapter_bytes` against
+`estimated_net_saving_bytes` are diagnostics, not acceptance criteria. They
+are held-out sample estimates; compare measured full-file `quality_and_adapter_bytes` against
 the head-only baseline (CNR 4-layer-80k: 76426168 bytes).
 
 Run rank 8 first. To compare rank 16, change the rank argument and the output
@@ -286,8 +294,9 @@ python -m codec.encode \
   > "$TEST_LORA/metrics.json" 2> "$TEST_LORA/encode.log"
 ```
 
-`encode.log` contains validation progress and an explicit final selection/
-fallback message; `metrics.json` contains size and admission fields.
+`encode.log` contains validation progress and the final selected model;
+`metrics.json` contains measured sizes and estimated savings. The encoding
+stage always measures the trained model instead of automatically reverting.
 
 ## Optional final-block Q/V LoRA
 

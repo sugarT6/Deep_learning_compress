@@ -1,5 +1,6 @@
 import base64
 import copy
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -212,20 +213,44 @@ class BackboneAdapterTest(unittest.TestCase):
             for name, parameter in model.named_parameters():
                 torch.testing.assert_close(parameter, selected[name], rtol=0, atol=0)
 
-    def test_gain_that_cannot_pay_for_weights_falls_back_without_changing_backbone(self):
+    def test_gain_that_cannot_pay_for_weights_still_uses_trained_backbone(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model, before, source, ckpt, cfg = self.fit_case(root, count=96, steps=10)
             with mock.patch.object(backbone_module, "score_model", side_effect=[6., 4., 6., 3.]):
                 adapter, report = adapt_output_head(model, source, device=torch.device("cpu"),
                     batch_reads=16, total=65536, base_sha256=sha256_file(ckpt), config=cfg)
-            self.assertFalse(report["backbone_accepted"])
-            self.assertEqual(report["reason"], "backbone_weight_cost_exceeds_estimated_saving")
+            self.assertTrue(report["backbone_accepted"])
+            self.assertFalse(report["backbone_fallback"])
+            self.assertEqual(report["reason"], "backbone_best_trained_state")
             self.assertLess(report["estimated_net_saving_bytes"], 0)
-            for name, parameter in model.named_parameters():
-                if not name.startswith("output_head."):
-                    torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
-            self.assertTrue(adapter is None or adapter["version"] != 7)
+            self.assertEqual(adapter["version"], 7)
+            self.assertFalse(torch.equal(model.transformer.layers[-1].linear1.weight,
+                                         before["transformer.layers.3.linear1.weight"]))
+
+    def test_worse_validation_still_selects_a_trained_state_in_dense_and_lora_modes(self):
+        for rank in (0, 2):
+            with self.subTest(rank=rank), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                model, _, source, ckpt, cfg = self.fit_case(root, steps=30)
+                # All trained states lose to step zero, and quantized BPQ worsens.
+                with mock.patch.object(backbone_module, "score_model", side_effect=[1., 2., 3., 4., 1., 1.5]):
+                    adapter, report = adapt_output_head(model, source, device=torch.device("cpu"),
+                        batch_reads=16, total=65536, base_sha256=sha256_file(ckpt),
+                        config=replace(cfg, backbone_lora_rank=rank))
+                self.assertTrue(report["backbone_accepted"])
+                self.assertFalse(report["backbone_fallback"])
+                self.assertEqual(report["backbone_selected_step"], 10)
+                self.assertEqual(adapter["version"], 8 if rank else 7)
+                self.assertLess(report["estimated_quality_saving_bytes"], 0)
+                self.assertLess(report["estimated_net_saving_bytes"], 0)
+
+    def test_unavailable_training_data_fails_instead_of_silently_reverting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model, _, source, ckpt, cfg = self.fit_case(Path(directory), count=32)
+            with self.assertRaisesRegex(ValueError, "sampling"):
+                adapt_output_head(model, source, device=torch.device("cpu"),
+                    batch_reads=16, total=65536, base_sha256=sha256_file(ckpt), config=cfg)
 
     def test_cli_wiring_and_guards(self):
         common = ["codec.encode", "in.fq", "out.fqdc", "base.pt"]

@@ -286,6 +286,7 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
                   backbone_validation_history=[], backbone_stage_seconds={},
                   backbone_adaptation_type="lora" if config.backbone_lora_rank else "dense",
                   backbone_lora_rank=config.backbone_lora_rank,
+                  backbone_selection_policy="best_trained_state_without_gain_gate",
                   backbone_validation_scope="random_read_holdout_after_warmup_prefix")
 
     def finish(adapter, reason):
@@ -309,7 +310,7 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     report["backbone_sampling"] = sample
     report["backbone_stage_seconds"]["sampling"] = time.perf_counter() - sampling_started
     if not sample["sampling_complete"] or len(records) < 4:
-        return finish(warm, "backbone_sampling_budget_or_insufficient_reads")
+        raise ValueError("backbone sampling timed out or has fewer than four eligible reads")
     split = len(records) * 3 // 4
     train, validation = records[:split], records[split:]
     report.update(backbone_train_reads=len(train), backbone_validation_reads=len(validation))
@@ -342,17 +343,19 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     ])
     common = dict(device=device, batch_reads=config.backbone_batch_reads, source=source,
                   total=total, version=config.quantization_version, deadline=deadline)
-    best_loss = score_model(candidate, validation, quantized=False, **common)
-    if best_loss is None:
-        return finish(warm, "backbone_validation_budget")
-    if not math.isfinite(best_loss):
-        return finish(warm, "backbone_nonfinite_validation")
-    best = {name: p.detach().cpu().clone() for name, p in trainable.items()}
+    initial_loss = score_model(candidate, validation, quantized=False, **common)
+    if initial_loss is None:
+        raise ValueError("backbone initial validation timed out")
+    if not math.isfinite(initial_loss):
+        raise ValueError("backbone initial validation is nonfinite")
+    # Select among trained states, even if all are worse than the warm-up head.
+    # Step zero must not silently act as the old head-only fallback.
+    best_loss, best = float("inf"), None
     control = TrainingControl(optimizer, TrainingControlConfig(
         lr_scheduler="plateau", lr_patience=2,
         min_lr=min(config.learning_rate, config.backbone_learning_rate) * .01,
-        early_stopping_patience=config.backbone_patience), best_bits=best_loss)
-    report["backbone_validation_history"].append(dict(step=0, bits_per_quality=best_loss))
+        early_stopping_patience=config.backbone_patience), best_bits=initial_loss)
+    report["backbone_validation_history"].append(dict(step=0, bits_per_quality=initial_loss))
     report["backbone_trainable_parameters"] = sum(p.numel() for p in backbone)
     report["head_trainable_parameters"] = sum(p.numel() for p in head)
     rng = random.Random(config.seed)
@@ -368,7 +371,7 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
         loss = loss + config.anchor_strength * sum(
             (p - anchors[name]).square().mean() for name, p in trainable.items())
         if not torch.isfinite(loss):
-            return finish(warm, "backbone_nonfinite_training")
+            raise ValueError("backbone training loss is nonfinite")
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(trainable.values()), 1.)
         optimizer.step()
@@ -378,7 +381,7 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
             if value is None:
                 break
             if not math.isfinite(value):
-                return finish(warm, "backbone_nonfinite_validation")
+                raise ValueError("backbone validation is nonfinite")
             if value < best_loss:
                 best_loss = value
                 best = {name: p.detach().cpu().clone() for name, p in trainable.items()}
@@ -392,8 +395,8 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
                 report["backbone_stopped_early"] = True
                 break
     report["backbone_stage_seconds"]["optimization"] = time.perf_counter() - optimization_started
-    if report["backbone_selected_step"] == 0:
-        return finish(warm, "backbone_no_heldout_gain")
+    if best is None:
+        raise ValueError("backbone training ended before a trained state could be validated")
     with torch.no_grad():
         for name, parameter in trainable.items():
             parameter.copy_(best[name])
@@ -420,17 +423,13 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
                   backbone_before_validation_bits_per_quality=before,
                   backbone_after_validation_bits_per_quality=after)
     if before is None or after is None:
-        return finish(warm, "backbone_wire_validation_budget")
+        raise ValueError("backbone wire validation timed out")
     if not math.isfinite(before) or not math.isfinite(after):
-        return finish(warm, "backbone_nonfinite_wire_validation")
+        raise ValueError("backbone wire validation is nonfinite")
     saving = (before - after) * sample["eligible_symbols"] / 8.
     cost = adapter_container_bytes(adapter) - adapter_container_bytes(warm)
     report.update(estimated_quality_saving_bytes=saving, incremental_adapter_bytes=cost,
                   estimated_net_saving_bytes=saving - cost)
-    if before - after <= config.min_gain_bits_per_quality:
-        return finish(warm, "backbone_no_quantized_gain")
-    if saving <= cost:
-        return finish(warm, "backbone_weight_cost_exceeds_estimated_saving")
     apply_head_adapter(model, adapter, base_sha256)
     report["backbone_accepted"] = True
-    return finish(adapter, "backbone_estimated_net_gain")
+    return finish(adapter, "backbone_best_trained_state")

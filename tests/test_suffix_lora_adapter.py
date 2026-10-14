@@ -183,11 +183,11 @@ class SuffixLoRATest(unittest.TestCase):
                     self.assertFalse(torch.equal(dict(model.named_parameters())[name], before[name]), name)
             self.assertEqual(report["backbone_trainable_parameters"] * 4, adapter["raw_bytes"])
 
-    def test_best_factors_are_restored_and_weight_cost_can_reject(self):
-        for reject in (False, True):
-            with self.subTest(reject=reject), tempfile.TemporaryDirectory() as directory:
+    def test_best_factors_are_used_even_when_weights_cost_more_than_savings(self):
+        for small_file in (False, True):
+            with self.subTest(small_file=small_file), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                model, before, source, checkpoint, cfg = self.fit(root, 96 if reject else 10000, 30)
+                model, _, source, checkpoint, cfg = self.fit(root, 96 if small_file else 10000, 30)
                 values = [6., 4., 5., 6., 6., 3.]
                 selected = {}
                 def score(candidate, records, *, quantized, **kwargs):
@@ -200,19 +200,15 @@ class SuffixLoRATest(unittest.TestCase):
                     adapter, report = adapt_output_head(model, source, device=torch.device("cpu"),
                         batch_reads=16, total=65536, base_sha256=sha256_file(checkpoint), config=cfg)
                 self.assertEqual(report["backbone_selected_step"], 10)
-                self.assertEqual(report["backbone_accepted"], not reject)
-                if reject:
-                    self.assertTrue(report["backbone_fallback"])
-                    self.assertIn(report["selected_adapter_type"], ("output_head", "base_model"))
-                    self.assertEqual(report["reason"], "backbone_weight_cost_exceeds_estimated_saving")
-                    for name, p in model.named_parameters():
-                        if not name.startswith("output_head."):
-                            torch.testing.assert_close(p, before[name], rtol=0, atol=0)
-                else:
-                    self.assertEqual(adapter["version"], 8)
-                    for i, layer in enumerate(model.transformer.layers[2:]):
-                        # Training FP32 matmul and canonical FP64 merge may differ by one rounding.
-                        torch.testing.assert_close(layer.linear1.weight, selected[i], rtol=1e-6, atol=1e-7)
+                self.assertTrue(report["backbone_accepted"])
+                self.assertFalse(report["backbone_fallback"])
+                self.assertEqual(report["selected_adapter_type"], "suffix_lora")
+                self.assertEqual(adapter["version"], 8)
+                if small_file:
+                    self.assertLess(report["estimated_net_saving_bytes"], 0)
+                for i, layer in enumerate(model.transformer.layers[2:]):
+                    # Training FP32 matmul and canonical FP64 merge may differ by one rounding.
+                    torch.testing.assert_close(layer.linear1.weight, selected[i], rtol=1e-6, atol=1e-7)
 
     def test_cli_guards_and_rank_parameter_cost(self):
         common = ["codec.encode", "in.fq", "out.fqdc", "base.pt", "--finetune-head"]
