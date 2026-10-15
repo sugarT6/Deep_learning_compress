@@ -25,6 +25,7 @@ from .model import fastq_batch_to_tensors
 from .probability_quantization import logits_to_cdfs
 from .encode_fastpath import selected_quantized_bits
 from .training_control import TrainingControl, TrainingControlConfig
+from .read_state import ReadStateConditioning, clear_conditioning, conditioned_tensors, fit_thresholds, serialize_read_state
 
 
 PROTOCOL = "transformer_suffix_and_final_norm_xor32_byteplanes_zlib_v1"
@@ -170,6 +171,7 @@ def apply_backbone_adapter(model, meta, digest):
                          device=original.weight.device, dtype=original.weight.dtype)
     head.train(original.training)
     head.requires_grad_(original.weight.requires_grad)
+    clear_conditioning(model)
     restore_backbone(model)
     if hasattr(model, "_lora_original_qkv"):
         with torch.no_grad():
@@ -245,7 +247,7 @@ def score_model(model, records, *, device, batch_reads, source, total, version, 
         for begin in range(0, len(records), batch_reads):
             if time.perf_counter() >= deadline:
                 return None
-            tensors = _tensors(records[begin:begin + batch_reads], device, source)
+            tensors = conditioned_tensors(model, _tensors(records[begin:begin + batch_reads], device, source))
             active = tensors["active_mask"]
             logits, labels = model.forward_full(**tensors)[active], tensors["qualities"][active]
             if not torch.isfinite(logits).all():
@@ -276,7 +278,7 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     deadline = started + config.max_seconds if config.max_seconds else float("inf")
     warm, warm_report = adapt_output_head(model, source, device=device, batch_reads=batch_reads,
         total=total, base_sha256=base_sha256,
-        config=replace(config, backbone_layers=0, backbone_lora_rank=0))
+        config=replace(config, backbone_layers=0, backbone_lora_rank=0, read_quality_state=False))
     report = dict(warm_report)
     # Candidate sizes below refer to the joint stage, not the warm-up candidate.
     report.pop("candidate_parameter_bytes", None)
@@ -293,7 +295,8 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         report.update(reason=reason, accepted=adapter is not None,
-                      selected_adapter_type=("suffix_lora" if adapter and adapter["version"] == 8
+                      selected_adapter_type=("read_state_suffix" if adapter and adapter["version"] == 9
+                          else "suffix_lora" if adapter and adapter["version"] == 8
                           else "dense_suffix" if adapter and adapter["version"] == 7
                           else "output_head" if adapter else "base_model"),
                       backbone_fallback=not report["backbone_accepted"],
@@ -325,6 +328,16 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
             candidate.output_head.weight.copy_(old_head.weight)
             candidate.output_head.bias.copy_(old_head.bias)
     first = model.config.num_layers - config.backbone_layers
+    if config.read_quality_state:
+        thresholds = fit_thresholds(train)
+        candidate.read_state_conditioning = ReadStateConditioning(
+            model.config.d_model, list(range(first, model.config.num_layers)), thresholds).to(
+                device=device, dtype=candidate.output_head.weight.dtype)
+        report.update(read_state_thresholds_milli=thresholds,
+                      read_state_threshold_fit="adaptation_training_reads_only",
+                      read_state_trainable_parameters=sum(p.numel() for p in candidate.read_state_conditioning.parameters()))
+        print(f"Read quality state: four classes; mean milli-Q thresholds={thresholds}; "
+              f"conditioning Transformer layers {first + 1}..{model.config.num_layers}", file=sys.stderr)
     if config.backbone_lora_rank:
         from .suffix_lora_adapter import install_suffix_lora
         install_suffix_lora(candidate, config.backbone_layers, config.backbone_lora_rank, config.seed)
@@ -364,7 +377,7 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
         if time.perf_counter() >= deadline:
             break
         rows = rng.sample(train, min(config.backbone_batch_reads, len(train)))
-        tensors = _tensors(rows, device, source)
+        tensors = conditioned_tensors(candidate, _tensors(rows, device, source))
         optimizer.zero_grad(set_to_none=True)
         active = tensors["active_mask"]
         loss = F.cross_entropy(candidate.forward_full(**tensors)[active], tensors["qualities"][active])
@@ -407,6 +420,8 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
             config.backbone_lora_rank, base_sha256, base_model=model)
     else:
         adapter = serialize_backbone(candidate, config.backbone_layers, base_sha256, base_model=model)
+    if config.read_quality_state:
+        adapter = serialize_read_state(candidate, adapter, base_sha256)
     wire = copy.deepcopy(model)
     apply_head_adapter(wire, adapter, base_sha256)
     wire.eval()
@@ -428,8 +443,12 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
         raise ValueError("backbone wire validation is nonfinite")
     saving = (before - after) * sample["eligible_symbols"] / 8.
     cost = adapter_container_bytes(adapter) - adapter_container_bytes(warm)
+    # These labels are transmitted for all reads, including warm-up and empty
+    # reads. The final encode report also includes their exact JSON framing.
+    label_cost = (sample["total_file_reads"] + 3) // 4 if config.read_quality_state else 0
     report.update(estimated_quality_saving_bytes=saving, incremental_adapter_bytes=cost,
-                  estimated_net_saving_bytes=saving - cost)
+                  estimated_read_state_stream_bytes=label_cost,
+                  estimated_net_saving_bytes=saving - cost - label_cost)
     apply_head_adapter(model, adapter, base_sha256)
     report["backbone_accepted"] = True
     return finish(adapter, "backbone_best_trained_state")

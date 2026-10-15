@@ -29,6 +29,7 @@ from .container import (
     CONTAINER_FORMAT,
     CONTAINER_VERSION,
     ADAPTED_CONTAINER_VERSION,
+    READ_STATE_CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
     ContainerError,
     ContainerIntegrityError,
@@ -64,6 +65,7 @@ from .probability_quantization import (
     validate_total,
 )
 from .range_decoder import RangeDecoder
+from .read_state import StateReader, classify_reads
 from .adaptive_prior import AdaptivePriorState
 from .mixture_prior import (MixturePriorConfig, MixturePriorState,
     make_prior_state, parse_probability_profile, fuse_profile_positions)
@@ -107,7 +109,7 @@ def _validate_codec_metadata(
     if metadata["format"] != CONTAINER_FORMAT:
         raise ContainerError("unsupported container format")
     format_version = int(metadata["format_version"])
-    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION):
+    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION):
         raise ContainerError("unsupported container version")
     stored_batch_reads = int(metadata["batch_reads"])
     if batch_reads != stored_batch_reads:
@@ -138,7 +140,7 @@ def _validate_codec_metadata(
     if metadata["inference_runtime"]["dtype"] != "float32":
         raise ContainerError("unsupported model inference dtype")
     probability_profile = metadata.get("probability_profile")
-    if format_version == LEGACY_CONTAINER_VERSION or (format_version == ADAPTED_CONTAINER_VERSION and probability_profile is None):
+    if format_version == LEGACY_CONTAINER_VERSION or (format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION) and probability_profile is None):
         if probability_profile is not None:
             raise ContainerError("legacy container unexpectedly declares a prior")
         online_prior_config = None
@@ -176,7 +178,7 @@ def _validate_checkpoint(
     if feature_schema() != checkpoint_metadata["feature_schema"]:
         raise ModelMismatchError("checkpoint feature schema does not match container")
     loaded.model.eval()
-    if metadata["format_version"] == ADAPTED_CONTAINER_VERSION:
+    if metadata["format_version"] in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION):
         from .head_adapter import apply_head_adapter
         apply_head_adapter(loaded.model, metadata["head_adapter"], observed_hash)
     return loaded.model
@@ -216,11 +218,13 @@ def _decode_quality_batch(
     verify_cdf: bool,
     online_prior: OnlinePriorState | MixturePriorState | None,
     quantization_version: int = 1,
+    read_states: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, int]:
     stage_started = time.perf_counter()
     bases, lengths, active_mask = _batch_tensors(base_records, device)
     _synchronize_device(device)
     _add_timing(timings, "tensor_transfer", stage_started)
+    state_inputs = {} if read_states is None else {"read_states": torch.as_tensor(read_states, dtype=torch.long, device=device)}
     read_count, maximum_length = bases.shape
     decoded = torch.full(
         (read_count, maximum_length),
@@ -248,6 +252,7 @@ def _decode_quality_batch(
                 decoded[:, :cycle],
                 lengths,
                 active_mask,
+                **state_inputs,
             )
             _synchronize_device(device)
             _add_timing(timings, "model_forward_step", stage_started)
@@ -289,7 +294,7 @@ def _decode_quality_batch(
         if verify_cdf:
             _synchronize_device(device)
             stage_started = time.perf_counter()
-            full_logits = model.forward_full(bases, decoded, lengths, active_mask)
+            full_logits = model.forward_full(bases, decoded, lengths, active_mask, **state_inputs)
             _synchronize_device(device)
             _add_timing(timings, "model_forward_full_verification", stage_started)
             stage_started = time.perf_counter()
@@ -324,6 +329,10 @@ def _decode_quality_batch(
             < lengths_cpu[:, None]
         )
         online_prior.update_batch(decoded_cpu, active_mask_cpu)
+    if read_states is not None:
+        expected = classify_reads(decoded_cpu, lengths_cpu, model.read_state_conditioning.thresholds)
+        if not np.array_equal(expected, read_states):
+            raise ContainerIntegrityError("decoded read quality means do not match transmitted states")
     return decoded_cpu, decoded_symbols
 
 
@@ -394,6 +403,8 @@ def _decode_to_handle(
     online_prior = make_prior_state(online_prior_config)
 
     with ExitStack() as stack:
+        state_reader = (StateReader(stack.enter_context(container_info.open_section("read_state")), read_count)
+                        if metadata["format_version"] == READ_STATE_CONTAINER_VERSION else None)
         header_compressed = stack.enter_context(
             container_info.open_section("header_gzip")
         )
@@ -458,6 +469,7 @@ def _decode_to_handle(
                 verify_cdf=verify_cdf,
                 online_prior=online_prior,
                 quantization_version=int(metadata["probability_quantization"]["version"]),
+                read_states=state_reader.read(current_batch_reads) if state_reader else None,
             )
             decoded_symbols += batch_symbols
             stage_started = time.perf_counter()
@@ -474,6 +486,8 @@ def _decode_to_handle(
                 progress_bar.update(batch_symbols)
 
         stage_started = time.perf_counter()
+        if state_reader is not None:
+            state_reader.finish()
         header_reader.finish()
         base_reader.finish()
         plus_reader.finish()

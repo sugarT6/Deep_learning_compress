@@ -32,6 +32,7 @@ from .container import (
     CONTAINER_FORMAT,
     CONTAINER_VERSION,
     ADAPTED_CONTAINER_VERSION,
+    READ_STATE_CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
     ContainerError,
     SectionSource,
@@ -71,6 +72,7 @@ from .probability_quantization import (
 )
 from .range_encoder import RangeEncoder
 from .head_adapter import HeadAdaptationConfig, adapt_output_head, apply_head_adapter, adapter_container_bytes
+from .read_state import StateWriter, classify_reads, label_metadata, state_container_overhead
 
 
 SUPPORTED_INPUT_SUFFIXES = SUPPORTED_FASTQ_SUFFIXES
@@ -109,6 +111,9 @@ class EncodeStatistics:
     head_adaptation: Optional[Dict[str, Any]]
     quality_and_adapter_bytes: int
     coder_backend: str
+    read_state_stream_bytes: int
+    read_state_metadata_bytes: int
+    read_state_stream_bits_per_quality: Optional[float]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -159,11 +164,14 @@ def _quantize_verified_batch(
     verify_cdf: bool = True,
     report_neural_only_bits: bool = True,
     quantization_version: int = 1,
+    read_states: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Any, float, float]:
     """Return cycle-major symbols and CDFs (v1) or low/high/total arrays (v2)."""
 
     stage_started = time.perf_counter()
     tensors = fastq_batch_to_tensors(batch, device)
+    state_inputs = {} if read_states is None else {"read_states": torch.as_tensor(read_states, dtype=torch.long, device=device)}
+    tensors.update(state_inputs)
     _synchronize_device(device)
     _add_timing(timings, "tensor_transfer", stage_started)
     with torch.inference_mode():
@@ -224,6 +232,7 @@ def _quantize_verified_batch(
                     tensors["qualities"][:, :cycle],
                     tensors["lengths"],
                     tensors["active_mask"],
+                    **state_inputs,
                 )
                 _synchronize_device(device)
                 _add_timing(
@@ -395,6 +404,10 @@ def _encode_fastq_compat(
             base_path = temporary_root / "base.gz"
             plus_path = temporary_root / "plus.gz"
             quality_path = temporary_root / "quality.range"
+            state_path = temporary_root / "read_state.bin"
+            state_enabled = hasattr(model, "read_state_conditioning")
+            if state_enabled and online_prior_config is not None:
+                raise ValueError("read-state encoding requires neural-only probabilities")
 
             with SideStreamWriter(
                 header_path, "header", compresslevel=GZIP_COMPRESSLEVEL
@@ -402,7 +415,8 @@ def _encode_fastq_compat(
                 base_path, "base", compresslevel=GZIP_COMPRESSLEVEL
             ) as base_writer, SideStreamWriter(
                 plus_path, "plus", compresslevel=GZIP_COMPRESSLEVEL
-            ) as plus_writer:
+            ) as plus_writer, state_path.open("wb") as state_handle:
+                state_writer = StateWriter(state_handle) if state_enabled else None
                 batch_iterator = iter_fastq_batches(
                     input_path, batch_reads=batch_reads
                 )
@@ -436,6 +450,13 @@ def _encode_fastq_compat(
                         )
                     _add_timing(timings, "side_stream_record_write", stage_started)
 
+                    read_states = None
+                    if state_writer is not None:
+                        stage_started = time.perf_counter()
+                        read_states = classify_reads(batch.qualities, batch.lengths,
+                            model.read_state_conditioning.thresholds)
+                        state_writer.write(read_states)
+                        _add_timing(timings, "read_state_classify_and_write", stage_started)
                     (
                         symbols,
                         cdfs,
@@ -451,6 +472,7 @@ def _encode_fastq_compat(
                         verify_cdf=verify_cdf,
                         report_neural_only_bits=report_neural_only_bits,
                         quantization_version=quantization_version,
+                        read_states=read_states,
                     )
                     stage_started = time.perf_counter()
                     if quantization_version == 2:
@@ -473,6 +495,9 @@ def _encode_fastq_compat(
                     neural_only_theoretical_bits += batch_neural_only_bits
                     if progress_bar is not None:
                         progress_bar.update(batch.read_count)
+
+                if state_writer is not None:
+                    state_writer.finish()
 
             stage_started = time.perf_counter()
             range_stream = range_encoder.finish()
@@ -538,6 +563,12 @@ def _encode_fastq_compat(
                 metadata["format_version"] = ADAPTED_CONTAINER_VERSION
                 metadata["head_adapter"] = adapter
                 metadata.setdefault("probability_profile", None)
+            if state_enabled:
+                metadata["format_version"] = READ_STATE_CONTAINER_VERSION
+                metadata["read_state"] = label_metadata(adapter, read_count)
+                if state_writer.count != read_count:
+                    raise ContainerError("read-state label count does not match FASTQ reads")
+                adaptation_report["read_state_class_counts"] = state_writer.class_counts.tolist()
             stage_started = time.perf_counter()
             container_info = write_container(
                 output_path,
@@ -553,7 +584,7 @@ def _encode_fastq_compat(
                         "plus_gzip", plus_path, plus_writer.uncompressed_length
                     ),
                     SectionSource("quality_range", quality_path, len(range_stream)),
-                ),
+                ) + ((SectionSource("read_state", state_path, state_path.stat().st_size),) if state_enabled else ()),
             )
             _add_timing(timings, "container_write", stage_started)
     finally:
@@ -563,6 +594,10 @@ def _encode_fastq_compat(
     input_bytes = input_path.stat().st_size
     output_bytes = container_info.file_size
     range_stream_bytes = container_info.section("quality_range").length
+    state_stream_bytes, state_metadata_bytes = state_container_overhead(container_info)
+    if state_stream_bytes or state_metadata_bytes:
+        print(f"Read-state labels: {state_stream_bytes} B; framing: {state_metadata_bytes} B; "
+              f"class counts: {state_writer.class_counts.tolist()}", file=sys.stderr)
     encode_seconds = time.perf_counter() - started
     quality_model_prediction_seconds = timings["model_forward_full"]
     quality_entropy_coding_seconds = (
@@ -619,8 +654,12 @@ def _encode_fastq_compat(
         online_adaptation=(online_prior.diagnostics() if isinstance(online_prior, AdaptivePriorState) else None),
         head_adaptation=adaptation_report,
         quality_and_adapter_bytes=range_stream_bytes + (
-            adaptation_report["container_adapter_bytes"] if adaptation_report else 0),
+            adaptation_report["container_adapter_bytes"] if adaptation_report else 0)
+            + state_stream_bytes + state_metadata_bytes,
         coder_backend=range_encoder.backend,
+        read_state_stream_bytes=state_stream_bytes,
+        read_state_metadata_bytes=state_metadata_bytes,
+        read_state_stream_bits_per_quality=(state_stream_bytes * 8 / quality_symbols if quality_symbols else None),
     )
 
 
@@ -712,6 +751,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-lora-learning-rate", type=float, default=0.0003)
     parser.add_argument("--finetune-last-layers", type=int, default=0,
                         help="jointly fit this many final Transformer layers, final norm, and head (1..4)")
+    parser.add_argument("--read-quality-state", action="store_true",
+                        help="transmit four-class read mean labels and condition each fitted Transformer block; requires --finetune-last-layers")
     parser.add_argument("--backbone-steps", type=int, default=5000)
     parser.add_argument("--backbone-batch-reads", type=int, default=16)
     parser.add_argument("--backbone-learning-rate", type=float, default=0.0001)
@@ -760,13 +801,13 @@ def main() -> int:
                 backbone_learning_rate=args.backbone_learning_rate,
                 backbone_eval_every=args.backbone_eval_every, backbone_patience=args.backbone_patience,
                 backbone_max_reads=args.backbone_max_reads, backbone_max_symbols=args.backbone_max_symbols,
-                backbone_lora_rank=args.backbone_lora_rank)
+                backbone_lora_rank=args.backbone_lora_rank, read_quality_state=args.read_quality_state)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
             "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",
             "head_type", "head_residual_dim", "head_cross_layer", "head_cross_dim",
             "head_lora", "head_lora_rank", "head_lora_steps", "head_lora_learning_rate",
-            "finetune_last_layers", *backbone_options)):
+            "finetune_last_layers", "read_quality_state", *backbone_options)):
             raise ValueError("adaptation training options require --finetune-head")
         statistics = encode_fastq(
             args.input,

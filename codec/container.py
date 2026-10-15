@@ -25,7 +25,8 @@ CONTAINER_FORMAT = "fastq-direct-quality-container"
 LEGACY_CONTAINER_VERSION = 1
 CONTAINER_VERSION = 2
 ADAPTED_CONTAINER_VERSION = 3
-SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION)
+READ_STATE_CONTAINER_VERSION = 4
+SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION)
 CONTAINER_MAGIC = b"FQDC0001"
 CONTAINER_FLAGS = 0
 SECTION_NAMES = ("header_gzip", "base_gzip", "plus_gzip", "quality_range")
@@ -282,7 +283,7 @@ def _validate_metadata(
     _integer(quantization.get("phred_offset"), name="phred_offset")
 
     probability_profile = metadata.get("probability_profile")
-    if format_version == ADAPTED_CONTAINER_VERSION:
+    if format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION):
         if "probability_profile" not in metadata:
             raise ContainerError("version-3 requires explicit probability_profile (null for neural-only)")
         try:
@@ -290,14 +291,23 @@ def _validate_metadata(
             validate_head_adapter(metadata.get("head_adapter"),
                                   checkpoint["model_config"].get("d_model"), checkpoint["sha256"])
             adapter = metadata["head_adapter"]
-            if adapter.get("version") in (7, 8) and (
+            if adapter.get("version") in (7, 8, 9) and (
                     adapter["num_layers"] != checkpoint["model_config"].get("num_layers")
                     or adapter["feedforward_dim"] != checkpoint["model_config"].get("feedforward_dim")):
                 raise ValueError("backbone adapter does not match checkpoint architecture")
+            if format_version == READ_STATE_CONTAINER_VERSION:
+                from .read_state import validate_label_metadata
+                validate_label_metadata(metadata)
+                if probability_profile is not None:
+                    raise ValueError("read-state encoding requires neural-only probabilities")
+            elif adapter.get("version") == 9:
+                raise ValueError("read-state adapter requires container version 4")
         except ValueError as exc:
             raise ContainerError(f"invalid head_adapter: {exc}") from exc
     elif "head_adapter" in metadata:
-        raise ContainerError("head_adapter requires container version 3")
+        raise ContainerError("head_adapter requires container version 3 or 4")
+    if format_version != READ_STATE_CONTAINER_VERSION and "read_state" in metadata:
+        raise ContainerError("read_state requires container version 4")
     if format_version == LEGACY_CONTAINER_VERSION:
         if probability_profile is not None:
             raise ContainerError(
@@ -334,9 +344,10 @@ def _validate_metadata(
         raise ContainerError("inference_runtime fields must be strings")
 
 
-def _section_infos(sources: Sequence[SectionSource]) -> Tuple[SectionInfo, ...]:
-    if tuple(source.name for source in sources) != SECTION_NAMES:
-        raise ContainerError(f"sections must appear exactly as {SECTION_NAMES}")
+def _section_infos(sources: Sequence[SectionSource], version=ADAPTED_CONTAINER_VERSION) -> Tuple[SectionInfo, ...]:
+    expected_names = SECTION_NAMES + (("read_state",) if version == READ_STATE_CONTAINER_VERSION else ())
+    if tuple(source.name for source in sources) != expected_names:
+        raise ContainerError(f"sections must appear exactly as {expected_names}")
     offset = 0
     sections = []
     for source in sources:
@@ -375,7 +386,7 @@ def write_container(
     if "sections" in metadata:
         raise ContainerError("caller metadata must not predefine sections")
 
-    sections = _section_infos(section_sources)
+    sections = _section_infos(section_sources, metadata.get("format_version"))
     complete_metadata = dict(metadata)
     complete_metadata["sections"] = [asdict(section) for section in sections]
     container_version = _integer(
@@ -423,12 +434,13 @@ def write_container(
     )
 
 
-def _parse_section_infos(raw_sections: Any) -> Tuple[SectionInfo, ...]:
-    if not isinstance(raw_sections, list) or len(raw_sections) != len(SECTION_NAMES):
-        raise ContainerError("container must contain exactly four sections")
+def _parse_section_infos(raw_sections: Any, version=ADAPTED_CONTAINER_VERSION) -> Tuple[SectionInfo, ...]:
+    expected_names = SECTION_NAMES + (("read_state",) if version == READ_STATE_CONTAINER_VERSION else ())
+    if not isinstance(raw_sections, list) or len(raw_sections) != len(expected_names):
+        raise ContainerError(f"container must contain exactly {len(expected_names)} sections")
     sections = []
     expected_offset = 0
-    for expected_name, raw in zip(SECTION_NAMES, raw_sections):
+    for expected_name, raw in zip(expected_names, raw_sections):
         if not isinstance(raw, dict) or raw.get("name") != expected_name:
             raise ContainerError(f"expected section {expected_name!r}")
         offset = _integer(raw.get("offset"), name=f"{expected_name}.offset")
@@ -484,7 +496,11 @@ def read_container(path: Path, *, verify_checksums: bool = True) -> ContainerInf
     if _canonical_metadata(metadata) != metadata_bytes:
         raise ContainerError("container metadata is not in canonical JSON form")
     _validate_metadata(metadata, physical_version=version)
-    sections = _parse_section_infos(metadata.get("sections"))
+    sections = _parse_section_infos(metadata.get("sections"), version)
+    if version == READ_STATE_CONTAINER_VERSION:
+        expected_state_bytes = (metadata["read_count"] + 3) // 4
+        if sections[-1].length != expected_state_bytes or sections[-1].uncompressed_length != expected_state_bytes:
+            raise ContainerError("read-state stream length does not match read count")
     header_bytes = _PREFIX.size + metadata_length
     expected_size = header_bytes + sum(section.length for section in sections)
     observed_size = container_path.stat().st_size

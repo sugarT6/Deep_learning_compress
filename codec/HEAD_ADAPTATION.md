@@ -1,5 +1,9 @@
 # Per-file output-head adaptation
 
+For transmitted read quality states that condition the fitted Transformer
+blocks, see [READ_QUALITY_STATE.md](READ_QUALITY_STATE.md). This uses existing
+base weights, the suffix adaptation pipeline, adapter v9 and container v4.
+
 This opt-in experiment freezes the base model and fits its output head on a
 bounded FASTQ prefix. The default is `Linear(d_model, 42)`; the opt-in residual
 head adds a small GELU branch. It does not train on the whole target file,

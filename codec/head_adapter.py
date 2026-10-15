@@ -58,8 +58,11 @@ class HeadAdaptationConfig:
     backbone_max_reads: int = 32000
     backbone_max_symbols: int = 4800000
     backbone_lora_rank: int = 0
+    read_quality_state: bool = False
 
     def __post_init__(self):
+        if type(self.read_quality_state) is not bool or (self.read_quality_state and not self.backbone_layers):
+            raise ValueError("read_quality_state requires Transformer suffix adaptation")
         if type(self.backbone_layers) is not int or not 0 <= self.backbone_layers <= 4:
             raise ValueError("backbone_layers must be in [0, 4]")
         if self.backbone_layers and self.lora:
@@ -172,6 +175,9 @@ def adapter_container_bytes(adapter):
 
 def validate_head_adapter(metadata, d_model, base_sha256):
     """Validate bounded plain data before allocating model tensors; no pickle."""
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 9:
+        from .read_state import validate_read_state_adapter
+        return validate_read_state_adapter(metadata, d_model, base_sha256)
     if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 8:
         from .suffix_lora_adapter import validate_suffix_lora
         return validate_suffix_lora(metadata, d_model, base_sha256)
@@ -258,6 +264,9 @@ def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
 
 
 def apply_head_adapter(model, metadata, base_sha256):
+    if isinstance(metadata, dict) and metadata.get("version") == 9:
+        from .read_state import apply_read_state_adapter
+        return apply_read_state_adapter(model, metadata, base_sha256)
     if isinstance(metadata, dict) and metadata.get("version") == 8:
         from .suffix_lora_adapter import apply_suffix_lora
         return apply_suffix_lora(model, metadata, base_sha256)
@@ -272,6 +281,8 @@ def apply_head_adapter(model, metadata, base_sha256):
     original = model.output_head
     head = _restore_head(metadata, model.config.d_model, base_sha256,
                          device=original.weight.device, dtype=original.weight.dtype)
+    from .read_state import clear_conditioning
+    clear_conditioning(model)
     if hasattr(model, "_backbone_original_parameters"):
         from .backbone_adapter import restore_backbone
         restore_backbone(model)

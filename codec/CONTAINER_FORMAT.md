@@ -1,4 +1,12 @@
-# Direct-quality FASTQ container format, versions 1–3
+# Direct-quality FASTQ container format, versions 1–4
+
+Version 4 adds read quality states: an adapter v9, explicit `read_state`
+metadata, and a fifth packed two-bit `read_state` section after `quality_range`.
+It requires neural-only probabilities and preserves the original quality range
+protocol. See [READ_QUALITY_STATE.md](READ_QUALITY_STATE.md) for conditioning,
+packing, checks, and complete storage accounting. Versions 1–3 keep their
+existing four-section layout. The layout and legacy descriptions below apply
+to versions 1–3 unless stated otherwise.
 
 The direct-quality container reconstructs the decompressed FASTQ content byte
 for byte. It does not attempt to reproduce the original gzip member bytes. Encoding
@@ -12,7 +20,8 @@ budget and read-disjoint admission procedure. The base checkpoint stays external
 and hash-checked; fitted head bytes are embedded in metadata and counted in size.
 
 Current production encoding is neural-only: version 1 without an accepted head,
-version 3 with an accepted head and null `probability_profile`. All non-null
+version 3 with an accepted head, or version 4 with read quality states. Adapted
+neural containers use null `probability_profile`. All non-null
 expert profiles below describe historical containers whose decoding remains
 supported; they are no longer selectable by the production encoder.
 
@@ -27,6 +36,7 @@ header_gzip section
 base_gzip section
 plus_gzip section
 quality_range section
+read_state section (version 4 only)
 ```
 
 The fixed prefix is:
@@ -34,7 +44,7 @@ The fixed prefix is:
 | Offset | Bytes | Meaning |
 |---:|---:|---|
 | 0 | 8 | magic `FQDC0001` |
-| 8 | 2 | format version: 1 legacy, 2 prior, 3 transmitted head |
+| 8 | 2 | format version: 1 legacy, 2 prior, 3 transmitted head, 4 read states |
 | 10 | 2 | flags, currently 0 |
 | 12 | 4 | canonical JSON metadata length |
 | 16 | 4 | CRC32 of the JSON metadata bytes |
@@ -42,6 +52,7 @@ The fixed prefix is:
 Metadata is UTF-8 JSON serialized with sorted keys and no insignificant
 whitespace. Section offsets are relative to the first byte after metadata, so
 metadata length cannot recursively change its own offsets. The four sections
+(five for version 4)
 must be contiguous, ordered exactly as above, and consume the remainder of the
 file. Each section entry records its relative offset, compressed/stored byte
 length, logical uncompressed length, and CRC32. Truncation and trailing bytes

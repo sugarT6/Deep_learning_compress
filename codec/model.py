@@ -434,7 +434,14 @@ class DirectQualityTransformer(nn.Module):
         qualities: torch.Tensor,
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
+        read_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if hasattr(self, "read_state_conditioning"):
+            self._validate_read_states(read_states, bases.shape[0])
+            if read_states.device != bases.device:
+                raise ValueError("read states and bases must be on the same device")
+        elif read_states is not None:
+            raise ValueError("read states require a state-conditioned adapter")
         sequence_length = bases.shape[1]
         if sequence_length == 0:
             return self.output_head.weight.new_empty(
@@ -459,35 +466,46 @@ class DirectQualityTransformer(nn.Module):
                 message="Converting mask without torch.bool dtype to bool.*",
                 category=UserWarning,
             )
-            hidden = self.transformer(
-                hidden,
-                mask=self._attention_mask(sequence_length, bases.device),
-            )
+            mask = self._attention_mask(sequence_length, bases.device)
+            if hasattr(self, "read_state_conditioning"):
+                for index, layer in enumerate(self.transformer.layers):
+                    if index in self.read_state_conditioning.layers:
+                        hidden = self.read_state_conditioning(hidden, read_states, index)
+                    hidden = layer(hidden, src_mask=mask)
+                hidden = self.transformer.norm(hidden)
+            else:
+                hidden = self.transformer(hidden, mask=mask)
         return hidden
 
-    def _forward_impl(self, bases, qualities, lengths, active_mask):
-        hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask)
+    def _validate_read_states(self, read_states, batch_size):
+        if (not isinstance(read_states, torch.Tensor) or read_states.dtype != torch.long
+                or read_states.shape != (batch_size,)
+                or torch.any((read_states < 0) | (read_states > 3))):
+            raise ValueError("conditioned inference requires one read-state ID in [0, 3] per read")
+
+    def _forward_impl(self, bases, qualities, lengths, active_mask, read_states=None):
+        hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask, read_states)
                   if isinstance(self.output_head, CrossLayerOutputHead)
-                  else self._hidden_impl(bases, qualities, lengths, active_mask))
+                  else self._hidden_impl(bases, qualities, lengths, active_mask, read_states))
         logits = self.output_head(hidden)
         return logits * active_mask.unsqueeze(-1).to(logits.dtype)
 
-    def forward_features(self, bases, qualities, lengths, active_mask):
+    def forward_features(self, bases, qualities, lengths, active_mask, read_states=None):
         """Return causal output-head inputs, for frozen-feature adaptation only."""
         self._validate_common_inputs(bases, lengths, active_mask)
         if qualities.shape != bases.shape:
             raise ValueError("qualities must have the same shape as bases")
         _validate_target_values(qualities, active_mask, name="qualities")
-        return self._hidden_impl(bases, qualities, lengths, active_mask)
+        return self._hidden_impl(bases, qualities, lengths, active_mask, read_states)
 
-    def forward_cross_layer_features(self, bases, qualities, lengths, active_mask):
+    def forward_cross_layer_features(self, bases, qualities, lengths, active_mask, read_states=None):
         self._validate_common_inputs(bases, lengths, active_mask)
         if qualities.shape != bases.shape:
             raise ValueError("qualities must have the same shape as bases")
         _validate_target_values(qualities, active_mask, name="qualities")
-        return self._cross_hidden_impl(bases, qualities, lengths, active_mask)
+        return self._cross_hidden_impl(bases, qualities, lengths, active_mask, read_states)
 
-    def _cross_hidden_impl(self, bases, qualities, lengths, active_mask):
+    def _cross_hidden_impl(self, bases, qualities, lengths, active_mask, read_states=None):
         """Pack final features and per-position, affine-free LN of block 3.
 
         Capture the existing forward instead of rerunning the backbone. The
@@ -496,13 +514,13 @@ class DirectQualityTransformer(nn.Module):
         if self.config.num_layers < 4:
             raise ValueError("cross-layer adaptation requires at least 4 Transformer layers")
         if bases.shape[1] == 0:
-            return self._hidden_impl(bases, qualities, lengths, active_mask).repeat(1, 1, 2)
+            return self._hidden_impl(bases, qualities, lengths, active_mask, read_states).repeat(1, 1, 2)
         captured = []
         def capture(module, inputs, output):
             captured.append(output)
         handle = self.transformer.layers[2].register_forward_hook(capture)
         try:
-            final = self._hidden_impl(bases, qualities, lengths, active_mask)
+            final = self._hidden_impl(bases, qualities, lengths, active_mask, read_states)
         finally:
             handle.remove()
         middle = F.layer_norm(captured[0], (self.config.d_model,), weight=None, bias=None, eps=1e-5)
@@ -514,6 +532,7 @@ class DirectQualityTransformer(nn.Module):
         qualities: torch.Tensor,
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
+        read_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict all positions with teacher-forced, strictly causal history."""
 
@@ -521,7 +540,7 @@ class DirectQualityTransformer(nn.Module):
         if qualities.shape != bases.shape:
             raise ValueError("qualities must have the same shape as bases")
         _validate_target_values(qualities, active_mask, name="qualities")
-        return self._forward_impl(bases, qualities, lengths, active_mask)
+        return self._forward_impl(bases, qualities, lengths, active_mask, read_states)
 
     def forward_step(
         self,
@@ -529,6 +548,7 @@ class DirectQualityTransformer(nn.Module):
         quality_prefix: torch.Tensor,
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
+        read_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict one cycle from already-decoded quality history.
 
@@ -548,7 +568,7 @@ class DirectQualityTransformer(nn.Module):
         _validate_target_values(quality_prefix, prefix_mask, name="quality_prefix")
         qualities = torch.full_like(bases, QUALITY_PAD_ID)
         qualities[:, :cycle] = quality_prefix
-        logits = self._forward_impl(bases, qualities, lengths, active_mask)
+        logits = self._forward_impl(bases, qualities, lengths, active_mask, read_states)
         return logits[:, cycle, :]
 
     def forward(
@@ -557,5 +577,6 @@ class DirectQualityTransformer(nn.Module):
         qualities: torch.Tensor,
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
+        read_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.forward_full(bases, qualities, lengths, active_mask)
+        return self.forward_full(bases, qualities, lengths, active_mask, read_states)

@@ -207,6 +207,8 @@ def apply_suffix_lora(model, meta, digest):
     head.train(original.training)
     head.requires_grad_(original.weight.requires_grad)
     head.bias.requires_grad_(original.bias.requires_grad)
+    from .read_state import clear_conditioning
+    clear_conditioning(model)
     restore_backbone(model)
     if hasattr(model, "_lora_original_qkv"):
         with torch.no_grad():
