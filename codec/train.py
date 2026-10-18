@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -25,6 +26,9 @@ except ImportError:  # pragma: no cover - tqdm is optional
 
 from .checkpoint import load_training_checkpoint, save_training_checkpoint
 from .datasets import (
+    EXPANDED_FAMILY_WEIGHTS,
+    EXPANDED_TRAIN_DATASETS,
+    EXPANDED_UNSEEN_DATASETS,
     TRAIN_DATASETS,
     UNSEEN_DATASETS,
     DirectQualityDataset,
@@ -101,6 +105,7 @@ class BalancedTrainingSampler:
         batch_reads: int,
         seed: int,
         steps_per_epoch: int = 2000,
+        family_weights: Optional[Mapping[str, int]] = None,
     ) -> None:
         if not 0.0 < train_fraction < 1.0:
             raise ValueError("train_fraction must be between 0 and 1")
@@ -116,6 +121,13 @@ class BalancedTrainingSampler:
         grouped = datasets_by_family(datasets)
         if sum(len(members) for members in grouped.values()) != len(datasets):
             raise ValueError("training datasets have no recognized platform families")
+        if family_weights is not None:
+            if set(family_weights) != set(grouped) or any(
+                type(weight) is not int or weight <= 0
+                for weight in family_weights.values()
+            ):
+                raise ValueError("family weights must be positive integers for every training family")
+        self.family_weights = dict(family_weights) if family_weights is not None else None
         self.datasets = tuple(datasets)
         self.cache_dir = Path(cache_dir)
         self.train_fraction = float(train_fraction)
@@ -197,6 +209,32 @@ class BalancedTrainingSampler:
         return rng.permutation(blocks).tolist()
 
     def _next_epoch(self) -> None:
+        if self.family_weights is not None:
+            # A persistent integer-weight cycle fixes family exposure even when
+            # steps_per_epoch is not divisible by the sum of the weights.
+            cycle = [
+                family for family in self._families
+                for _ in range(self.family_weights[family])
+            ]
+            quotient, remainder = divmod(self.steps_per_epoch, len(cycle))
+            offset = (self._epoch * self.steps_per_epoch) % len(cycle)
+            extras = [cycle[(offset + i) % len(cycle)] for i in range(remainder)]
+            schedule = []
+            for family in self._families:
+                members = [
+                    i for i, dataset in enumerate(self.datasets)
+                    if dataset.platform_family == family
+                ]
+                slots = quotient * self.family_weights[family] + extras.count(family)
+                per_file, extra = divmod(slots, len(members))
+                cursor = self._family_counts[family] % len(members)
+                schedule.extend(members * per_file)
+                schedule.extend(members[(cursor + i) % len(members)] for i in range(extra))
+            self._rng.shuffle(schedule)
+            self._schedule = schedule
+            self._schedule_cursor = 0
+            self._epoch += 1
+            return
         count = len(self.datasets)
         quotient, remainder = divmod(self.steps_per_epoch, count)
         schedule = list(range(count)) * quotient
@@ -238,7 +276,7 @@ class BalancedTrainingSampler:
         )
 
     def config_dict(self) -> Dict[str, Any]:
-        return {
+        config = {
             "strategy": "strict_dataset_balanced_shuffled_blocks",
             "version": SAMPLER_VERSION,
             "batch_source": "one_training_cache_file",
@@ -254,6 +292,14 @@ class BalancedTrainingSampler:
                 for family, datasets in self._by_family.items()
             },
         }
+        if self.family_weights is not None:
+            config.update({
+                "strategy": "fixed_family_weights_equal_files_shuffled_blocks",
+                "version": 3,
+                "family_weights": dict(self.family_weights),
+                "remainder_policy": "persistent_family_cycle_and_within_family_rotation",
+            })
+        return config
 
     def state_dict(self) -> Dict[str, Any]:
         return copy.deepcopy({
@@ -364,6 +410,25 @@ class BalancedTrainingSampler:
             "unseen_used_for_checkpoint_selection": False,
         }
 
+    def corpus_statistics_dict(self) -> Dict[str, Any]:
+        entries = {}
+        for dataset in self.datasets:
+            reader = self.reader_for(dataset.accession)
+            stop = self.train_stop_for(dataset.accession)
+            entries[dataset.accession] = {
+                "train_reads": stop,
+                "validation_reads": reader.metadata.read_count - stop,
+                "train_quality_tokens": reader.count_symbols(0, stop),
+                "validation_quality_tokens": reader.count_symbols(stop, reader.metadata.read_count),
+            }
+        return {
+            "training_files": len(self.datasets),
+            **{key: sum(entry[key] for entry in entries.values()) for key in (
+                "train_reads", "validation_reads", "train_quality_tokens", "validation_quality_tokens",
+            )},
+            "datasets": entries,
+        }
+
 
 def evaluate_validation(
     model: DirectQualityTransformer,
@@ -415,12 +480,18 @@ def run_training(
     unseen_datasets: Sequence[DirectQualityDataset] = UNSEEN_DATASETS,
     progress: bool = True,
     resume: Optional[Path] = None,
+    init_from: Optional[Path] = None,
+    family_weights: Optional[Mapping[str, int]] = None,
     control_config: Optional[TrainingControlConfig] = None,
 ) -> Path:
     """Train and select checkpoints using only train-source validation reads."""
 
     if epochs <= 0 or steps_per_epoch <= 0:
         raise ValueError("epochs and steps_per_epoch must be positive")
+    if resume is not None and init_from is not None:
+        raise ValueError("resume and init_from are mutually exclusive")
+    if {d.accession for d in train_datasets} & {d.accession for d in unseen_datasets}:
+        raise ValueError("training and unseen datasets must not overlap")
     if validation_max_reads_per_file < 0:
         raise ValueError("validation_max_reads_per_file must be nonnegative")
     if (not all(math.isfinite(value) for value in (learning_rate, weight_decay, grad_clip))
@@ -447,6 +518,8 @@ def run_training(
     )
     best_validation_bits = float("inf")
     global_step = 0
+    training_quality_tokens = 0
+    training_tokens_by_dataset = {dataset.accession: 0 for dataset in train_datasets}
     best_path = output_dir / "best.pt"
     start_epoch = 1
     restored_control_state = None
@@ -459,6 +532,7 @@ def run_training(
         batch_reads=batch_reads,
         seed=seed,
         steps_per_epoch=steps_per_epoch,
+        family_weights=family_weights,
     ) as sampler:
         split_manifest = sampler.data_split_manifest(unseen_datasets)
         validation_counts = {}
@@ -496,6 +570,24 @@ def run_training(
             "seed": seed,
             "training_control": control_config.to_dict(),
         }
+        if init_from is not None:
+            # Loading constructs a temporary CPU model. Preserve RNG draws for
+            # this run's dropout, independently of how its weights were loaded.
+            with torch.random.fork_rng(devices=[]):
+                loaded = load_training_checkpoint(init_from)
+            if loaded.model.config != model_config:
+                raise ValueError("init-from model configuration does not match requested model")
+            model.load_state_dict(loaded.model.state_dict(), strict=True)
+            digest = hashlib.sha256()
+            with Path(init_from).open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            run_config["initialization"] = {
+                "method": "weights_only",
+                "checkpoint": str(Path(init_from).resolve()),
+                "sha256": digest.hexdigest(),
+                "source_global_step": loaded.payload.get("global_step"),
+            }
         if resume is not None:
             loaded = load_training_checkpoint(resume, device=device)
             payload = loaded.payload
@@ -503,6 +595,8 @@ def run_training(
             if not payload.get("sampler_state") or not saved_training:
                 raise ValueError("checkpoint lacks resumable training/sampler state")
             previous_config = saved_training["run_config"]
+            if "initialization" in previous_config:
+                run_config["initialization"] = copy.deepcopy(previous_config["initialization"])
             if saved_training.get("version") not in (1, 2):
                 raise ValueError("unsupported training state version")
             if _resume_contract(previous_config) != _resume_contract(run_config):
@@ -528,6 +622,10 @@ def run_training(
             model.load_state_dict(loaded.model.state_dict())
             optimizer.load_state_dict(payload["optimizer_state_dict"])
             global_step = payload["global_step"]
+            # Historical checkpoints did not count tokens; a partial count
+            # must not be presented as their cumulative training total.
+            training_quality_tokens = saved_training.get("training_quality_tokens")
+            training_tokens_by_dataset = saved_training.get("training_tokens_by_dataset")
             best_validation_bits = payload["best_validation_bits_per_quality"]
             # Preserve the prior best in the new, empty output directory.
             best_source = Path(resume).parent / "best.pt"
@@ -552,12 +650,23 @@ def run_training(
         if restored_control_state is not None:
             control.load_state_dict(restored_control_state)
         _write_json_atomic(output_dir / "run_config.json", run_config)
+        corpus = sampler.corpus_statistics_dict()
+        _write_json_atomic(output_dir / "training_corpus.json", corpus)
+        if progress:
+            print(
+                f"training_files={len(train_datasets)} train_reads={corpus['train_reads']} "
+                f"train_quality_tokens={corpus['train_quality_tokens']} "
+                f"sampler={sampler.config_dict()['strategy']} "
+                f"start_epoch={start_epoch} target_epoch={epochs}",
+                flush=True,
+            )
 
         for epoch in range(start_epoch, epochs + 1):
             model.train()
             epoch_learning_rate = optimizer.param_groups[0]["lr"]
             epoch_nats = 0.0
             epoch_symbols = 0
+            epoch_tokens_by_dataset = {dataset.accession: 0 for dataset in train_datasets}
             step_iter = range(1, steps_per_epoch + 1)
             if progress and tqdm is not None:
                 step_iter = tqdm(
@@ -583,6 +692,7 @@ def run_training(
                 symbols = int(tensors["active_mask"].sum().item())
                 epoch_nats += float(loss.item()) * symbols
                 epoch_symbols += symbols
+                epoch_tokens_by_dataset[sample.dataset.accession] += symbols
                 global_step += 1
                 if (
                     progress
@@ -606,11 +716,20 @@ def run_training(
                 raise ValueError("validation dataset macro must be finite")
             stopped_early = control.step(validation_bits)
             sampling_statistics = sampler.statistics_dict()
+            if training_quality_tokens is not None:
+                training_quality_tokens += epoch_symbols
+            if training_tokens_by_dataset is not None:
+                for accession, tokens in epoch_tokens_by_dataset.items():
+                    training_tokens_by_dataset[accession] += tokens
             train_loss = epoch_nats / epoch_symbols
             train_bits = train_loss / math.log(2.0)
             epoch_record = {
                 "epoch": epoch,
                 "global_step": global_step,
+                "epoch_training_quality_tokens": epoch_symbols,
+                "training_quality_tokens": training_quality_tokens,
+                "epoch_tokens_by_dataset": epoch_tokens_by_dataset,
+                "training_tokens_by_dataset": training_tokens_by_dataset,
                 "train_loss": train_loss,
                 "train_bits_per_quality": train_bits,
                 "validation": validation_summary,
@@ -641,6 +760,8 @@ def run_training(
                 "sampler_state": sampler.state_dict(),
                 "training_state": {
                     "version": 2,
+                    "training_quality_tokens": training_quality_tokens,
+                    "training_tokens_by_dataset": training_tokens_by_dataset,
                     "control_state": control.state_dict(),
                     "run_config": run_config,
                     "python_rng": random.getstate(),
@@ -674,6 +795,9 @@ def run_training(
         _write_json_atomic(output_dir / "training_summary.json", {
             "start_epoch": start_epoch, "completed_epoch": epoch,
             "requested_epochs": epochs, "global_step": global_step,
+            "training_quality_tokens": training_quality_tokens,
+            "training_tokens_by_dataset": training_tokens_by_dataset,
+            "training_corpus_quality_tokens": corpus["train_quality_tokens"],
             "stopped_early": stopped_early,
             "best_validation_bits_per_quality": best_validation_bits,
             "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
@@ -685,18 +809,27 @@ def run_training(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train the 42-class direct-quality model from the fixed ten training "
-            "caches. Unseen datasets are never used for checkpoint selection."
+            "Train the 42-class direct-quality model from an explicit cache split. "
+            "Unseen datasets are never used for checkpoint selection."
         )
     )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--training-set", choices=("original10", "expanded20"), default="original10",
+        help="expanded20 adds ten audited human sources with family weights 3:5:1:1",
+    )
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--steps-per-epoch", type=int, default=2000)
     parser.add_argument("--batch-reads", type=int, default=256)
-    parser.add_argument(
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument(
         "--resume", type=Path,
         help="epoch checkpoint; use a NEW empty output dir; epochs is total target",
+    )
+    initialization.add_argument(
+        "--init-from", type=Path,
+        help="initialize weights only; reset optimizer, sampler, controls and step count for a new data split",
     )
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--validation-max-reads-per-file", type=int, default=5000)
@@ -752,6 +885,10 @@ def main() -> int:
             seed=args.seed,
             progress=not args.no_progress,
             resume=args.resume,
+            init_from=args.init_from,
+            train_datasets=EXPANDED_TRAIN_DATASETS if args.training_set == "expanded20" else TRAIN_DATASETS,
+            unseen_datasets=EXPANDED_UNSEEN_DATASETS if args.training_set == "expanded20" else UNSEEN_DATASETS,
+            family_weights=EXPANDED_FAMILY_WEIGHTS if args.training_set == "expanded20" else None,
             control_config=TrainingControlConfig(
                 lr_scheduler=args.lr_scheduler, lr_factor=args.lr_factor,
                 lr_patience=args.lr_patience, min_lr=args.min_lr,

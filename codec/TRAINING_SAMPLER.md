@@ -4,6 +4,12 @@ The training CLI defaults to `--batch-reads 256`, accepting 1 through 256.
 Batch size is an optimization/data-loading setting, not a model architecture
 parameter. The fixed ten training files and nine unseen files are unchanged.
 
+An explicit `--training-set expanded20` option now supports the audited human
+expansion with fixed family weights and equal files within each family.
+The default remains `original10`; historical commands and exact resumes keep
+their existing behavior. See [expanded training commands](TRAINING_EXPANDED20.md)
+for the new split, token accounting, and optional weights-only initialization.
+
 ## Scheduling and file blocks
 
 Sampler strategy `strict_dataset_balanced_shuffled_blocks`, version 2:

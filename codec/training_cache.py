@@ -498,6 +498,14 @@ class TrainingCacheReader:
             raise RuntimeError("training cache reader is closed")
         return self._handle
 
+    def count_symbols(self, start: int, stop: int) -> int:
+        """Count quality tokens in a read range without loading its records."""
+
+        if not 0 <= start <= stop <= self.metadata.read_count:
+            raise IndexError("invalid cache read range")
+        offsets = self._require_open()["read_offsets"]
+        return int(offsets[stop]) - int(offsets[start])
+
     def read_indices(self, read_indices: Sequence[int]) -> FastqBatch:
         """Read up to 256 reads by zero-based index in the requested order."""
 

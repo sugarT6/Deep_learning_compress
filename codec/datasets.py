@@ -1,8 +1,8 @@
-"""Fixed 19-dataset split for the first direct-quality experiment."""
+"""Explicit original and expanded direct-quality experiment splits."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
@@ -50,6 +50,37 @@ UNSEEN_DATASETS = tuple(dataset for dataset in DATASETS if not dataset.training_
 UNSEEN_INSTRUMENT_DATASETS = tuple(
     dataset for dataset in UNSEEN_DATASETS if dataset.unseen_instrument
 )
+
+# Audited human sources selected on 2026-10-19. Never infer training sources
+# by globbing the cache directory: it may also contain evaluation caches.
+ADDITIONAL_TRAIN_DATASETS = (
+    DirectQualityDataset("ERR15766980", "MGI/BGI", True),
+    DirectQualityDataset("ERR15801889", "MGI/BGI", True),
+    DirectQualityDataset("SRR13142212", "MGI/BGI", True),
+    DirectQualityDataset("SRR33170689", "MGI/BGI", True),
+    DirectQualityDataset("ERR12916630", "Illumina", True),
+    DirectQualityDataset("ERR15158516", "Illumina", True),
+    DirectQualityDataset("ERR11454184", "Illumina", True),
+    DirectQualityDataset("ERR3989434", "Illumina", True),
+    DirectQualityDataset("DRR917081", "Illumina", True),
+    DirectQualityDataset("SRR29727531", "Illumina", True),
+)
+EXPANDED_TRAIN_DATASETS = TRAIN_DATASETS + ADDITIONAL_TRAIN_DATASETS
+NEW_EXTERNAL_HOLDOUT_DATASETS = (
+    DirectQualityDataset("SRR30917699", "MGI/BGI", False),
+    DirectQualityDataset("SRR32083931", "MGI/BGI", False),
+    DirectQualityDataset("SRR29436245", "Illumina", False),
+    DirectQualityDataset("ERR16748054", "Illumina", False),
+    DirectQualityDataset("SRR36237671", "Illumina", False),
+)
+# NovaSeq 6000 and NovaSeq X Plus are represented in the expanded training
+# pool. Preserve the original split/flags for historical runs.
+EXPANDED_UNSEEN_DATASETS = tuple(
+    replace(dataset, unseen_instrument=False) for dataset in UNSEEN_DATASETS
+) + NEW_EXTERNAL_HOLDOUT_DATASETS
+EXPANDED_FAMILY_WEIGHTS = {
+    "MGI/BGI": 3, "Illumina": 5, "ABI SOLiD": 1, "Ion Torrent": 1,
+}
 PLATFORM_FAMILIES = ("MGI/BGI", "Illumina", "ABI SOLiD", "Ion Torrent")
 
 
