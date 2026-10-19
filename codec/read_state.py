@@ -1,7 +1,7 @@
-"""Transmitted four-class read means and state-conditioned Transformer blocks.
+"""Transmitted read-mean labels and state-conditioned Transformer blocks.
 
 Only the encoder computes a state from a complete quality string. The decoder
-reads the two-bit labels before predicting Q; it never infers future qualities.
+reads the one- or two-bit labels before predicting Q; it never infers future qualities.
 """
 
 import base64
@@ -15,13 +15,24 @@ from torch import nn
 
 STATE_PROTOCOL = "mean_milli_four_class_film_suffix_v1"
 LABEL_PROTOCOL = "packed_2bit_msb_first_v1"
+TWO_STATE_PROTOCOL = "mean_milli_two_class_film_suffix_v1"
+TWO_LABEL_PROTOCOL = "packed_1bit_msb_first_v1"
 
 
-def validate_thresholds(thresholds):
-    if (not isinstance(thresholds, list) or len(thresholds) != 3
+def bits_per_label(class_count):
+    if type(class_count) is not int or class_count not in (2, 4):
+        raise ValueError("read-state class_count must be 2 or 4")
+    return 1 if class_count == 2 else 2
+
+
+def validate_thresholds(thresholds, class_count=None):
+    if class_count is None:
+        class_count = len(thresholds) + 1 if isinstance(thresholds, list) else 0
+    bits_per_label(class_count)
+    if (not isinstance(thresholds, list) or len(thresholds) != class_count - 1
             or any(type(v) is not int or not 0 <= v <= 41000 for v in thresholds)
             or thresholds != sorted(thresholds)):
-        raise ValueError("read-state thresholds must be three sorted integer milli-Q values")
+        raise ValueError("read-state thresholds must match class_count and contain sorted integer milli-Q values")
 
 
 def mean_milli(qualities, lengths):
@@ -32,14 +43,16 @@ def mean_milli(qualities, lengths):
     return np.where(active, q, 0).sum(axis=1) * 1000 // np.maximum(n, 1)
 
 
-def fit_thresholds(records):
+def fit_thresholds(records, class_count=4):
+    bits_per_label(class_count)
     means = sorted(sum(v - 33 for v in r.quality) * 1000 // len(r.quality)
                    for r in records if r.quality)
     if not means:
         raise ValueError("read-state fitting needs nonempty training reads")
-    # Nearest-rank quartiles use only the adaptation training split. Repeated
+    # Nearest-rank quantiles use only the adaptation training split. Repeated
     # thresholds are valid for constant/small-alphabet files; classes may be empty.
-    return [means[(len(means) * k + 3) // 4 - 1] for k in (1, 2, 3)]
+    return [means[(len(means) * k + class_count - 1) // class_count - 1]
+            for k in range(1, class_count)]
 
 
 def classify_reads(qualities, lengths, thresholds):
@@ -56,8 +69,9 @@ class ReadStateConditioning(nn.Module):
         validate_thresholds(thresholds)
         self.layers = tuple(layers)
         self.thresholds = list(thresholds)
-        self.scale = nn.Parameter(torch.zeros(len(layers), 4, dim))
-        self.shift = nn.Parameter(torch.zeros(len(layers), 4, dim))
+        self.class_count = len(thresholds) + 1
+        self.scale = nn.Parameter(torch.zeros(len(layers), self.class_count, dim))
+        self.shift = nn.Parameter(torch.zeros(len(layers), self.class_count, dim))
 
     def forward(self, hidden, states, layer_index):
         index = self.layers.index(layer_index)
@@ -90,10 +104,11 @@ def serialize_read_state(model, backbone, digest):
                    for p in (state.scale, state.shift))
     meta = dict(format=ADAPTER_FORMAT, version=9,
                 application="replace_suffix_and_read_state_conditioning",
-                protocol=STATE_PROTOCOL, base_checkpoint_sha256=digest,
+                protocol=(TWO_STATE_PROTOCOL if state.class_count == 2 else STATE_PROTOCOL),
+                base_checkpoint_sha256=digest,
                 backbone=backbone, num_layers=model.config.num_layers,
                 feedforward_dim=model.config.feedforward_dim, layers=list(state.layers),
-                thresholds_milli=state.thresholds, class_count=4,
+                thresholds_milli=state.thresholds, class_count=state.class_count,
                 dtype="little_endian_float32", layout="scale_then_shift_layer_state_hidden",
                 raw_bytes=len(raw), parameter_bytes=backbone["parameter_bytes"] + len(raw),
                 sha256=hashlib.sha256(raw).hexdigest(),
@@ -110,8 +125,9 @@ def validate_read_state_adapter(meta, dim, digest):
     if (not isinstance(meta, dict) or set(meta) != keys or meta["format"] != ADAPTER_FORMAT
             or type(meta["version"]) is not int or meta["version"] != 9
             or meta["application"] != "replace_suffix_and_read_state_conditioning"
-            or meta["protocol"] != STATE_PROTOCOL or meta["base_checkpoint_sha256"] != digest
-            or type(meta["class_count"]) is not int or meta["class_count"] != 4
+            or meta["base_checkpoint_sha256"] != digest
+            or type(meta["class_count"]) is not int or meta["class_count"] not in (2, 4)
+            or meta["protocol"] != (TWO_STATE_PROTOCOL if meta["class_count"] == 2 else STATE_PROTOCOL)
             or meta["dtype"] != "little_endian_float32"
             or meta["layout"] != "scale_then_shift_layer_state_hidden"):
         raise ValueError("invalid read-state adapter protocol")
@@ -123,8 +139,8 @@ def validate_read_state_adapter(meta, dim, digest):
     for field in ("num_layers", "feedforward_dim", "layers"):
         if json.dumps(meta[field]) != json.dumps(nested[field]):
             raise ValueError("read-state and backbone architecture mismatch")
-    validate_thresholds(meta["thresholds_milli"])
-    size = len(meta["layers"]) * 4 * dim * 2 * 4
+    validate_thresholds(meta["thresholds_milli"], meta["class_count"])
+    size = len(meta["layers"]) * meta["class_count"] * dim * 2 * 4
     encoded = meta["data_base64"]
     if (type(meta["raw_bytes"]) is not int or meta["raw_bytes"] != size
             or type(meta["parameter_bytes"]) is not int
@@ -166,39 +182,50 @@ def apply_read_state_adapter(model, meta, digest):
 
 
 class StateWriter:
-    """Continuous two-bit packing across batches, with zero low-bit padding."""
+    """Continuous fixed-width packing across batches, with zero low-bit padding."""
 
-    def __init__(self, handle):
+    def __init__(self, handle, class_count=4):
+        self.label_bits = bits_per_label(class_count)
+        self.class_count = class_count
         self.handle, self.count, self.pending, self.bits = handle, 0, 0, 0
-        self.class_counts = np.zeros(4, dtype=np.int64)
+        self.class_counts = np.zeros(class_count, dtype=np.int64)
+        self.finished = False
 
     def write(self, states):
+        if self.finished:
+            raise ValueError("cannot write a finished read-state stream")
         states = np.asarray(states)
-        if states.ndim != 1 or states.dtype.kind not in "iu" or np.any((states < 0) | (states > 3)):
+        if (states.ndim != 1 or states.dtype.kind not in "iu"
+                or np.any((states < 0) | (states >= self.class_count))):
             raise ValueError("invalid read-state labels")
         out = bytearray()
         for state in states:
-            self.pending = (self.pending << 2) | int(state)
-            self.bits += 2
+            self.pending = (self.pending << self.label_bits) | int(state)
+            self.bits += self.label_bits
             if self.bits == 8:
                 out.append(self.pending)
                 self.pending = self.bits = 0
         self.handle.write(out)
         self.count += len(states)
-        self.class_counts += np.bincount(states.astype(np.int64), minlength=4)
+        self.class_counts += np.bincount(states.astype(np.int64), minlength=self.class_count)
 
     def finish(self):
         if self.bits:
             self.handle.write(bytes([self.pending << (8 - self.bits)]))
             self.pending = self.bits = 0
+        self.finished = True
 
 
 class StateReader:
-    def __init__(self, handle, count):
+    def __init__(self, handle, count, class_count=4):
+        self.label_bits = bits_per_label(class_count)
+        self.mask = class_count - 1
+        if type(count) is not int or count < 0:
+            raise ValueError("read-state label count must be a nonnegative integer")
         self.handle, self.remaining, self.pending, self.bits = handle, count, 0, 0
 
     def read(self, count):
-        if count > self.remaining or count < 0:
+        if type(count) is not int or count > self.remaining or count < 0:
             raise ValueError("read-state label count mismatch")
         out = np.empty(count, dtype=np.int64)
         for i in range(count):
@@ -207,8 +234,8 @@ class StateReader:
                 if not value:
                     raise ValueError("truncated read-state stream")
                 self.pending, self.bits = value[0], 8
-            self.bits -= 2
-            out[i] = (self.pending >> self.bits) & 3
+            self.bits -= self.label_bits
+            out[i] = (self.pending >> self.bits) & self.mask
         self.remaining -= count
         return out
 
@@ -218,8 +245,16 @@ class StateReader:
 
 
 def label_metadata(adapter, read_count):
-    return dict(version=1, protocol=LABEL_PROTOCOL, class_count=4, bits_per_read=2,
-                label_count=read_count, valid_bits=2 * read_count,
+    class_count = adapter["class_count"]
+    label_bits = bits_per_label(class_count)
+    validate_thresholds(adapter["thresholds_milli"], class_count)
+    if adapter.get("protocol") != (TWO_STATE_PROTOCOL if class_count == 2 else STATE_PROTOCOL):
+        raise ValueError("read-state adapter protocol and class_count mismatch")
+    if type(read_count) is not int or read_count < 0:
+        raise ValueError("read-state label count must be a nonnegative integer")
+    return dict(version=1, protocol=(TWO_LABEL_PROTOCOL if class_count == 2 else LABEL_PROTOCOL),
+                class_count=class_count, bits_per_read=label_bits,
+                label_count=read_count, valid_bits=label_bits * read_count,
                 thresholds_milli=adapter["thresholds_milli"], empty_read_state=0)
 
 

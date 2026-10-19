@@ -403,7 +403,8 @@ def _decode_to_handle(
     online_prior = make_prior_state(online_prior_config)
 
     with ExitStack() as stack:
-        state_reader = (StateReader(stack.enter_context(container_info.open_section("read_state")), read_count)
+        state_reader = (StateReader(stack.enter_context(container_info.open_section("read_state")), read_count,
+                                   class_count=metadata["read_state"]["class_count"])
                         if metadata["format_version"] == READ_STATE_CONTAINER_VERSION else None)
         header_compressed = stack.enter_context(
             container_info.open_section("header_gzip")

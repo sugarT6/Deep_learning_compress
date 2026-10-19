@@ -59,10 +59,15 @@ class HeadAdaptationConfig:
     backbone_max_symbols: int = 4800000
     backbone_lora_rank: int = 0
     read_quality_state: bool = False
+    read_state_classes: int = 4
 
     def __post_init__(self):
         if type(self.read_quality_state) is not bool or (self.read_quality_state and not self.backbone_layers):
             raise ValueError("read_quality_state requires Transformer suffix adaptation")
+        if type(self.read_state_classes) is not int or self.read_state_classes not in (2, 4):
+            raise ValueError("read_state_classes must be 2 or 4")
+        if self.read_state_classes != 4 and not self.read_quality_state:
+            raise ValueError("read_state_classes requires read_quality_state")
         if type(self.backbone_layers) is not int or not 0 <= self.backbone_layers <= 4:
             raise ValueError("backbone_layers must be in [0, 4]")
         if self.backbone_layers and self.lora:

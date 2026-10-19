@@ -478,10 +478,11 @@ class DirectQualityTransformer(nn.Module):
         return hidden
 
     def _validate_read_states(self, read_states, batch_size):
+        class_count = self.read_state_conditioning.class_count
         if (not isinstance(read_states, torch.Tensor) or read_states.dtype != torch.long
                 or read_states.shape != (batch_size,)
-                or torch.any((read_states < 0) | (read_states > 3))):
-            raise ValueError("conditioned inference requires one read-state ID in [0, 3] per read")
+                or torch.any((read_states < 0) | (read_states >= class_count))):
+            raise ValueError(f"conditioned inference requires one read-state ID in [0, {class_count - 1}] per read")
 
     def _forward_impl(self, bases, qualities, lengths, active_mask, read_states=None):
         hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask, read_states)

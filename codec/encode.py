@@ -416,7 +416,8 @@ def _encode_fastq_compat(
             ) as base_writer, SideStreamWriter(
                 plus_path, "plus", compresslevel=GZIP_COMPRESSLEVEL
             ) as plus_writer, state_path.open("wb") as state_handle:
-                state_writer = StateWriter(state_handle) if state_enabled else None
+                state_writer = (StateWriter(state_handle,
+                    class_count=model.read_state_conditioning.class_count) if state_enabled else None)
                 batch_iterator = iter_fastq_batches(
                     input_path, batch_reads=batch_reads
                 )
@@ -752,7 +753,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--finetune-last-layers", type=int, default=0,
                         help="jointly fit this many final Transformer layers, final norm, and head (1..4)")
     parser.add_argument("--read-quality-state", action="store_true",
-                        help="transmit four-class read mean labels and condition each fitted Transformer block; requires --finetune-last-layers")
+                        help="transmit read mean labels and condition each fitted Transformer block; requires --finetune-last-layers")
+    parser.add_argument("--read-state-classes", type=int, choices=(2, 4), default=4,
+                        help="2: median/1 bit per read; 4: quartiles/2 bits per read (default); requires --read-quality-state")
     parser.add_argument("--backbone-steps", type=int, default=5000)
     parser.add_argument("--backbone-batch-reads", type=int, default=16)
     parser.add_argument("--backbone-learning-rate", type=float, default=0.0001)
@@ -774,6 +777,8 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         head_config = None
+        if args.read_state_classes != 4 and not args.read_quality_state:
+            raise ValueError("--read-state-classes requires --read-quality-state")
         if not args.head_lora and (args.head_lora_rank != 4 or args.head_lora_steps != 1000 or args.head_lora_learning_rate != 0.0003):
             raise ValueError("--head-lora-* requires --head-lora")
         if args.head_cross_dim != 16 and not args.head_cross_layer:
@@ -801,13 +806,14 @@ def main() -> int:
                 backbone_learning_rate=args.backbone_learning_rate,
                 backbone_eval_every=args.backbone_eval_every, backbone_patience=args.backbone_patience,
                 backbone_max_reads=args.backbone_max_reads, backbone_max_symbols=args.backbone_max_symbols,
-                backbone_lora_rank=args.backbone_lora_rank, read_quality_state=args.read_quality_state)
+                backbone_lora_rank=args.backbone_lora_rank, read_quality_state=args.read_quality_state,
+                read_state_classes=args.read_state_classes)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
             "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",
             "head_type", "head_residual_dim", "head_cross_layer", "head_cross_dim",
             "head_lora", "head_lora_rank", "head_lora_steps", "head_lora_learning_rate",
-            "finetune_last_layers", "read_quality_state", *backbone_options)):
+            "finetune_last_layers", "read_quality_state", "read_state_classes", *backbone_options)):
             raise ValueError("adaptation training options require --finetune-head")
         statistics = encode_fastq(
             args.input,

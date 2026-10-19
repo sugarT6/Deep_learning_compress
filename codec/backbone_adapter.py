@@ -25,7 +25,10 @@ from .model import fastq_batch_to_tensors
 from .probability_quantization import logits_to_cdfs
 from .encode_fastpath import selected_quantized_bits
 from .training_control import TrainingControl, TrainingControlConfig
-from .read_state import ReadStateConditioning, clear_conditioning, conditioned_tensors, fit_thresholds, serialize_read_state
+from .read_state import (
+    ReadStateConditioning, bits_per_label, clear_conditioning, conditioned_tensors,
+    fit_thresholds, serialize_read_state,
+)
 
 
 PROTOCOL = "transformer_suffix_and_final_norm_xor32_byteplanes_zlib_v1"
@@ -278,7 +281,8 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     deadline = started + config.max_seconds if config.max_seconds else float("inf")
     warm, warm_report = adapt_output_head(model, source, device=device, batch_reads=batch_reads,
         total=total, base_sha256=base_sha256,
-        config=replace(config, backbone_layers=0, backbone_lora_rank=0, read_quality_state=False))
+        config=replace(config, backbone_layers=0, backbone_lora_rank=0,
+                       read_quality_state=False, read_state_classes=4))
     report = dict(warm_report)
     # Candidate sizes below refer to the joint stage, not the warm-up candidate.
     report.pop("candidate_parameter_bytes", None)
@@ -329,14 +333,18 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
             candidate.output_head.bias.copy_(old_head.bias)
     first = model.config.num_layers - config.backbone_layers
     if config.read_quality_state:
-        thresholds = fit_thresholds(train)
+        thresholds = fit_thresholds(train, class_count=config.read_state_classes)
         candidate.read_state_conditioning = ReadStateConditioning(
             model.config.d_model, list(range(first, model.config.num_layers)), thresholds).to(
                 device=device, dtype=candidate.output_head.weight.dtype)
-        report.update(read_state_thresholds_milli=thresholds,
+        report.update(read_state_class_count=config.read_state_classes,
+                      read_state_bits_per_read=bits_per_label(config.read_state_classes),
+                      read_state_thresholds_milli=thresholds,
                       read_state_threshold_fit="adaptation_training_reads_only",
+                      read_state_threshold_rule=("nearest_rank_median" if config.read_state_classes == 2
+                                                 else "nearest_rank_quartiles"),
                       read_state_trainable_parameters=sum(p.numel() for p in candidate.read_state_conditioning.parameters()))
-        print(f"Read quality state: four classes; mean milli-Q thresholds={thresholds}; "
+        print(f"Read quality state: {config.read_state_classes} classes; mean milli-Q thresholds={thresholds}; "
               f"conditioning Transformer layers {first + 1}..{model.config.num_layers}", file=sys.stderr)
     if config.backbone_lora_rank:
         from .suffix_lora_adapter import install_suffix_lora
@@ -445,7 +453,8 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     cost = adapter_container_bytes(adapter) - adapter_container_bytes(warm)
     # These labels are transmitted for all reads, including warm-up and empty
     # reads. The final encode report also includes their exact JSON framing.
-    label_cost = (sample["total_file_reads"] + 3) // 4 if config.read_quality_state else 0
+    label_bits = bits_per_label(config.read_state_classes)
+    label_cost = (sample["total_file_reads"] * label_bits + 7) // 8 if config.read_quality_state else 0
     report.update(estimated_quality_saving_bytes=saving, incremental_adapter_bytes=cost,
                   estimated_read_state_stream_bytes=label_cost,
                   estimated_net_saving_bytes=saving - cost - label_cost)

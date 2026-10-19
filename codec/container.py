@@ -498,7 +498,7 @@ def read_container(path: Path, *, verify_checksums: bool = True) -> ContainerInf
     _validate_metadata(metadata, physical_version=version)
     sections = _parse_section_infos(metadata.get("sections"), version)
     if version == READ_STATE_CONTAINER_VERSION:
-        expected_state_bytes = (metadata["read_count"] + 3) // 4
+        expected_state_bytes = (metadata["read_count"] * metadata["read_state"]["bits_per_read"] + 7) // 8
         if sections[-1].length != expected_state_bytes or sections[-1].uncompressed_length != expected_state_bytes:
             raise ContainerError("read-state stream length does not match read count")
     header_bytes = _PREFIX.size + metadata_length

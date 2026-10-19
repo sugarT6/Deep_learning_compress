@@ -1,7 +1,11 @@
 # Direct-quality FASTQ container format, versions 1–4
 
 Version 4 adds read quality states: an adapter v9, explicit `read_state`
-metadata, and a fifth packed two-bit `read_state` section after `quality_range`.
+metadata, and a fifth packed `read_state` section after `quality_range`:
+one bit per read for two classes, or two bits for four classes. The class count,
+bit width and protocol must agree with adapter v9. The two-class extension uses
+new protocol identifiers; existing four-class files retain their original wire
+representation and remain readable.
 It requires neural-only probabilities and preserves the original quality range
 protocol. See [READ_QUALITY_STATE.md](READ_QUALITY_STATE.md) for conditioning,
 packing, checks, and complete storage accounting. Versions 1–3 keep their
