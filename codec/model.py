@@ -35,6 +35,7 @@ QMER_BOS_BUCKET = QMER_BUCKET_COUNT
 QMER_BASE = QMER_BUCKET_COUNT + 1
 QMER_VOCAB_SIZE = QMER_BASE ** max(QMER_KS)
 POSITION_FEATURE_DIM = 3
+QUALITY_PREFIX_FEATURE_DIM = 4
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,9 @@ class DirectQualityModelConfig:
     feedforward_dim: int = 512
     context_length: int = 256
     dropout: float = 0.1
+    base_encoder_type: str = "local_cnn"
+    ffn_type: str = "gelu"
+    quality_prefix_features: bool = False
 
     def __post_init__(self) -> None:
         if self.architecture != MODEL_ARCHITECTURE:
@@ -91,9 +95,25 @@ class DirectQualityModelConfig:
             raise ValueError("context_length must be positive")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
+        if self.base_encoder_type not in ("local_cnn", "dilated_cnn"):
+            raise ValueError("base_encoder_type must be local_cnn or dilated_cnn")
+        if self.ffn_type not in ("gelu", "swiglu"):
+            raise ValueError("ffn_type must be gelu or swiglu")
+        if not isinstance(self.quality_prefix_features, bool):
+            raise ValueError("quality_prefix_features must be bool")
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        # Keep the serialized legacy configuration identical. Checkpoint and
+        # strict-resume contracts from before these opt-in variants stay valid.
+        for name, default in (
+            ("base_encoder_type", "local_cnn"),
+            ("ffn_type", "gelu"),
+            ("quality_prefix_features", False),
+        ):
+            if values[name] == default:
+                values.pop(name)
+        return values
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "DirectQualityModelConfig":
@@ -104,10 +124,10 @@ class DirectQualityModelConfig:
         return cls(**normalized)
 
 
-def feature_schema() -> Dict[str, Any]:
+def feature_schema(config: Optional[DirectQualityModelConfig] = None) -> Dict[str, Any]:
     """Return the exact decoder-available feature contract saved in checkpoints."""
 
-    return {
+    schema = {
         "version": FEATURE_SCHEMA_VERSION,
         "prediction_target": "quality_id",
         "quality_classes": list(range(QUALITY_ALPHABET_SIZE)),
@@ -140,6 +160,19 @@ def feature_schema() -> Dict[str, Any]:
             "accession_id",
         ],
     }
+    if config is not None and config.quality_prefix_features:
+        schema["version"] = FEATURE_SCHEMA_VERSION + 1
+        schema["features"]["causal_quality_prefix"] = {
+            "values": ["mean", "variance", "low_quality_fraction", "low_quality_run_length"],
+            "history": "qualities_before_prediction_position_only",
+            "empty_prefix": "all_zero",
+            "variance": "population",
+            "low_quality_threshold_exclusive": 20,
+            "quality_scale": QUALITY_ALPHABET_SIZE - 1,
+            "run_length_scale": config.position_length_scale,
+            "side_information_bytes": 0,
+        }
+    return schema
 
 
 def fastq_batch_to_tensors(
@@ -211,6 +244,62 @@ def build_quality_history_tokens(
             code = code * QMER_BASE + history
         qmer_tokens.append(code)
     return prev_q, tuple(qmer_tokens)
+
+
+def build_quality_prefix_features(
+    qualities: torch.Tensor,
+    active_mask: torch.Tensor,
+    position_length_scale: float = 512.0,
+) -> torch.Tensor:
+    """Four decoder-reconstructible statistics of Q[:t], never Q[t:].
+
+    Mean and population variance are scaled by Q41 and Q41 squared. The
+    consecutive-low-Q length is scaled like the absolute cycle feature.
+    Padded positions and the empty prefix are exactly zero.
+    """
+    if qualities.ndim != 2 or active_mask.shape != qualities.shape:
+        raise ValueError("prefix qualities and active_mask must have shape [batch, sequence]")
+    if active_mask.dtype != torch.bool:
+        raise ValueError("prefix active_mask must be bool")
+    if position_length_scale <= 0:
+        raise ValueError("position_length_scale must be positive")
+    batch_size, sequence_length = qualities.shape
+    if sequence_length == 0:
+        return torch.zeros(
+            (batch_size, 0, QUALITY_PREFIX_FEATURE_DIM),
+            dtype=torch.float32,
+            device=qualities.device,
+        )
+    mask = active_mask.to(torch.float32)
+    values = qualities.to(torch.float32) * mask
+    zeros = values.new_zeros((batch_size, 1))
+
+    def exclusive_cumsum(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.cat((zeros, tensor.cumsum(dim=1)[:, :-1]), dim=1)
+
+    counts = exclusive_cumsum(mask).clamp_min(1.0)
+    mean = exclusive_cumsum(values) / counts
+    variance = (exclusive_cumsum(values.square()) / counts - mean.square()).clamp_min(0.0)
+    low = qualities.lt(20) & active_mask
+    low_fraction = exclusive_cumsum(low.to(torch.float32)) / counts
+
+    # At each position, record the last non-low cycle. cummax reconstructs a
+    # run without a Python loop, and shifting excludes the current target Q.
+    cycles = torch.arange(1, sequence_length + 1, device=qualities.device).unsqueeze(0)
+    reset_cycles = torch.where(low, torch.zeros_like(cycles), cycles)
+    run_including_current = cycles - reset_cycles.cummax(dim=1).values
+    previous_run = torch.cat((zeros, run_including_current[:, :-1].to(torch.float32)), dim=1)
+    quality_scale = float(QUALITY_ALPHABET_SIZE - 1)
+    features = torch.stack(
+        (
+            mean / quality_scale,
+            variance / (quality_scale * quality_scale),
+            low_fraction,
+            previous_run / position_length_scale,
+        ),
+        dim=-1,
+    )
+    return features * mask.unsqueeze(-1)
 
 
 def masked_cross_entropy(
@@ -288,6 +377,77 @@ class BaseContextEncoder(nn.Module):
         return context * active_mask.unsqueeze(-1).to(context.dtype)
 
 
+class DilatedBaseResidualBlock(nn.Module):
+    """Position-wise normalization and a masked, bidirectional convolution."""
+
+    def __init__(self, channels: int, dilation: int, dropout: float) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+        self.convolution = nn.Conv1d(
+            channels, channels, kernel_size=3, dilation=dilation, padding=dilation
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # LN has an affine bias. Mask before convolution as well as after the
+        # residual, so artificial padding never reenters active positions.
+        branch = self.norm(hidden) * mask
+        branch = self.convolution(branch.transpose(1, 2)).transpose(1, 2)
+        branch = self.dropout(F.gelu(branch))
+        return (hidden + branch) * mask
+
+
+class DilatedBaseContextEncoder(nn.Module):
+    """Encode known bases with a 255-cycle bidirectional receptive field.
+
+    The quality Transformer remains strictly causal; future *bases* are
+    available at decode time and may be used by this independent encoder.
+    """
+
+    def __init__(self, config: DirectQualityModelConfig) -> None:
+        super().__init__()
+        self.context_dim = config.base_context_dim
+        self.embedding = nn.Embedding(
+            BASE_ALPHABET_SIZE, config.base_embed_dim, padding_idx=BASE_PAD_ID
+        )
+        self.projection = nn.Linear(config.base_embed_dim, config.base_context_dim)
+        self.blocks = nn.ModuleList(
+            DilatedBaseResidualBlock(config.base_context_dim, dilation, config.dropout)
+            for dilation in (1, 2, 4, 8, 16, 32, 64)
+        )
+        self.norm = nn.LayerNorm(config.base_context_dim)
+
+    def forward(self, bases: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
+        if bases.shape[1] == 0:
+            return self.projection.weight.new_zeros((bases.shape[0], 0, self.context_dim))
+        mask = active_mask.unsqueeze(-1).to(self.projection.weight.dtype)
+        hidden = self.projection(self.embedding(bases)) * mask
+        for block in self.blocks:
+            hidden = block(hidden, mask)
+        return self.norm(hidden) * mask
+
+
+class SwiGLUTransformerEncoderLayer(nn.TransformerEncoderLayer):
+    """Keep familiar FFN parameter names and add an independently learned gate."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.linear_gate = nn.Linear(
+            self.linear1.in_features,
+            self.linear1.out_features,
+            device=self.linear1.weight.device,
+            dtype=self.linear1.weight.dtype,
+        )
+        # The fused Transformer eval path hardcodes ReLU/GELU and would silently
+        # bypass _ff_block and linear_gate. Its documented internal guard must
+        # remain false, including inference under torch.no_grad().
+        self.activation_relu_or_gelu = 0
+
+    def _ff_block(self, hidden: torch.Tensor) -> torch.Tensor:
+        hidden = self.linear1(hidden) * F.silu(self.linear_gate(hidden))
+        return self.dropout2(self.linear2(self.dropout(hidden)))
+
+
 class ResidualOutputHead(nn.Linear):
     """Linear logits plus a small GELU residual; installed only by a wire adapter.
 
@@ -338,19 +498,29 @@ class DirectQualityTransformer(nn.Module):
                 for _ in QMER_KS
             ]
         )
-        self.base_encoder = BaseContextEncoder(self.config)
+        self.base_encoder = (
+            BaseContextEncoder(self.config)
+            if self.config.base_encoder_type == "local_cnn"
+            else DilatedBaseContextEncoder(self.config)
+        )
         combined_dim = (
             self.config.prev_q_embed_dim
             + len(QMER_KS) * self.config.qmer_embed_dim
             + self.config.base_context_dim
             + POSITION_FEATURE_DIM
+            + (QUALITY_PREFIX_FEATURE_DIM if self.config.quality_prefix_features else 0)
         )
         self.input_projection = nn.Sequential(
             nn.Linear(combined_dim, self.config.d_model),
             nn.GELU(),
             nn.Dropout(self.config.dropout),
         )
-        layer = nn.TransformerEncoderLayer(
+        layer_class = (
+            nn.TransformerEncoderLayer
+            if self.config.ffn_type == "gelu"
+            else SwiGLUTransformerEncoderLayer
+        )
+        layer = layer_class(
             d_model=self.config.d_model,
             nhead=self.config.num_heads,
             dim_feedforward=self.config.feedforward_dim,
@@ -455,6 +625,12 @@ class DirectQualityTransformer(nn.Module):
         )
         pieces.append(self.base_encoder(bases, active_mask))
         pieces.append(self._position_features(lengths, active_mask))
+        if self.config.quality_prefix_features:
+            pieces.append(
+                build_quality_prefix_features(
+                    qualities, active_mask, self.config.position_length_scale
+                )
+            )
         hidden = self.input_projection(torch.cat(pieces, dim=-1))
 
         # Active positions are a contiguous prefix of every read. A causal

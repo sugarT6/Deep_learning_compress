@@ -547,7 +547,7 @@ def run_training(
             )
         run_config = {
             "model_config": model_config.to_dict(),
-            "feature_schema": feature_schema(),
+            "feature_schema": feature_schema(model_config),
             "cache_schema": {
                 "format": CACHE_FORMAT,
                 "schema_version": CACHE_SCHEMA_VERSION,
@@ -851,6 +851,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feedforward-dim", type=int, default=512)
     parser.add_argument("--context-length", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--base-encoder-type", choices=("local_cnn", "dilated_cnn"), default="local_cnn")
+    parser.add_argument("--ffn-type", choices=("gelu", "swiglu"), default="gelu")
+    parser.add_argument("--quality-prefix-features", action="store_true",
+                        help="strictly causal Q-prefix statistics; no read-state side stream")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=20260909)
     parser.add_argument("--no-progress", action="store_true")
@@ -868,6 +872,9 @@ def main() -> int:
             feedforward_dim=args.feedforward_dim,
             context_length=args.context_length,
             dropout=args.dropout,
+            base_encoder_type=args.base_encoder_type,
+            ffn_type=args.ffn_type,
+            quality_prefix_features=args.quality_prefix_features,
         )
         best_path = run_training(
             cache_dir=args.cache_dir,

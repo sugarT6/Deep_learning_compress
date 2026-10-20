@@ -81,7 +81,15 @@ coverage calculations, checkpoint resume instructions, and the **40,000-step
 and 70,320-step formal training commands** are in
 [codec/TRAINING_SAMPLER.md](codec/TRAINING_SAMPLER.md).
 
-The current compression-ratio comparison continues the existing 4-layer model
+The expanded20 baseline adds ten audited training sources while keeping
+platform-family batch weights at 3:5:1:1; see
+[codec/TRAINING_EXPANDED20.md](codec/TRAINING_EXPANDED20.md).
+Five independent 4-layer architecture experiments (FFN1024, D384, dilated base
+CNN, SwiGLU, and causal quality-prefix statistics) use the same 200,000-update
+expanded20 training recipe. Their standalone commands and grouped result paths
+are in [codec/TRAINING_ARCHITECTURE_EXPERIMENTS.md](codec/TRAINING_ARCHITECTURE_EXPERIMENTS.md).
+
+The earlier 4/6-layer compression-ratio comparison continues the existing 4-layer model
 to 80,000 total updates and trains a 6-layer, 3,297,946-parameter model from
 scratch for 80,000 updates. Both use 40 epochs of 2,000 steps. See the sampler
 document for commands, validation-driven LR reduction, optional early stopping

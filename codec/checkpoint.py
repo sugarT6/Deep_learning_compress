@@ -50,7 +50,7 @@ def save_training_checkpoint(
     payload = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "model_config": model.config.to_dict(),
-        "feature_schema": feature_schema(),
+        "feature_schema": feature_schema(model.config),
         "cache_schema": cache_schema(),
         "data_split": dict(data_split),
         "sampler_config": dict(sampler_config),
@@ -111,12 +111,12 @@ def load_training_checkpoint(
         raise ValueError(f"{path}: missing checkpoint fields: {', '.join(missing)}")
     if int(payload["checkpoint_schema_version"]) != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(f"{path}: unsupported checkpoint schema version")
-    if payload["feature_schema"] != feature_schema():
+    config = DirectQualityModelConfig.from_dict(payload["model_config"])
+    if payload["feature_schema"] != feature_schema(config):
         raise ValueError(f"{path}: feature schema does not match this implementation")
     if payload["cache_schema"] != cache_schema():
         raise ValueError(f"{path}: training-cache schema does not match")
 
-    config = DirectQualityModelConfig.from_dict(payload["model_config"])
     model = DirectQualityTransformer(config)
     model.load_state_dict(payload["model_state_dict"], strict=True)
     model.to(device)

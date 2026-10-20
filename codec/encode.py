@@ -548,7 +548,7 @@ def _encode_fastq_compat(
                     "sha256": checkpoint_sha256,
                     "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
                     "model_config": model.config.to_dict(),
-                    "feature_schema": feature_schema(),
+                    "feature_schema": feature_schema(model.config),
                 },
                 "inference_runtime": {
                     "torch_version": torch.__version__,

@@ -175,7 +175,7 @@ def _validate_checkpoint(
     ).to_dict()
     if loaded.model.config.to_dict() != stored_config:
         raise ModelMismatchError("checkpoint model configuration does not match container")
-    if feature_schema() != checkpoint_metadata["feature_schema"]:
+    if feature_schema(loaded.model.config) != checkpoint_metadata["feature_schema"]:
         raise ModelMismatchError("checkpoint feature schema does not match container")
     loaded.model.eval()
     if metadata["format_version"] in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION):

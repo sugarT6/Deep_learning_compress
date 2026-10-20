@@ -32,10 +32,13 @@ from .read_state import (
 
 
 PROTOCOL = "transformer_suffix_and_final_norm_xor32_byteplanes_zlib_v1"
+SWIGLU_PROTOCOL = "transformer_suffix_swiglu_and_final_norm_xor32_byteplanes_zlib_v1"
 MAX_RAW_BYTES = 32 << 20
 
 
-def parameter_shapes(dim, ff, depth, layers):
+def parameter_shapes(dim, ff, depth, layers, ffn_type="gelu"):
+    if ffn_type not in ("gelu", "swiglu"):
+        raise ValueError("unsupported backbone FFN type")
     block = (
         ("self_attn.in_proj_weight", [3 * dim, dim]),
         ("self_attn.in_proj_bias", [3 * dim]),
@@ -46,6 +49,8 @@ def parameter_shapes(dim, ff, depth, layers):
         ("norm1.weight", [dim]), ("norm1.bias", [dim]),
         ("norm2.weight", [dim]), ("norm2.bias", [dim]),
     )
+    if ffn_type == "swiglu":
+        block += (("linear_gate.weight", [ff, dim]), ("linear_gate.bias", [ff]))
     return [dict(name=f"transformer.layers.{i}.{name}", shape=shape)
             for i in layers for name, shape in block] + [
                 dict(name="transformer.norm.weight", shape=[dim]),
@@ -60,7 +65,8 @@ def serialize_backbone(model, layer_count, digest, *, base_model):
     if model.config.to_dict() != base_model.config.to_dict():
         raise ValueError("base and adapted model configurations must match")
     layers = list(range(cfg.num_layers - layer_count, cfg.num_layers))
-    shapes = parameter_shapes(cfg.d_model, cfg.feedforward_dim, cfg.num_layers, layers)
+    ffn_type = getattr(cfg, "ffn_type", "gelu")
+    shapes = parameter_shapes(cfg.d_model, cfg.feedforward_dim, cfg.num_layers, layers, ffn_type)
     parameters = dict(model.named_parameters())
     raw = b"".join(parameters[item["name"]].detach().cpu().numpy().astype("<f4").tobytes()
                    for item in shapes)
@@ -71,7 +77,8 @@ def serialize_backbone(model, layer_count, digest, *, base_model):
     planes = delta.view(np.uint8).reshape(-1, 4).T.copy().tobytes()
     head = serialize_head(model.output_head, digest)
     meta = dict(format=ADAPTER_FORMAT, version=7, application="replace_head_and_transformer_suffix",
-                protocol=PROTOCOL, base_checkpoint_sha256=digest, head=head,
+                protocol=SWIGLU_PROTOCOL if ffn_type == "swiglu" else PROTOCOL,
+                base_checkpoint_sha256=digest, head=head,
                 num_layers=cfg.num_layers, feedforward_dim=cfg.feedforward_dim,
                 layers=layers, tensors=shapes, dtype="little_endian_float32",
                 compression="xor32_byteplanes_zlib", raw_bytes=len(raw),
@@ -79,6 +86,8 @@ def serialize_backbone(model, layer_count, digest, *, base_model):
                 sha256=hashlib.sha256(raw).hexdigest(),
                 delta_sha256=hashlib.sha256(planes).hexdigest(),
                 data_base64=base64.b64encode(zlib.compress(planes, level=6)).decode("ascii"))
+    if ffn_type == "swiglu":
+        meta["ffn_type"] = ffn_type
     validate_backbone_adapter(meta, cfg.d_model, digest)
     return meta
 
@@ -88,10 +97,15 @@ def validate_backbone_adapter(meta, dim, digest):
     keys = {"format", "version", "application", "protocol", "base_checkpoint_sha256", "head",
             "num_layers", "feedforward_dim", "layers", "tensors", "dtype", "compression",
             "raw_bytes", "parameter_bytes", "sha256", "delta_sha256", "data_base64"}
+    swiglu = isinstance(meta, dict) and meta.get("protocol") == SWIGLU_PROTOCOL
+    if swiglu:
+        keys = keys | {"ffn_type"}
     if (not isinstance(meta, dict) or set(meta) != keys or meta["format"] != ADAPTER_FORMAT
             or type(meta["version"]) is not int or meta["version"] != 7
             or meta["application"] != "replace_head_and_transformer_suffix"
-            or meta["protocol"] != PROTOCOL or meta["base_checkpoint_sha256"] != digest
+            or meta["protocol"] != (SWIGLU_PROTOCOL if swiglu else PROTOCOL)
+            or (swiglu and meta["ffn_type"] != "swiglu")
+            or meta["base_checkpoint_sha256"] != digest
             or meta["dtype"] != "little_endian_float32"
             or meta["compression"] != "xor32_byteplanes_zlib"):
         raise ValueError("invalid backbone adapter protocol")
@@ -108,7 +122,7 @@ def validate_backbone_adapter(meta, dim, digest):
     if meta["head"]["version"] == 4 and depth < 4:
         raise ValueError("cross-layer head requires four or more layers")
     validate_head_adapter(meta["head"], dim, digest)
-    shapes = parameter_shapes(dim, ff, depth, layers)
+    shapes = parameter_shapes(dim, ff, depth, layers, "swiglu" if swiglu else "gelu")
     # Canonical JSON distinguishes bool/int and float/int in tensor descriptors.
     if json.dumps(meta["tensors"], sort_keys=True) != json.dumps(shapes, sort_keys=True):
         raise ValueError("backbone tensor layout mismatch")
@@ -162,7 +176,8 @@ def apply_backbone_adapter(model, meta, digest):
     from .head_adapter import _restore_head
     delta = validate_backbone_adapter(meta, model.config.d_model, digest)
     if (meta["num_layers"] != model.config.num_layers
-            or meta["feedforward_dim"] != model.config.feedforward_dim):
+            or meta["feedforward_dim"] != model.config.feedforward_dim
+            or meta.get("ffn_type", "gelu") != getattr(model.config, "ffn_type", "gelu")):
         raise ValueError("backbone adapter model configuration mismatch")
     values = (np.frombuffer(_base_bytes(model, meta["tensors"]), dtype="<u4") ^ delta).astype("<u4").view("<f4")
     if not np.isfinite(values).all():

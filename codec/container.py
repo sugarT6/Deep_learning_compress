@@ -295,6 +295,11 @@ def _validate_metadata(
                     adapter["num_layers"] != checkpoint["model_config"].get("num_layers")
                     or adapter["feedforward_dim"] != checkpoint["model_config"].get("feedforward_dim")):
                 raise ValueError("backbone adapter does not match checkpoint architecture")
+            backbone = adapter.get("backbone", adapter) if adapter.get("version") == 9 else adapter
+            if adapter.get("version") in (7, 8, 9) and (
+                    backbone.get("ffn_type", "gelu")
+                    != checkpoint["model_config"].get("ffn_type", "gelu")):
+                raise ValueError("backbone adapter FFN type does not match checkpoint architecture")
             if format_version == READ_STATE_CONTAINER_VERSION:
                 from .read_state import validate_label_metadata
                 validate_label_metadata(metadata)

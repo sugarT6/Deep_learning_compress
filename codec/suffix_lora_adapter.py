@@ -14,13 +14,18 @@ from .backbone_adapter import MAX_RAW_BYTES, _base_bytes, restore_backbone
 
 
 PROTOCOL = "transformer_suffix_qkvo_ffn_rank_major_f64_merge_v1"
+SWIGLU_PROTOCOL = "transformer_suffix_qkvo_swiglu_rank_major_f64_merge_v1"
 
 
-def matrix_layout(dim, ff, layers):
+def matrix_layout(dim, ff, layers, ffn_type="gelu"):
+    if ffn_type not in ("gelu", "swiglu"):
+        raise ValueError("unsupported suffix LoRA FFN type")
     matrices = (("self_attn.in_proj_weight", [3 * dim, dim], 3),
                 ("self_attn.out_proj.weight", [dim, dim], 1),
                 ("linear1.weight", [ff, dim], 1),
                 ("linear2.weight", [dim, ff], 1))
+    if ffn_type == "swiglu":
+        matrices += (("linear_gate.weight", [ff, dim], 1),)
     return [dict(name=f"transformer.layers.{i}.{name}", shape=shape, parts=parts)
             for i in layers for name, shape, parts in matrices]
 
@@ -46,7 +51,7 @@ def install_suffix_lora(model, layer_count, rank, seed):
             or type(rank) is not int or not 1 <= rank <= 16):
         raise ValueError("invalid suffix LoRA layers or rank")
     layers = list(range(cfg.num_layers - layer_count, cfg.num_layers))
-    layout = matrix_layout(cfg.d_model, cfg.feedforward_dim, layers)
+    layout = matrix_layout(cfg.d_model, cfg.feedforward_dim, layers, getattr(cfg, "ffn_type", "gelu"))
     for index, item in enumerate(layout):
         module_name, name = item["name"].rsplit(".", 1)
         module = model.get_submodule(module_name)
@@ -110,7 +115,8 @@ def serialize_suffix_lora(model, layer_count, rank, digest, *, base_model):
     if cfg.to_dict() != base_model.config.to_dict():
         raise ValueError("base and adapted model configurations must match")
     layers = list(range(cfg.num_layers - layer_count, cfg.num_layers))
-    layout = matrix_layout(cfg.d_model, cfg.feedforward_dim, layers)
+    ffn_type = getattr(cfg, "ffn_type", "gelu")
+    layout = matrix_layout(cfg.d_model, cfg.feedforward_dim, layers, ffn_type)
     arrays = []
     for item in layout:
         module_name, name = item["name"].rsplit(".", 1)
@@ -125,13 +131,16 @@ def serialize_suffix_lora(model, layer_count, rank, digest, *, base_model):
     head = serialize_head(model.output_head, digest)
     planes = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4).T.copy().tobytes()
     meta = dict(format=ADAPTER_FORMAT, version=8, application="replace_head_and_suffix_lora",
-                protocol=PROTOCOL, base_checkpoint_sha256=digest, head=head,
+                protocol=SWIGLU_PROTOCOL if ffn_type == "swiglu" else PROTOCOL,
+                base_checkpoint_sha256=digest, head=head,
                 num_layers=cfg.num_layers, feedforward_dim=cfg.feedforward_dim,
                 layers=layers, rank=rank, scaling=1, matrices=layout,
                 dtype="little_endian_float32", compression="byteplanes_zlib",
                 raw_bytes=len(raw), parameter_bytes=len(raw) + head["parameter_bytes"],
                 sha256=hashlib.sha256(raw).hexdigest(), merged_sha256=_merged_digest(merged),
                 data_base64=base64.b64encode(zlib.compress(planes, level=6)).decode("ascii"))
+    if ffn_type == "swiglu":
+        meta["ffn_type"] = ffn_type
     validate_suffix_lora(meta, cfg.d_model, digest)
     return meta
 
@@ -141,10 +150,15 @@ def validate_suffix_lora(meta, dim, digest):
     keys = {"format", "version", "application", "protocol", "base_checkpoint_sha256", "head",
             "num_layers", "feedforward_dim", "layers", "rank", "scaling", "matrices", "dtype",
             "compression", "raw_bytes", "parameter_bytes", "sha256", "merged_sha256", "data_base64"}
+    swiglu = isinstance(meta, dict) and meta.get("protocol") == SWIGLU_PROTOCOL
+    if swiglu:
+        keys = keys | {"ffn_type"}
     if (not isinstance(meta, dict) or set(meta) != keys or meta["format"] != ADAPTER_FORMAT
             or type(meta["version"]) is not int or meta["version"] != 8
             or meta["application"] != "replace_head_and_suffix_lora"
-            or meta["protocol"] != PROTOCOL or meta["base_checkpoint_sha256"] != digest
+            or meta["protocol"] != (SWIGLU_PROTOCOL if swiglu else PROTOCOL)
+            or (swiglu and meta["ffn_type"] != "swiglu")
+            or meta["base_checkpoint_sha256"] != digest
             or meta["dtype"] != "little_endian_float32" or meta["compression"] != "byteplanes_zlib"
             or type(meta["scaling"]) is not int or meta["scaling"] != 1):
         raise ValueError("invalid suffix LoRA protocol")
@@ -162,7 +176,7 @@ def validate_suffix_lora(meta, dim, digest):
             or head["version"] not in (1, 2, 4) or (head["version"] == 4 and depth < 4)):
         raise ValueError("suffix LoRA requires a nonrecursive head compatible with model depth")
     validate_head_adapter(head, dim, digest)
-    layout = matrix_layout(dim, ff, layers)
+    layout = matrix_layout(dim, ff, layers, "swiglu" if swiglu else "gelu")
     if json.dumps(meta["matrices"], sort_keys=True) != json.dumps(layout, sort_keys=True):
         raise ValueError("suffix LoRA matrix layout mismatch")
     size = 4 * (sum(rank * (i["shape"][0] + i["parts"] * i["shape"][1])
@@ -196,7 +210,8 @@ def apply_suffix_lora(model, meta, digest):
     from .head_adapter import _restore_head
     values = validate_suffix_lora(meta, model.config.d_model, digest)
     if (meta["num_layers"] != model.config.num_layers
-            or meta["feedforward_dim"] != model.config.feedforward_dim):
+            or meta["feedforward_dim"] != model.config.feedforward_dim
+            or meta.get("ffn_type", "gelu") != getattr(model.config, "ffn_type", "gelu")):
         raise ValueError("suffix LoRA model configuration mismatch")
     merged = _canonical_parameters(model, meta["matrices"], values, meta["rank"])
     if _merged_digest(merged) != meta["merged_sha256"]:
