@@ -88,6 +88,11 @@ Five independent 4-layer architecture experiments (FFN1024, D384, dilated base
 CNN, SwiGLU, and causal quality-prefix statistics) use the same 200,000-update
 expanded20 training recipe. Their standalone commands and grouped result paths
 are in [codec/TRAINING_ARCHITECTURE_EXPERIMENTS.md](codec/TRAINING_ARCHITECTURE_EXPERIMENTS.md).
+To compare suffix LoRA with full fine-tuning from the same pretrained model,
+warm head and fixed read split, see
+[codec/ADAPTATION_DIAGNOSTIC.md](codec/ADAPTATION_DIAGNOSTIC.md).
+This probability diagnostic records training/validation curves without
+encoding the complete file.
 
 The earlier 4/6-layer compression-ratio comparison continues the existing 4-layer model
 to 80,000 total updates and trains a 6-layer, 3,297,946-parameter model from
