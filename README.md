@@ -93,6 +93,8 @@ warm head and fixed read split, see
 [codec/ADAPTATION_DIAGNOSTIC.md](codec/ADAPTATION_DIAGNOSTIC.md).
 This probability diagnostic records training/validation curves without
 encoding the complete file.
+Completed full-model diagnostic runs can be evaluated with parameter-group
+reversions using [codec/ADAPTATION_ABLATION.md](codec/ADAPTATION_ABLATION.md).
 
 The earlier 4/6-layer compression-ratio comparison continues the existing 4-layer model
 to 80,000 total updates and trains a 6-layer, 3,297,946-parameter model from
