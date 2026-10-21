@@ -1,4 +1,4 @@
-"""Five controlled expanded20 pretraining experiments in one run group.
+"""Controlled expanded20 architecture and model-size pretraining experiments.
 
 Each invocation allocates its own empty run directory, including when multiple
 terminals start the same experiment concurrently. No scratch-file training or
@@ -28,6 +28,12 @@ from .training_control import TrainingControlConfig
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RUN_GROUP = REPOSITORY_ROOT / "codec/runs/architecture_ablation_20261020"
+DEFAULT_SCALING_RUN_GROUP = REPOSITORY_ROOT / "codec/runs/model_scaling_20261021"
+SCALING_EXPERIMENT_CHANGES = {
+    "depth6": {"num_layers": 6},
+    "depth8": {"num_layers": 8},
+    "wide512": {"d_model": 512, "num_heads": 8, "feedforward_dim": 1024},
+}
 EXPERIMENT_CHANGES = {
     "ffn1024": {"feedforward_dim": 1024},
     # Keep 64 channels per attention head and the original FFN/model ratio.
@@ -36,6 +42,7 @@ EXPERIMENT_CHANGES = {
     # 3*344 is close to the GELU baseline's 2*512 FFN matrix budget.
     "swiglu": {"ffn_type": "swiglu", "feedforward_dim": 344},
     "qprefix": {"quality_prefix_features": True},
+    **SCALING_EXPERIMENT_CHANGES,
 }
 
 
@@ -50,7 +57,10 @@ def experiment_config(name: str) -> DirectQualityModelConfig:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("experiment", choices=tuple(EXPERIMENT_CHANGES))
-    parser.add_argument("--run-group", type=Path, default=DEFAULT_RUN_GROUP)
+    parser.add_argument(
+        "--run-group", type=Path,
+        help="override the architecture- or model-scaling-specific run directory",
+    )
     parser.add_argument("--cache-dir", type=Path, default=REPOSITORY_ROOT / DEFAULT_CACHE_DIR)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int, default=100)
@@ -78,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.run_group is None:
+        args.run_group = (
+            DEFAULT_SCALING_RUN_GROUP
+            if args.experiment in SCALING_EXPERIMENT_CHANGES
+            else DEFAULT_RUN_GROUP
+        )
     try:
         config = experiment_config(args.experiment)
         control = TrainingControlConfig(
