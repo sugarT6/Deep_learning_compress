@@ -88,6 +88,10 @@ Five independent 4-layer architecture experiments (FFN1024, D384, dilated base
 CNN, SwiGLU, and causal quality-prefix statistics) use the same 200,000-update
 expanded20 training recipe. Their standalone commands and grouped result paths
 are in [codec/document/TRAINING_ARCHITECTURE_EXPERIMENTS.md](codec/document/TRAINING_ARCHITECTURE_EXPERIMENTS.md).
+Two further independent experiments add learned relative attention distances or
+a lightweight bidirectional base encoder with cross-attention in the Q decoder.
+Both train from scratch on expanded20 with the same 200,000-update budget; see
+[conditioning experiment commands](codec/document/TRAINING_CONDITIONING_EXPERIMENTS.md).
 To compare suffix LoRA with full fine-tuning from the same pretrained model,
 warm head and fixed read split, see
 [codec/document/ADAPTATION_DIAGNOSTIC.md](codec/document/ADAPTATION_DIAGNOSTIC.md).

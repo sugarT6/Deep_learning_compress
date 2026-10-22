@@ -21,6 +21,8 @@ class PretrainingExperimentTests(unittest.TestCase):
             "base_dilated": {"base_encoder_type": "dilated_cnn"},
             "swiglu": {"ffn_type": "swiglu", "feedforward_dim": 344},
             "qprefix": {"quality_prefix_features": True},
+            "relative_position": {"relative_position_bias": True},
+            "base_encoder_decoder": {"base_cross_attention": True},
         }
         for name, changes in expected.items():
             with self.subTest(experiment=name):
@@ -42,6 +44,25 @@ class PretrainingExperimentTests(unittest.TestCase):
             self.assertEqual(len(description["training_accessions"]), 20)
             self.assertFalse(group.exists())
             train.assert_not_called()
+
+    def test_conditioning_experiments_use_a_separate_group_and_original_training_budget(self):
+        for name in ("relative_position", "base_encoder_decoder"):
+            with self.subTest(name=name):
+                stdout = io.StringIO()
+                with mock.patch.object(train_experiments, "run_training") as train:
+                    with contextlib.redirect_stdout(stdout):
+                        self.assertEqual(train_experiments.main([name, "--dry-run"]), 0)
+                description = json.loads(stdout.getvalue())
+                self.assertEqual(Path(description["run_group"]),
+                                 train_experiments.DEFAULT_CONDITIONING_RUN_GROUP)
+                self.assertEqual(description["initialization"], "random")
+                self.assertEqual(description["target_updates"], 200000)
+                self.assertEqual(description["batch_reads"], 256)
+                self.assertEqual(description["seed"], 20260909)
+                self.assertEqual(description["training_accessions"],
+                                 [dataset.accession for dataset in EXPANDED_TRAIN_DATASETS])
+                self.assertEqual(description["feature_schema"]["version"], 3)
+                train.assert_not_called()
 
     def test_repeated_invocations_allocate_empty_independent_runs_with_same_training_contract(self):
         with tempfile.TemporaryDirectory() as temporary:

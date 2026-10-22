@@ -12,6 +12,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .base_memory import BaseMemoryDecoderLayer, BaseMemoryEncoder
+from .relative_attention import RelativePositionTransformerEncoderLayer
 from .fastq_stream import (
     BASE_ALPHABET_SIZE,
     BASE_OTHER_ID,
@@ -61,6 +63,12 @@ class DirectQualityModelConfig:
     base_encoder_type: str = "local_cnn"
     ffn_type: str = "gelu"
     quality_prefix_features: bool = False
+    relative_position_bias: bool = False
+    base_cross_attention: bool = False
+    base_memory_dim: int = 64
+    base_memory_heads: int = 4
+    base_memory_layers: int = 2
+    base_cross_attention_layers: int = 2
 
     def __post_init__(self) -> None:
         if self.architecture != MODEL_ARCHITECTURE:
@@ -101,6 +109,21 @@ class DirectQualityModelConfig:
             raise ValueError("ffn_type must be gelu or swiglu")
         if not isinstance(self.quality_prefix_features, bool):
             raise ValueError("quality_prefix_features must be bool")
+        for name in ("relative_position_bias", "base_cross_attention"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be bool")
+        if self.relative_position_bias and self.base_cross_attention:
+            raise ValueError("relative position and base cross-attention are independent experiments")
+        if (self.relative_position_bias or self.base_cross_attention) and self.ffn_type != "gelu":
+            raise ValueError("conditioning architecture experiments require the GELU FFN")
+        for name in ("base_memory_dim", "base_memory_heads", "base_memory_layers",
+                     "base_cross_attention_layers"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.base_memory_dim % self.base_memory_heads:
+            raise ValueError("base_memory_dim must be divisible by base_memory_heads")
+        if self.base_cross_attention and self.base_cross_attention_layers > self.num_layers:
+            raise ValueError("base_cross_attention_layers cannot exceed num_layers")
 
     def to_dict(self) -> Dict[str, Any]:
         values = asdict(self)
@@ -110,6 +133,12 @@ class DirectQualityModelConfig:
             ("base_encoder_type", "local_cnn"),
             ("ffn_type", "gelu"),
             ("quality_prefix_features", False),
+            ("relative_position_bias", False),
+            ("base_cross_attention", False),
+            ("base_memory_dim", 64),
+            ("base_memory_heads", 4),
+            ("base_memory_layers", 2),
+            ("base_cross_attention_layers", 2),
         ):
             if values[name] == default:
                 values.pop(name)
@@ -170,6 +199,29 @@ def feature_schema(config: Optional[DirectQualityModelConfig] = None) -> Dict[st
             "low_quality_threshold_exclusive": 20,
             "quality_scale": QUALITY_ALPHABET_SIZE - 1,
             "run_length_scale": config.position_length_scale,
+            "side_information_bytes": 0,
+        }
+    if config is not None and config.relative_position_bias:
+        schema["version"] = FEATURE_SCHEMA_VERSION + 2
+        schema["features"]["relative_position_bias"] = {
+            "type": "learned_per_head_causal_distance",
+            "distance_bins": config.context_length,
+            "future_quality_allowed": False,
+            "side_information_bytes": 0,
+        }
+    if config is not None and config.base_cross_attention:
+        schema["version"] = FEATURE_SCHEMA_VERSION + 2
+        schema["features"]["base_memory"] = {
+            "inputs": ["complete_base_sequence", "position_read_length"],
+            "bidirectional": True,
+            "quality_input": False,
+            "padding_masked": True,
+            "dimension": config.base_memory_dim,
+            "heads": config.base_memory_heads,
+            "encoder_layers": config.base_memory_layers,
+            "cross_attention_layers": list(range(
+                config.num_layers - config.base_cross_attention_layers, config.num_layers
+            )),
             "side_information_bytes": 0,
         }
     return schema
@@ -520,7 +572,7 @@ class DirectQualityTransformer(nn.Module):
             if self.config.ffn_type == "gelu"
             else SwiGLUTransformerEncoderLayer
         )
-        layer = layer_class(
+        layer_options = dict(
             d_model=self.config.d_model,
             nhead=self.config.num_heads,
             dim_feedforward=self.config.feedforward_dim,
@@ -529,11 +581,25 @@ class DirectQualityTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
+        if self.config.relative_position_bias:
+            layer_class = RelativePositionTransformerEncoderLayer
+        layer = layer_class(
+            **layer_options,
+            **({"context_length": self.config.context_length}
+               if self.config.relative_position_bias else {}),
+        )
         self.transformer = nn.TransformerEncoder(
             layer,
             num_layers=self.config.num_layers,
             norm=nn.LayerNorm(self.config.d_model),
         )
+        if self.config.base_cross_attention:
+            self.base_memory_encoder = BaseMemoryEncoder(self.config)
+            first_cross = self.config.num_layers - self.config.base_cross_attention_layers
+            for index in range(first_cross, self.config.num_layers):
+                self.transformer.layers[index] = BaseMemoryDecoderLayer(
+                    **layer_options, memory_dim=self.config.base_memory_dim
+                )
         self.output_head = nn.Linear(
             self.config.d_model, QUALITY_ALPHABET_SIZE
         )
@@ -624,7 +690,8 @@ class DirectQualityTransformer(nn.Module):
             for embedding, tokens in zip(self.qmer_embeddings, qmer_tokens)
         )
         pieces.append(self.base_encoder(bases, active_mask))
-        pieces.append(self._position_features(lengths, active_mask))
+        position_features = self._position_features(lengths, active_mask)
+        pieces.append(position_features)
         if self.config.quality_prefix_features:
             pieces.append(
                 build_quality_prefix_features(
@@ -643,7 +710,21 @@ class DirectQualityTransformer(nn.Module):
                 category=UserWarning,
             )
             mask = self._attention_mask(sequence_length, bases.device)
-            if hasattr(self, "read_state_conditioning"):
+            if self.config.base_cross_attention:
+                memory = self.base_memory_encoder(bases, active_mask, position_features)
+                for index, layer in enumerate(self.transformer.layers):
+                    if (hasattr(self, "read_state_conditioning")
+                            and index in self.read_state_conditioning.layers):
+                        hidden = self.read_state_conditioning(hidden, read_states, index)
+                    if isinstance(layer, BaseMemoryDecoderLayer):
+                        hidden = layer(
+                            hidden, src_mask=mask, memory=memory,
+                            memory_key_padding_mask=~active_mask,
+                        )
+                    else:
+                        hidden = layer(hidden, src_mask=mask)
+                hidden = self.transformer.norm(hidden)
+            elif hasattr(self, "read_state_conditioning"):
                 for index, layer in enumerate(self.transformer.layers):
                     if index in self.read_state_conditioning.layers:
                         hidden = self.read_state_conditioning(hidden, read_states, index)

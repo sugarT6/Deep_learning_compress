@@ -855,6 +855,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffn-type", choices=("gelu", "swiglu"), default="gelu")
     parser.add_argument("--quality-prefix-features", action="store_true",
                         help="strictly causal Q-prefix statistics; no read-state side stream")
+    conditioning = parser.add_mutually_exclusive_group()
+    conditioning.add_argument("--relative-position-bias", action="store_true",
+                              help="learn per-head distances in causal Q self-attention")
+    conditioning.add_argument("--base-cross-attention", action="store_true",
+                              help="add bidirectional base-only memory to the last Q layers")
+    parser.add_argument("--base-memory-dim", type=int, default=64)
+    parser.add_argument("--base-memory-heads", type=int, default=4)
+    parser.add_argument("--base-memory-layers", type=int, default=2)
+    parser.add_argument("--base-cross-attention-layers", type=int, default=2)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=20260909)
     parser.add_argument("--no-progress", action="store_true")
@@ -875,6 +884,12 @@ def main() -> int:
             base_encoder_type=args.base_encoder_type,
             ffn_type=args.ffn_type,
             quality_prefix_features=args.quality_prefix_features,
+            relative_position_bias=args.relative_position_bias,
+            base_cross_attention=args.base_cross_attention,
+            base_memory_dim=args.base_memory_dim,
+            base_memory_heads=args.base_memory_heads,
+            base_memory_layers=args.base_memory_layers,
+            base_cross_attention_layers=args.base_cross_attention_layers,
         )
         best_path = run_training(
             cache_dir=args.cache_dir,

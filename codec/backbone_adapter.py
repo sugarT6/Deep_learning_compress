@@ -290,6 +290,13 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     )
     if config.backbone_layers > model.config.num_layers:
         raise ValueError("cannot adapt more backbone layers than the model contains")
+    if not config.backbone_lora_rank and (
+        model.config.relative_position_bias or model.config.base_cross_attention
+    ):
+        raise ValueError(
+            "conditioning architectures require --backbone-lora-rank for suffix adaptation; "
+            "dense suffix adapters cannot serialize their additional layer parameters"
+        )
     if hasattr(model, "_backbone_original_parameters") or hasattr(model, "_lora_original_qkv"):
         raise ValueError("backbone fitting requires a fresh base model")
     started = time.perf_counter()

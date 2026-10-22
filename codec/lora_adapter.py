@@ -129,6 +129,11 @@ def apply_lora_adapter(model, meta, digest):
 
 
 def adapt_last_layer(model, source, *, device, batch_reads, total, base_sha256, config):
+    if model.config.base_cross_attention:
+        raise ValueError(
+            "base-memory models require suffix LoRA (--finetune-last-layers and "
+            "--backbone-lora-rank); legacy --head-lora caches no base memory"
+        )
     from .head_adapter import adapt_output_head, _restore_head
     if model.config.num_layers != 4 or hasattr(model, "_lora_original_qkv"):
         raise ValueError("LoRA fitting requires a fresh four-layer base model")

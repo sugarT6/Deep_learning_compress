@@ -29,6 +29,11 @@ from .training_control import TrainingControlConfig
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RUN_GROUP = REPOSITORY_ROOT / "codec/runs/architecture_ablation_20261020"
 DEFAULT_SCALING_RUN_GROUP = REPOSITORY_ROOT / "codec/runs/model_scaling_20261021"
+DEFAULT_CONDITIONING_RUN_GROUP = REPOSITORY_ROOT / "codec/runs/conditioning_architecture_20261022"
+CONDITIONING_EXPERIMENT_CHANGES = {
+    "relative_position": {"relative_position_bias": True},
+    "base_encoder_decoder": {"base_cross_attention": True},
+}
 SCALING_EXPERIMENT_CHANGES = {
     "depth6": {"num_layers": 6},
     "depth8": {"num_layers": 8},
@@ -43,6 +48,7 @@ EXPERIMENT_CHANGES = {
     "swiglu": {"ffn_type": "swiglu", "feedforward_dim": 344},
     "qprefix": {"quality_prefix_features": True},
     **SCALING_EXPERIMENT_CHANGES,
+    **CONDITIONING_EXPERIMENT_CHANGES,
 }
 
 
@@ -89,11 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.run_group is None:
-        args.run_group = (
-            DEFAULT_SCALING_RUN_GROUP
-            if args.experiment in SCALING_EXPERIMENT_CHANGES
-            else DEFAULT_RUN_GROUP
-        )
+        if args.experiment in CONDITIONING_EXPERIMENT_CHANGES:
+            args.run_group = DEFAULT_CONDITIONING_RUN_GROUP
+        elif args.experiment in SCALING_EXPERIMENT_CHANGES:
+            args.run_group = DEFAULT_SCALING_RUN_GROUP
+        else:
+            args.run_group = DEFAULT_RUN_GROUP
     try:
         config = experiment_config(args.experiment)
         control = TrainingControlConfig(
