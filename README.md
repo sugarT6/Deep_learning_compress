@@ -16,7 +16,7 @@ and transmit an accepted FP32 head in a version-3 container. The decoder loads
 the head without training. The default adaptation budget is 20 seconds with
 cooperative checks, not a measured GPU guarantee. All encodes are neural-only;
 `--adaptive-weights`, `--probability-profile`, and `--prior-*` are rejected. See
-[codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md) for current commands,
+[codec/document/HEAD_ADAPTATION.md](codec/document/HEAD_ADAPTATION.md) for current commands,
 fallback behavior, exact adapter reuse, and quality-plus-adapter byte accounting.
 The default head is linear. `--head-type residual --head-residual-dim 32`
 adds a small trainable GELU residual branch, keeping the same frozen backbone
@@ -47,7 +47,7 @@ Its exact FP32 updates are losslessly XOR-differenced against the shared base,
 compressed, and transmitted as adapter v7. The best validated trained state
 is always used; predicted savings and weight cost never trigger a return to
 the warm-up head. Weight storage is included in final quality-plus-adapter bytes. See
-[codec/HEAD_ADAPTATION.md](codec/HEAD_ADAPTATION.md#dense-final-layer-adaptation)
+[codec/document/HEAD_ADAPTATION.md](codec/document/HEAD_ADAPTATION.md#dense-final-layer-adaptation)
 for the 4-layer-80k command and reporting fields.
 
 Add `--backbone-lora-rank 8` to adapt those selected blocks with independent
@@ -58,13 +58,13 @@ updates before coding. Rank 8 adds 231424 raw bytes for two D=256/FF=512 blocks
 and final norm, excluding the head. It uses the same whole-file sample, best
 validation state, and always-use policy. Predicted savings and weight cost
 are diagnostics; actual compression determines the result. See the
-[multi-layer LoRA command](codec/HEAD_ADAPTATION.md#multi-layer-lora-adaptation).
+[multi-layer LoRA command](codec/document/HEAD_ADAPTATION.md#multi-layer-lora-adaptation).
 
 The opt-in `--quantizer floor` uses CPU float64 floor frequencies
 without largest-remainder sorting, variable per-position totals, and direct
 symbol intervals on the encoder. The default largest-remainder path remains
 available for paired comparisons and old files remain decodable. See
-[codec/FAST_QUANTIZATION.md](codec/FAST_QUANTIZATION.md) for the 2000-update
+[codec/document/FAST_QUANTIZATION.md](codec/document/FAST_QUANTIZATION.md) for the 2000-update
 compression command, protocol and small-sample timing results.
 
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
@@ -79,22 +79,22 @@ and persistent shuffled blocks without replacement (including the final short
 block). `best.pt` uses validation dataset-macro bits/Q. Full sampler rules,
 coverage calculations, checkpoint resume instructions, and the **40,000-step
 and 70,320-step formal training commands** are in
-[codec/TRAINING_SAMPLER.md](codec/TRAINING_SAMPLER.md).
+[codec/document/TRAINING_SAMPLER.md](codec/document/TRAINING_SAMPLER.md).
 
 The expanded20 baseline adds ten audited training sources while keeping
 platform-family batch weights at 3:5:1:1; see
-[codec/TRAINING_EXPANDED20.md](codec/TRAINING_EXPANDED20.md).
+[codec/document/TRAINING_EXPANDED20.md](codec/document/TRAINING_EXPANDED20.md).
 Five independent 4-layer architecture experiments (FFN1024, D384, dilated base
 CNN, SwiGLU, and causal quality-prefix statistics) use the same 200,000-update
 expanded20 training recipe. Their standalone commands and grouped result paths
-are in [codec/TRAINING_ARCHITECTURE_EXPERIMENTS.md](codec/TRAINING_ARCHITECTURE_EXPERIMENTS.md).
+are in [codec/document/TRAINING_ARCHITECTURE_EXPERIMENTS.md](codec/document/TRAINING_ARCHITECTURE_EXPERIMENTS.md).
 To compare suffix LoRA with full fine-tuning from the same pretrained model,
 warm head and fixed read split, see
-[codec/ADAPTATION_DIAGNOSTIC.md](codec/ADAPTATION_DIAGNOSTIC.md).
+[codec/document/ADAPTATION_DIAGNOSTIC.md](codec/document/ADAPTATION_DIAGNOSTIC.md).
 This probability diagnostic records training/validation curves without
 encoding the complete file.
 Completed full-model diagnostic runs can be evaluated with parameter-group
-reversions using [codec/ADAPTATION_ABLATION.md](codec/ADAPTATION_ABLATION.md).
+reversions using [codec/document/ADAPTATION_ABLATION.md](codec/document/ADAPTATION_ABLATION.md).
 
 The earlier 4/6-layer compression-ratio comparison continues the existing 4-layer model
 to 80,000 total updates and trains a 6-layer, 3,297,946-parameter model from
@@ -156,7 +156,7 @@ dataset for each requested group.
 Stage C implements deterministic 42-class probability quantization and an
 independent, single-stream 32-bit integer range coder. The default quantizer
 total is `2^16`; exact rounding, tie-breaking, stream framing, finalization,
-and termination rules are documented in `codec/RANGE_CODER_FORMAT.md`. A
+and termination rules are documented in `codec/document/RANGE_CODER_FORMAT.md`. A
 non-neural adaptive quality histogram has a tested encode/decode round trip.
 The Stage C modules themselves remain independent of the neural model.
 
@@ -167,12 +167,12 @@ while keeping training caches out of the runtime codec. The encoder accepts
 The encoder uses a bit-exact range batch loop, without expert fusion, count
 updates or weight feedback. Neural-only diagnostic bits default to `null`; enable them with
 `--report-neural-only-bits` when needed. Final quantized bits remain enabled.
-See [encoder speed notes](codec/ENCODING_SPEED.md) for compatibility and timings.
+See [encoder speed notes](codec/document/ENCODING_SPEED.md) for compatibility and timings.
 The command below uses the historical checkpoint; substitute your new `best.pt`
 and a new output filename when evaluating retraining.
 
-The [fusion evaluation](codec/FUSION_VALIDATION.md),
-[running delta](codec/RUNNING_DELTA.md), and [adaptive weights](codec/ADAPTIVE_WEIGHTS.md)
+The [fusion evaluation](codec/document/FUSION_VALIDATION.md),
+[running delta](codec/document/RUNNING_DELTA.md), and [adaptive weights](codec/document/ADAPTIVE_WEIGHTS.md)
 documents describe historical experiments, not current encoder options.
 Old v3 batch runners that pass expert flags must not be reused or resumed as
 neural runs; the encoder rejects these flags instead of silently changing a run.
@@ -201,10 +201,10 @@ Both commands show progress on stderr and emit JSON statistics on stdout;
 `--no-progress` disables the progress bar. Decode requires the exact checkpoint
 SHA-256 and the batch size stored in the container. The decompressed output is
 verified against the source FASTQ SHA-256 before it is atomically published.
-The format and lossless boundary are specified in `codec/CONTAINER_FORMAT.md`.
+The format and lossless boundary are specified in `codec/document/CONTAINER_FORMAT.md`.
 The online count tables, strict completed-batch update boundary, hierarchical
 backoff equations, neural fusion, defaults, and metadata contract are specified
-in `codec/ONLINE_PRIOR_FORMAT.md`.
+in `codec/document/ONLINE_PRIOR_FORMAT.md`.
 The runtime codec defaults to 256 reads per batch. This does not require a new
 checkpoint: training batch size is not part of the model architecture. Existing
 containers that store a 64-read grouping remain decodable by passing
