@@ -37,12 +37,12 @@ class SuffixLoRATest(unittest.TestCase):
     def tearDownClass(cls):
         torch.set_num_threads(cls.previous_threads)
 
-    def candidate(self, root, depth=4, rank=2):
+    def candidate(self, root, depth=4, rank=2, layer_count=2):
         base, checkpoint = model_and_checkpoint(root, num_layers=depth)
         candidate = copy.deepcopy(base).eval().requires_grad_(False)
         candidate.output_head = CrossLayerOutputHead(8, 16, 4)
         rng = torch.get_rng_state().clone()
-        layout = install_suffix_lora(candidate, 2, rank, 77)
+        layout = install_suffix_lora(candidate, layer_count, rank, 77)
         self.assertTrue(torch.equal(rng, torch.get_rng_state()))
         with torch.no_grad():
             for item in layout:
@@ -51,14 +51,17 @@ class SuffixLoRATest(unittest.TestCase):
                 factors.b.normal_(std=.03)
             candidate.transformer.norm.bias.add_(.01)
         digest = sha256_file(checkpoint)
-        adapter = serialize_suffix_lora(candidate, 2, rank, digest, base_model=base)
+        adapter = serialize_suffix_lora(candidate, layer_count, rank, digest, base_model=base)
         return base, candidate, checkpoint, adapter
 
-    def test_wire_roundtrip_and_exact_cdfs_for_four_and_six_layers(self):
-        for depth, rank in ((4, 8), (6, 16)):
-            with self.subTest(depth=depth, rank=rank), tempfile.TemporaryDirectory() as directory:
+    def test_wire_roundtrip_and_exact_cdfs_for_suffix_and_all_layers(self):
+        for depth, layer_count, rank in ((4, 2, 8), (6, 2, 16), (4, 4, 4),
+                                         (6, 6, 4), (8, 8, 4)):
+            with self.subTest(depth=depth, layers=layer_count, rank=rank), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                base, _, checkpoint, adapter = self.candidate(root, depth, rank)
+                base, _, checkpoint, adapter = self.candidate(root, depth, rank, layer_count)
+                self.assertEqual(adapter["layers"], list(range(depth - layer_count, depth)))
+                self.assertEqual(adapter["version"], 8)
                 digest = sha256_file(checkpoint)
                 source, raw = source_file(root, count=17, compressed=True)
                 artifact = root / "adapter.json"
@@ -122,7 +125,10 @@ class SuffixLoRATest(unittest.TestCase):
             base, _, checkpoint, adapter = self.candidate(root)
             digest = sha256_file(checkpoint)
             changes = [dict(version=True), dict(rank=True), dict(rank=17), dict(scaling=2),
-                       dict(num_layers=True), dict(layers=[0, 3]), dict(extra=True),
+                       dict(num_layers=True), dict(num_layers=65), dict(layers=[0, 3]),
+                       dict(layers=[]), dict(layers=[-1, 0, 1, 2, 3]),
+                       dict(layers=[2, 2]), dict(layers=[3, 2]), dict(layers=[2, 4]),
+                       dict(layers=[True, 3]), dict(extra=True),
                        dict(raw_bytes=adapter["raw_bytes"] + 4), dict(data_base64="!"),
                        dict(sha256="0" * 64), dict(parameter_bytes=True),
                        dict(matrices=[{**adapter["matrices"][0], "parts": True}] + adapter["matrices"][1:]),
@@ -157,31 +163,55 @@ class SuffixLoRATest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "configuration mismatch"):
                 apply_head_adapter(different, adapter, digest)
 
-    def fit(self, root, count=10000, steps=40):
-        model, before, source, checkpoint, cfg = backbone_tests.BackboneAdapterTest().fit_case(root, count, steps)
-        return model, before, source, checkpoint, replace(cfg, backbone_lora_rank=2)
-
-    def test_real_training_updates_only_target_matrices_norm_and_head(self):
+    def test_install_and_serialize_reject_layers_outside_model_and_protocol_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            model, before, source, checkpoint, cfg = self.fit(root)
-            adapter, report = adapt_output_head(model, source, device=torch.device("cpu"),
-                batch_reads=16, total=65536, base_sha256=sha256_file(checkpoint), config=cfg)
-            self.assertTrue(report["backbone_accepted"], report)
-            self.assertEqual(adapter["version"], 8)
-            self.assertEqual(report["selected_adapter_type"], "suffix_lora")
-            self.assertFalse(report["backbone_fallback"])
-            self.assertEqual(report["backbone_steps_completed"], 40)
-            self.assertGreater(report["estimated_net_saving_bytes"], 0)
-            targets = {i["name"] for i in adapter["matrices"]}
-            for name, p in model.named_parameters():
-                if not name.startswith(("output_head.", "transformer.norm.")) and name not in targets:
-                    torch.testing.assert_close(p, before[name], rtol=0, atol=0)
-            for layer in (2, 3):
-                for matrix in ("self_attn.in_proj_weight", "self_attn.out_proj.weight", "linear1.weight", "linear2.weight"):
-                    name = f"transformer.layers.{layer}.{matrix}"
-                    self.assertFalse(torch.equal(dict(model.named_parameters())[name], before[name]), name)
-            self.assertEqual(report["backbone_trainable_parameters"] * 4, adapter["raw_bytes"])
+            base, checkpoint = model_and_checkpoint(root, num_layers=6)
+            digest = sha256_file(checkpoint)
+            for layer_count in (0, 7, 65, True, 6.0):
+                with self.subTest(layers=layer_count):
+                    with self.assertRaisesRegex(ValueError, "invalid suffix LoRA"):
+                        install_suffix_lora(base, layer_count, 4, 77)
+                    with self.assertRaisesRegex(ValueError, "invalid suffix LoRA"):
+                        serialize_suffix_lora(base, layer_count, 4, digest, base_model=base)
+            self.assertFalse(any("parametrizations" in name for name, _ in base.named_parameters()))
+            # Training-side guards must also reject a model whose depth is outside
+            # the unchanged v8 wire protocol, before registering any factors.
+            base.config = replace(base.config, num_layers=65)
+            with self.assertRaisesRegex(ValueError, "invalid suffix LoRA"):
+                install_suffix_lora(base, 6, 4, 77)
+            with self.assertRaisesRegex(ValueError, "invalid suffix LoRA"):
+                serialize_suffix_lora(base, 6, 4, digest, base_model=base)
+
+    def fit(self, root, count=10000, steps=40, depth=4, layer_count=2):
+        model, before, source, checkpoint, cfg = backbone_tests.BackboneAdapterTest().fit_case(root, count, steps)
+        if depth != 4:
+            model, checkpoint = model_and_checkpoint(root, num_layers=depth)
+            before = {name: p.detach().clone() for name, p in model.named_parameters()}
+        return model, before, source, checkpoint, replace(cfg, backbone_layers=layer_count, backbone_lora_rank=2)
+
+    def test_real_training_updates_only_target_matrices_norm_and_head(self):
+        for depth, layer_count in ((4, 2), (6, 6), (8, 8)):
+            with self.subTest(depth=depth, layers=layer_count), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                model, before, source, checkpoint, cfg = self.fit(root, depth=depth, layer_count=layer_count)
+                adapter, report = adapt_output_head(model, source, device=torch.device("cpu"),
+                    batch_reads=16, total=65536, base_sha256=sha256_file(checkpoint), config=cfg)
+                self.assertTrue(report["backbone_accepted"], report)
+                self.assertEqual(adapter["version"], 8)
+                self.assertEqual(report["selected_adapter_type"], "suffix_lora")
+                self.assertFalse(report["backbone_fallback"])
+                self.assertEqual(report["backbone_steps_completed"], 40)
+                self.assertGreater(report["estimated_net_saving_bytes"], 0)
+                targets = {i["name"] for i in adapter["matrices"]}
+                for name, p in model.named_parameters():
+                    if not name.startswith(("output_head.", "transformer.norm.")) and name not in targets:
+                        torch.testing.assert_close(p, before[name], rtol=0, atol=0)
+                for layer in range(depth - layer_count, depth):
+                    for matrix in ("self_attn.in_proj_weight", "self_attn.out_proj.weight", "linear1.weight", "linear2.weight"):
+                        name = f"transformer.layers.{layer}.{matrix}"
+                        self.assertFalse(torch.equal(dict(model.named_parameters())[name], before[name]), name)
+                self.assertEqual(report["backbone_trainable_parameters"] * 4, adapter["raw_bytes"])
 
     def test_best_factors_are_used_even_when_weights_cost_more_than_savings(self):
         for small_file in (False, True):
@@ -212,16 +242,34 @@ class SuffixLoRATest(unittest.TestCase):
 
     def test_cli_guards_and_rank_parameter_cost(self):
         common = ["codec.encode", "in.fq", "out.fqdc", "base.pt", "--finetune-head"]
-        with mock.patch("sys.argv", common + ["--finetune-last-layers", "2", "--backbone-lora-rank", "8"]), \
-             mock.patch("codec.encode.encode_fastq") as encode, mock.patch("builtins.print"):
-            encode.return_value.to_dict.return_value = {}
-            main()
-            self.assertEqual(encode.call_args.kwargs["head_adaptation_config"].backbone_lora_rank, 8)
-        for flags in (["--backbone-lora-rank", "8"], ["--finetune-last-layers", "2", "--backbone-lora-rank", "17"]):
+        for layer_count in (2, 6, 8):
+            with self.subTest(layers=layer_count), \
+                 mock.patch("sys.argv", common + ["--finetune-last-layers", str(layer_count), "--backbone-lora-rank", "8"]), \
+                 mock.patch("codec.encode.encode_fastq") as encode, mock.patch("builtins.print"):
+                encode.return_value.to_dict.return_value = {}
+                main()
+                cfg = encode.call_args.kwargs["head_adaptation_config"]
+                self.assertEqual(cfg.backbone_lora_rank, 8)
+                self.assertEqual(cfg.backbone_layers, layer_count)
+        for flags in (["--backbone-lora-rank", "8"],
+                      ["--finetune-last-layers", "2", "--backbone-lora-rank", "17"],
+                      ["--finetune-last-layers", "65", "--backbone-lora-rank", "8"],
+                      ["--finetune-last-layers", "6"]):
             with mock.patch("sys.argv", common + flags), self.assertRaises(SystemExit):
                 main()
-        with self.assertRaises(ValueError):
-            config(backbone_layers=2, backbone_lora_rank=True)
+        for overrides in (dict(backbone_layers=2, backbone_lora_rank=True),
+                          dict(backbone_layers=True, backbone_lora_rank=8),
+                          dict(backbone_layers=65, backbone_lora_rank=8)):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                config(**overrides)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, checkpoint = model_and_checkpoint(root, num_layers=4)
+            source, _ = source_file(root, count=17)
+            with self.assertRaisesRegex(ValueError, "more backbone layers than the model"):
+                adapt_output_head(model, source, device=torch.device("cpu"), batch_reads=8,
+                    total=65536, base_sha256=sha256_file(checkpoint),
+                    config=config(backbone_layers=6, backbone_lora_rank=8))
         from codec.suffix_lora_adapter import matrix_layout
         layout = matrix_layout(256, 512, [2, 3])
         for rank, expected in ((8, 231424), (16, 460800)):

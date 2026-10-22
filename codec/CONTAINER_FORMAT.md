@@ -155,8 +155,9 @@ readers reject unknown adapter v7 rather than silently using base weights.
 
 Adapter v8 uses `application=replace_head_and_suffix_lora` and
 `protocol=transformer_suffix_qkvo_ffn_rank_major_f64_merge_v1`. Its nested head
-is restricted to v1/v2/v4. The contiguous final 1..4 layer indices, layer count
-and FFN width are bound to the checkpoint architecture. Rank is an integer in
+is restricted to v1/v2/v4. The contiguous final 1..depth layer indices, layer
+count and FFN width are bound to the checkpoint architecture; supported model
+depth is at most 64. Rank is an integer in
 1..16 and `scaling` is exactly integer 1. Canonical matrix descriptors list
 packed QKV (three independent parts), attention output, linear1 and linear2
 in each selected block. Each descriptor includes its base matrix shape.

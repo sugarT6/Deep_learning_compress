@@ -751,7 +751,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-lora-steps", type=int, default=1000, help="maximum extra sequence updates within total budget")
     parser.add_argument("--head-lora-learning-rate", type=float, default=0.0003)
     parser.add_argument("--finetune-last-layers", type=int, default=0,
-                        help="jointly fit this many final Transformer layers, final norm, and head (1..4)")
+                        help="jointly fit this many final Transformer layers, final norm, and head "
+                             "(LoRA: up to model depth, at most 64; dense: 1..4)")
     parser.add_argument("--read-quality-state", action="store_true",
                         help="transmit read mean labels and condition each fitted Transformer block; requires --finetune-last-layers")
     parser.add_argument("--read-state-classes", type=int, choices=(2, 4), default=4,

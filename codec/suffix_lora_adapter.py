@@ -47,7 +47,8 @@ class LowRankWeight(nn.Module):
 def install_suffix_lora(model, layer_count, rank, seed):
     """Training-only parametrizations; original matrices remain frozen."""
     cfg = model.config
-    if (type(layer_count) is not int or not 1 <= layer_count <= min(4, cfg.num_layers)
+    if (type(cfg.num_layers) is not int or not 1 <= cfg.num_layers <= 64
+            or type(layer_count) is not int or not 1 <= layer_count <= cfg.num_layers
             or type(rank) is not int or not 1 <= rank <= 16):
         raise ValueError("invalid suffix LoRA layers or rank")
     layers = list(range(cfg.num_layers - layer_count, cfg.num_layers))
@@ -109,7 +110,8 @@ def _merged_digest(parameters):
 def serialize_suffix_lora(model, layer_count, rank, digest, *, base_model):
     from .head_adapter import ADAPTER_FORMAT, serialize_head
     cfg = model.config
-    if (type(layer_count) is not int or not 1 <= layer_count <= min(4, cfg.num_layers)
+    if (type(cfg.num_layers) is not int or not 1 <= cfg.num_layers <= 64
+            or type(layer_count) is not int or not 1 <= layer_count <= cfg.num_layers
             or type(rank) is not int or not 1 <= rank <= 16):
         raise ValueError("invalid suffix LoRA layers or rank")
     if cfg.to_dict() != base_model.config.to_dict():
@@ -167,7 +169,7 @@ def validate_suffix_lora(meta, dim, digest):
             or type(depth) is not int or not 1 <= depth <= 64
             or type(ff) is not int or not 1 <= ff <= 65536
             or type(rank) is not int or not 1 <= rank <= 16
-            or not isinstance(layers, list) or not 1 <= len(layers) <= min(4, depth)
+            or not isinstance(layers, list) or not 1 <= len(layers) <= depth
             or any(type(i) is not int for i in layers)
             or layers != list(range(depth - len(layers), depth))):
         raise ValueError("invalid suffix LoRA dimensions")

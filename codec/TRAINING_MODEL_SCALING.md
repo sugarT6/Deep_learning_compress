@@ -81,6 +81,95 @@ cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
 python -m codec.train_experiments depth6 --dry-run
 ```
 
-训练完成后以各自 `best.pt` 比较压缩效果。六层、八层模型若要让 LoRA 覆盖全部层，
-后续需要扩展当前最多适配四层的限制；本轮只增加预训练配置，不修改压缩协议。
+训练完成后以各自 `best.pt` 比较压缩效果。LoRA 现已支持覆盖模型全部 Transformer 层，
+包括六层、八层模型；适配器仍使用 v8 协议，dense v7 的最多四层限制保持不变。
 最后仍以 `quality_and_adapter_bytes` 判断实际收益，扩大模型后适配器成本也需要计入。
+
+## 全层 rank8 LoRA 压缩对照（2026-10-22）
+
+下面三个命令可分别在独立终端执行，按空闲 GPU 修改 `CUDA_VISIBLE_DEVICES=0`。
+同样测试 CNR0847462，保持原先输出头 warm-up 2000 步、主干适配上限 10000 步、
+抽样、学习率和随机种子，不加入 read 状态；只把适配层数分别改成 6、8、4。
+每次自动建立独立输出目录，不覆盖末两层对照结果。
+
+“全层 LoRA”覆盖所有 Transformer 层的 Q/K/V/O 和两层 FFN，另训练最终
+LayerNorm 和原输出头；不是 Full 全参数微调。原 cross-layer 输出头继续从
+第 3 个 Transformer block 取特征，不随模型深度调整。
+相同 rank 下增加适配层数会增加适配器预算，因此最终比较含实际适配器的
+`quality_and_adapter_bytes`，原四层末两层 rank8 参考值为 **75,179,664 字节**。
+原四层全层 rank4 的 **74,975,072 字节**可作补充参考，但 rank 和参数预算不同。
+
+A：六层 D256，全部六层 rank8。
+
+```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+TEST_RUN=$(mktemp -d /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/codec/output/CNR0847462_A_depth6_all6_rank8_10k_XXXXXX)
+
+CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
+  /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/data/2nd/CNR0847462_1.head2M.fastq.gz \
+  "$TEST_RUN/CNR0847462.fqdc" \
+  /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/codec/runs/model_scaling_20261021/depth6_s_fnb3se/best.pt \
+  --device cuda --batch-reads 256 --quantizer floor --coder-backend native \
+  --finetune-head --head-type residual --head-residual-dim 64 \
+  --head-cross-layer --head-cross-dim 16 \
+  --head-max-reads 8000 --head-max-symbols 1200000 --head-steps 2000 \
+  --head-max-seconds 0 --head-seed 20260921 \
+  --finetune-last-layers 6 --backbone-lora-rank 8 \
+  --backbone-steps 10000 --backbone-batch-reads 16 \
+  --backbone-learning-rate 0.0003 --backbone-eval-every 200 \
+  --backbone-patience 6 --backbone-max-reads 32000 --backbone-max-symbols 4800000 \
+  --save-head-adapter "$TEST_RUN/head.adapter.json" \
+  > "$TEST_RUN/metrics.json"
+
+cat "$TEST_RUN/metrics.json"
+```
+
+B：八层 D256，全部八层 rank8。
+
+```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+TEST_RUN=$(mktemp -d /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/codec/output/CNR0847462_B_depth8_all8_rank8_10k_XXXXXX)
+
+CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
+  /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/data/2nd/CNR0847462_1.head2M.fastq.gz \
+  "$TEST_RUN/CNR0847462.fqdc" \
+  /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/codec/runs/model_scaling_20261021/depth8_13od_1x1/best.pt \
+  --device cuda --batch-reads 256 --quantizer floor --coder-backend native \
+  --finetune-head --head-type residual --head-residual-dim 64 \
+  --head-cross-layer --head-cross-dim 16 \
+  --head-max-reads 8000 --head-max-symbols 1200000 --head-steps 2000 \
+  --head-max-seconds 0 --head-seed 20260921 \
+  --finetune-last-layers 8 --backbone-lora-rank 8 \
+  --backbone-steps 10000 --backbone-batch-reads 16 \
+  --backbone-learning-rate 0.0003 --backbone-eval-every 200 \
+  --backbone-patience 6 --backbone-max-reads 32000 --backbone-max-symbols 4800000 \
+  --save-head-adapter "$TEST_RUN/head.adapter.json" \
+  > "$TEST_RUN/metrics.json"
+
+cat "$TEST_RUN/metrics.json"
+```
+
+C：四层 D512，全部四层 rank8。
+
+```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+TEST_RUN=$(mktemp -d /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/codec/output/CNR0847462_C_wide512_all4_rank8_10k_XXXXXX)
+
+CUDA_VISIBLE_DEVICES=0 python -m codec.encode \
+  /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/data/2nd/CNR0847462_1.head2M.fastq.gz \
+  "$TEST_RUN/CNR0847462.fqdc" \
+  /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual/codec/runs/model_scaling_20261021/wide512_khuefi70/best.pt \
+  --device cuda --batch-reads 256 --quantizer floor --coder-backend native \
+  --finetune-head --head-type residual --head-residual-dim 64 \
+  --head-cross-layer --head-cross-dim 16 \
+  --head-max-reads 8000 --head-max-symbols 1200000 --head-steps 2000 \
+  --head-max-seconds 0 --head-seed 20260921 \
+  --finetune-last-layers 4 --backbone-lora-rank 8 \
+  --backbone-steps 10000 --backbone-batch-reads 16 \
+  --backbone-learning-rate 0.0003 --backbone-eval-every 200 \
+  --backbone-patience 6 --backbone-max-reads 32000 --backbone-max-symbols 4800000 \
+  --save-head-adapter "$TEST_RUN/head.adapter.json" \
+  > "$TEST_RUN/metrics.json"
+
+cat "$TEST_RUN/metrics.json"
+```

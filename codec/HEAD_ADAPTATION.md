@@ -233,7 +233,9 @@ stage with independent low-rank updates on **Q, K, V, O, FFN linear1 and FFN
 linear2 in each selected block**. This differs from the older `--head-lora`
 experiment, which updates only fourth-block Q/V on the warm-up prefix.
 Do not combine the two modes. Rank is bounded to 1..16; zero (the default)
-retains dense adaptation. Four- and six-layer base models are supported.
+retains dense adaptation. LoRA supports a contiguous suffix of 1..depth blocks,
+including all blocks, for base models up to 64 layers. The dense adapter v7
+continues to allow only 1..4 blocks.
 
 The embeddings, input projection, earlier blocks, selected-block biases and
 selected-block LayerNorm parameters stay frozen. Final encoder LayerNorm and
@@ -242,6 +244,12 @@ all output-head tensors train alongside the factors. Each matrix update is
 normal with standard deviation .02; B starts at zero. Q/K/V have independent
 factors despite sharing PyTorch's packed projection tensor. No new input
 features or Header contents are used.
+
+For all-layer LoRA, set `--finetune-last-layers` equal to the model depth.
+This adapts Q/K/V/O and both FFN matrices throughout the Transformer, together
+with final LayerNorm and the output head; it is not full-parameter fine-tuning.
+Embeddings, base encoder, input projection, block biases and block norms remain
+frozen. The cross-layer head continues to use the existing block-3 feature tap.
 
 The reservoir sample, train/validation split, full-read updates, best-state
 selection, plateau scheduler and always-use policy are identical to the
