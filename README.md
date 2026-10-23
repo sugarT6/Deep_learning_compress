@@ -67,6 +67,12 @@ available for paired comparisons and old files remain decodable. See
 [codec/document/FAST_QUANTIZATION.md](codec/document/FAST_QUANTIZATION.md) for the 2000-update
 compression command, protocol and small-sample timing results.
 
+Every encode also writes a sibling `<output-stem>.predictions.txt` with the
+final adapted model's top-1 accuracy over all quality symbols, followed by
+top-five softmax probabilities for up to the first 1,000 coding positions.
+Correct top-1 predictions end with `yes`. Existing commands need no new flag;
+see [prediction report format](codec/document/PREDICTION_REPORT.md).
+
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
 `k=2,3,4`, complete decoder-known base reads, position/read length, and an
 active mask. `forward_full` performs causal teacher-forced prediction for

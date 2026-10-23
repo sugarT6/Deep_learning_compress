@@ -50,6 +50,7 @@ from .fastq_stream import (
 )
 from .fastq_stream import iter_fastq_batches
 from .model import DirectQualityTransformer, fastq_batch_to_tensors, feature_schema
+from .prediction_report import PredictionReport
 from .online_prior import (
     BOS_QUALITY_ID,
     DEFAULT_ONLINE_PRIOR_CONFIG,
@@ -114,6 +115,9 @@ class EncodeStatistics:
     read_state_stream_bytes: int
     read_state_metadata_bytes: int
     read_state_stream_bits_per_quality: Optional[float]
+    prediction_top1_accuracy: Optional[float]
+    prediction_correct_symbols: int
+    prediction_report_path: str
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -165,6 +169,7 @@ def _quantize_verified_batch(
     report_neural_only_bits: bool = True,
     quantization_version: int = 1,
     read_states: Optional[np.ndarray] = None,
+    prediction_report: Optional[PredictionReport] = None,
 ) -> Tuple[np.ndarray, Any, float, float]:
     """Return cycle-major symbols and CDFs (v1) or low/high/total arrays (v2)."""
 
@@ -187,6 +192,10 @@ def _quantize_verified_batch(
         symbols = np.asarray(batch.qualities[rows, cycles], dtype=np.int64)
         active_logits = full_logits_cpu[rows, cycles]
         _add_timing(timings, "logits_transfer_and_context", stage_started)
+        if prediction_report is not None:
+            stage_started = time.perf_counter()
+            prediction_report.observe(active_logits, symbols)
+            _add_timing(timings, "prediction_diagnostic", stage_started)
         stage_started = time.perf_counter()
         neural_theoretical_bits = (
             logits_symbols_bits(active_logits, symbols) if report_neural_only_bits else 0.0
@@ -288,6 +297,15 @@ def _encode_fastq_compat(
     output_path = Path(output_path)
     checkpoint_path = Path(checkpoint_path)
     _validate_paths(input_path, output_path, checkpoint_path)
+    prediction_report_path = output_path.with_suffix(".predictions.txt")
+    protected_paths = {input_path.resolve(), output_path.resolve(), checkpoint_path.resolve()}
+    for adapter_path in (head_adapter_path, save_head_adapter_path):
+        if adapter_path is not None:
+            protected_paths.add(Path(adapter_path).resolve())
+    if prediction_report_path.resolve() in protected_paths:
+        raise ValueError("prediction report path must be distinct from input, output, checkpoint and adapters")
+    if prediction_report_path.exists() or prediction_report_path.is_symlink():
+        raise FileExistsError(f"{prediction_report_path}: prediction report already exists")
     if type(quantization_version) is not int or quantization_version not in (1, 2):
         raise ValueError("unsupported quantization version")
     if quantization_version == 2 and online_prior_config is not None:
@@ -325,6 +343,8 @@ def _encode_fastq_compat(
         "range_encode": 0.0,
         "range_finalize_and_stage": 0.0,
         "container_write": 0.0,
+        "prediction_diagnostic": 0.0,
+        "prediction_report_write": 0.0,
     }
     stage_started = time.perf_counter()
     checkpoint_sha256 = sha256_file(checkpoint_path)
@@ -390,6 +410,7 @@ def _encode_fastq_compat(
     quality_symbols = 0
     quantized_theoretical_bits = 0.0
     neural_only_theoretical_bits = 0.0
+    prediction_report = PredictionReport()
     online_prior = make_prior_state(online_prior_config) if online_prior_config is not None else None
     progress_bar = None
     if progress and tqdm is not None:
@@ -474,6 +495,7 @@ def _encode_fastq_compat(
                         report_neural_only_bits=report_neural_only_bits,
                         quantization_version=quantization_version,
                         read_states=read_states,
+                        prediction_report=prediction_report,
                     )
                     stage_started = time.perf_counter()
                     if quantization_version == 2:
@@ -508,6 +530,8 @@ def _encode_fastq_compat(
                 raise ContainerError(
                     "range symbol count does not match FASTQ qualities"
                 )
+            if prediction_report.total_symbols != quality_symbols:
+                raise ContainerError("prediction report did not cover every active quality")
 
             metadata = {
                 "format": CONTAINER_FORMAT,
@@ -588,11 +612,15 @@ def _encode_fastq_compat(
                 ) + ((SectionSource("read_state", state_path, state_path.stat().st_size),) if state_enabled else ()),
             )
             _add_timing(timings, "container_write", stage_started)
+            stage_started = time.perf_counter()
+            prediction_report.write(prediction_report_path)
+            _add_timing(timings, "prediction_report_write", stage_started)
     finally:
         if progress_bar is not None:
             progress_bar.close()
 
     input_bytes = input_path.stat().st_size
+    print(f"Prediction report: {prediction_report_path.resolve()}", file=sys.stderr)
     output_bytes = container_info.file_size
     range_stream_bytes = container_info.section("quality_range").length
     state_stream_bytes, state_metadata_bytes = state_container_overhead(container_info)
@@ -661,6 +689,9 @@ def _encode_fastq_compat(
         read_state_stream_bytes=state_stream_bytes,
         read_state_metadata_bytes=state_metadata_bytes,
         read_state_stream_bits_per_quality=(state_stream_bytes * 8 / quality_symbols if quality_symbols else None),
+        prediction_top1_accuracy=prediction_report.accuracy,
+        prediction_correct_symbols=prediction_report.correct_symbols,
+        prediction_report_path=str(prediction_report_path.resolve()),
     )
 
 
@@ -675,7 +706,7 @@ def encode_fastq(
     quantization_version: int = 1,
     coder_backend: str = "auto",
 ) -> EncodeStatistics:
-    """Encode only neural probabilities; legacy experts cannot be selected here."""
+    """Encode neural probabilities and write a sibling .predictions.txt report."""
     return _encode_fastq_compat(
         input_path, output_path, checkpoint_path, device=device, batch_reads=batch_reads,
         quantization_total=quantization_total, progress=progress, verify_cdf=verify_cdf,
@@ -702,6 +733,8 @@ class _NeuralEncoderParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = _NeuralEncoderParser(
         description="Compress plain/gzip FASTQ with pure neural probabilities and optional head fitting",
+        epilog="Also writes <output-stem>.predictions.txt: whole-file top-1 accuracy "
+               "and up to 1,000 positions with top-five probabilities.",
         allow_abbrev=False,
     )
     parser.add_argument("input", type=Path)
