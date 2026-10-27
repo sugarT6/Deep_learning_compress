@@ -329,6 +329,11 @@ def _validate_metadata(
             validate_head_adapter(metadata.get("head_adapter"),
                                   checkpoint["model_config"].get("d_model"), checkpoint["sha256"])
             adapter = metadata["head_adapter"]
+            if adapter.get("version") == 10:
+                from .model import DirectQualityModelConfig
+                from .quality_gru_adapter import feature_dim
+                if adapter["feature_dim"] != feature_dim(DirectQualityModelConfig.from_dict(checkpoint["model_config"])):
+                    raise ValueError("recurrent adapter feature dimension does not match checkpoint architecture")
             if adapter.get("version") in (7, 8, 9) and (
                     adapter["num_layers"] != checkpoint["model_config"].get("num_layers")
                     or adapter["feedforward_dim"] != checkpoint["model_config"].get("feedforward_dim")):

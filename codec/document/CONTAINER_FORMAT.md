@@ -1,5 +1,12 @@
 # Direct-quality FASTQ container format, versions 1–4
 
+Adapter v10 adds a file-specific recurrent quality predictor inside physical
+version 3. It carries all private GRU, normalization and head parameters and
+reuses the exact SHA-bound public input features. Both codec ends use the same
+explicit per-cycle recurrence. See [QUALITY_GRU.md](QUALITY_GRU.md) for its
+strict payload, inference protocol, accounting and bounded verification commands.
+The four-section container and quality-range format are unchanged.
+
 Version 4 adds read quality states: an adapter v9, explicit `read_state`
 metadata, and a fifth packed `read_state` section after `quality_range`:
 one bit per read for two classes, or two bits for four classes. The class count,

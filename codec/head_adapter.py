@@ -182,6 +182,9 @@ def adapter_container_bytes(adapter):
 
 def validate_head_adapter(metadata, d_model, base_sha256):
     """Validate bounded plain data before allocating model tensors; no pickle."""
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 10:
+        from .quality_gru_adapter import validate_quality_gru
+        return validate_quality_gru(metadata, base_sha256)
     if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 9:
         from .read_state import validate_read_state_adapter
         return validate_read_state_adapter(metadata, d_model, base_sha256)
@@ -271,6 +274,16 @@ def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
 
 
 def apply_head_adapter(model, metadata, base_sha256):
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 10:
+        from .quality_gru_adapter import apply_quality_gru
+        return apply_quality_gru(model, metadata, base_sha256)
+    result = _apply_transformer_adapter(model, metadata, base_sha256)
+    if hasattr(model, "quality_gru"):
+        del model.quality_gru
+    return result
+
+
+def _apply_transformer_adapter(model, metadata, base_sha256):
     if isinstance(metadata, dict) and metadata.get("version") == 9:
         from .read_state import apply_read_state_adapter
         return apply_read_state_adapter(model, metadata, base_sha256)
