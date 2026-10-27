@@ -109,6 +109,9 @@ To compare saved base/LoRA/Full models on fresh reads excluded from all fitting
 and selection pools, see the [per-symbol code-length diagnostic](codec/document/CODE_LENGTH_DIAGNOSTIC.md).
 It reports code lengths by cycle, Q, quality transition and file block without
 retraining or complete-file compression.
+Weights-only ordinary/first-order adapter-aware continuation commands, matched
+data accounting and the limits of the short-adaptation validation proxy are in
+[codec/document/TRAINING_ADAPTATION_AB.md](codec/document/TRAINING_ADAPTATION_AB.md).
 
 The earlier 4/6-layer compression-ratio comparison continues the existing 4-layer model
 to 80,000 total updates and trains a 6-layer, 3,297,946-parameter model from
