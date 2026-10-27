@@ -73,6 +73,7 @@ from .probability_quantization import (
 )
 from .range_encoder import RangeEncoder
 from .head_adapter import HeadAdaptationConfig, adapt_output_head, apply_head_adapter, adapter_container_bytes
+from .container import adaptation_metadata_bytes
 from .read_state import StateWriter, classify_reads, label_metadata, state_container_overhead
 
 
@@ -289,10 +290,13 @@ def _encode_fastq_compat(
     save_head_adapter_path: Optional[Path] = None,
     quantization_version: int = 1,
     coder_backend: str = "auto",
+    compress_metadata: bool = False,
 ) -> EncodeStatistics:
     """Shared engine; expert profiles are for historical decoder fixtures only."""
 
     started = time.perf_counter()
+    if type(compress_metadata) is not bool:
+        raise ValueError("compress_metadata must be a boolean")
     input_path = Path(input_path)
     output_path = Path(output_path)
     checkpoint_path = Path(checkpoint_path)
@@ -610,6 +614,7 @@ def _encode_fastq_compat(
                     ),
                     SectionSource("quality_range", quality_path, len(range_stream)),
                 ) + ((SectionSource("read_state", state_path, state_path.stat().st_size),) if state_enabled else ()),
+                compress_metadata=compress_metadata,
             )
             _add_timing(timings, "container_write", stage_started)
             stage_started = time.perf_counter()
@@ -624,6 +629,14 @@ def _encode_fastq_compat(
     output_bytes = container_info.file_size
     range_stream_bytes = container_info.section("quality_range").length
     state_stream_bytes, state_metadata_bytes = state_container_overhead(container_info)
+    if compress_metadata:
+        adapter_bytes, state_metadata_bytes = adaptation_metadata_bytes(container_info.metadata, compressed=True)
+        if adaptation_report is not None:
+            adaptation_report["container_adapter_bytes_uncompressed"] = adaptation_report["container_adapter_bytes"]
+            adaptation_report["container_adapter_bytes"] = adapter_bytes
+            adaptation_report["metadata_encoding"] = "canonical_json_zlib"
+        print(f"Compressed container metadata: {container_info.header_bytes} B; adapter: {adapter_bytes} B",
+              file=sys.stderr)
     if state_stream_bytes or state_metadata_bytes:
         print(f"Read-state labels: {state_stream_bytes} B; framing: {state_metadata_bytes} B; "
               f"class counts: {state_writer.class_counts.tolist()}", file=sys.stderr)
@@ -705,6 +718,7 @@ def encode_fastq(
     save_head_adapter_path: Optional[Path] = None,
     quantization_version: int = 1,
     coder_backend: str = "auto",
+    compress_metadata: bool = False,
 ) -> EncodeStatistics:
     """Encode neural probabilities and write a sibling .predictions.txt report."""
     return _encode_fastq_compat(
@@ -715,6 +729,7 @@ def encode_fastq(
         save_head_adapter_path=save_head_adapter_path,
         quantization_version=quantization_version,
         coder_backend=coder_backend,
+        compress_metadata=compress_metadata,
     )
 
 
@@ -747,6 +762,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="floor: no remainder sorting, variable totals and direct symbol intervals")
     parser.add_argument("--coder-backend", choices=("auto", "python", "native"), default="auto",
                         help="native: require the single-threaded C++ coder; build with python -m codec.build_native")
+    parser.add_argument("--compress-metadata", action="store_true",
+                        help="losslessly compress container metadata, including the saved adapter")
     parser.add_argument(
         "--verify-cdf",
         action="store_true",
@@ -864,6 +881,7 @@ def main() -> int:
             head_adaptation_config=head_config,
             head_adapter_path=args.head_adapter,
             save_head_adapter_path=args.save_head_adapter,
+            compress_metadata=args.compress_metadata,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

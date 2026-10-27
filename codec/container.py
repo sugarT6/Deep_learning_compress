@@ -29,11 +29,12 @@ READ_STATE_CONTAINER_VERSION = 4
 SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION)
 CONTAINER_MAGIC = b"FQDC0001"
 CONTAINER_FLAGS = 0
+METADATA_ZLIB_FLAG = 1
 SECTION_NAMES = ("header_gzip", "base_gzip", "plus_gzip", "quality_range")
 MAX_METADATA_BYTES = 16 << 20
 MAX_FIELD_BYTES = 1 << 32
 
-# magic, version, flags, JSON bytes, CRC32(JSON)
+# magic, version, flags, stored metadata bytes, CRC32(stored metadata)
 _PREFIX = struct.Struct("<8sHHII")
 CONTAINER_PREFIX_BYTES = _PREFIX.size
 
@@ -83,6 +84,7 @@ class ContainerInfo:
     sections: Tuple[SectionInfo, ...]
     header_bytes: int
     file_size: int
+    metadata_compressed: bool = False
 
     def section(self, name: str) -> SectionInfo:
         for section in self.sections:
@@ -178,6 +180,42 @@ def _canonical_metadata(metadata: Mapping[str, Any]) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ContainerError("container metadata is not canonical JSON data") from exc
+
+
+def metadata_payload(metadata: Mapping[str, Any], *, compressed: bool = False) -> bytes:
+    """Serialize bounded canonical metadata with optional lossless transport coding."""
+    if type(compressed) is not bool:
+        raise ContainerError("metadata compression must be a boolean")
+    raw = _canonical_metadata(metadata)
+    if len(raw) > MAX_METADATA_BYTES:
+        raise ContainerError("container metadata exceeds the size limit")
+    payload = zlib.compress(raw, level=9) if compressed else raw
+    if len(payload) > MAX_METADATA_BYTES:
+        raise ContainerError("stored container metadata exceeds the size limit")
+    return payload
+
+
+def adaptation_metadata_bytes(metadata: Mapping[str, Any], *, compressed: bool = False) -> Tuple[int, int]:
+    """Incremental wire bytes for the adapter and read-label metadata.
+
+    Charge the adapter first, then label framing, so their increments telescope
+    exactly even when compression shares information between JSON members.
+    The unchanged prefix and ordinary container metadata are not adapter costs.
+    """
+    without_labels = dict(metadata)
+    if "read_state" in without_labels:
+        without_labels.pop("read_state")
+        without_labels["sections"] = [s for s in metadata["sections"] if s["name"] != "read_state"]
+    baseline = dict(without_labels)
+    baseline.pop("head_adapter", None)
+    if baseline.get("probability_profile", object()) is None:
+        baseline.pop("probability_profile")
+    adapted_size = len(metadata_payload(without_labels, compressed=compressed))
+    adapter = (adapted_size - len(metadata_payload(baseline, compressed=compressed))
+               if "head_adapter" in without_labels else 0)
+    labels = (len(metadata_payload(metadata, compressed=compressed)) - adapted_size
+              if "read_state" in metadata else 0)
+    return adapter, labels
 
 
 def _integer(value: Any, *, name: str, minimum: int = 0) -> int:
@@ -381,6 +419,8 @@ def write_container(
     path: Path,
     metadata: Mapping[str, Any],
     section_sources: Sequence[SectionSource],
+    *,
+    compress_metadata: bool = False,
 ) -> ContainerInfo:
     """Atomically write a validated container from four section files."""
 
@@ -398,13 +438,11 @@ def write_container(
         complete_metadata.get("format_version"), name="format_version"
     )
     _validate_metadata(complete_metadata, physical_version=container_version)
-    metadata_bytes = _canonical_metadata(complete_metadata)
-    if len(metadata_bytes) > MAX_METADATA_BYTES:
-        raise ContainerError("container metadata exceeds the size limit")
+    metadata_bytes = metadata_payload(complete_metadata, compressed=compress_metadata)
     prefix = _PREFIX.pack(
         CONTAINER_MAGIC,
         container_version,
-        CONTAINER_FLAGS,
+        METADATA_ZLIB_FLAG if compress_metadata else CONTAINER_FLAGS,
         len(metadata_bytes),
         zlib.crc32(metadata_bytes) & 0xFFFFFFFF,
     )
@@ -436,6 +474,7 @@ def write_container(
         sections=sections,
         header_bytes=len(prefix) + len(metadata_bytes),
         file_size=output_path.stat().st_size,
+        metadata_compressed=compress_metadata,
     )
 
 
@@ -483,7 +522,7 @@ def read_container(path: Path, *, verify_checksums: bool = True) -> ContainerInf
         magic, version, flags, metadata_length, metadata_crc32 = _PREFIX.unpack(prefix)
         if magic != CONTAINER_MAGIC or version not in SUPPORTED_CONTAINER_VERSIONS:
             raise ContainerError("invalid container magic/version")
-        if flags != CONTAINER_FLAGS:
+        if flags & ~METADATA_ZLIB_FLAG:
             raise ContainerError("unsupported container flags")
         if metadata_length > MAX_METADATA_BYTES:
             raise ContainerError("container metadata length exceeds the size limit")
@@ -492,6 +531,16 @@ def read_container(path: Path, *, verify_checksums: bool = True) -> ContainerInf
             raise TruncatedContainerError("container metadata is truncated")
     if (zlib.crc32(metadata_bytes) & 0xFFFFFFFF) != metadata_crc32:
         raise ContainerIntegrityError("container metadata checksum mismatch")
+    if flags & METADATA_ZLIB_FLAG:
+        try:
+            stream = zlib.decompressobj()
+            metadata_bytes = stream.decompress(metadata_bytes, MAX_METADATA_BYTES + 1)
+        except zlib.error as exc:
+            raise ContainerIntegrityError("invalid compressed container metadata") from exc
+        if len(metadata_bytes) > MAX_METADATA_BYTES or stream.unconsumed_tail:
+            raise ContainerError("decompressed container metadata exceeds the size limit")
+        if not stream.eof or stream.unused_data:
+            raise ContainerIntegrityError("compressed container metadata is incomplete or has trailing data")
     try:
         metadata = json.loads(metadata_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -522,6 +571,7 @@ def read_container(path: Path, *, verify_checksums: bool = True) -> ContainerInf
         sections=sections,
         header_bytes=header_bytes,
         file_size=observed_size,
+        metadata_compressed=bool(flags & METADATA_ZLIB_FLAG),
     )
     if verify_checksums:
         for section in sections:
@@ -683,6 +733,7 @@ __all__ = [
     "LEGACY_CONTAINER_VERSION",
     "CONTAINER_PREFIX_BYTES",
     "CONTAINER_VERSION",
+    "METADATA_ZLIB_FLAG",
     "SUPPORTED_CONTAINER_VERSIONS",
     "ContainerError",
     "ContainerInfo",
@@ -697,4 +748,6 @@ __all__ = [
     "read_container",
     "sha256_file",
     "write_container",
+    "metadata_payload",
+    "adaptation_metadata_bytes",
 ]

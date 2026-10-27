@@ -272,6 +272,9 @@ def state_container_overhead(info):
     """All additional label bytes and JSON framing, alongside adapter cost."""
     if "read_state" not in info.metadata:
         return 0, 0
+    if getattr(info, "metadata_compressed", False):
+        from .container import adaptation_metadata_bytes
+        return info.section("read_state").length, adaptation_metadata_bytes(info.metadata, compressed=True)[1]
     section = next(s for s in info.metadata["sections"] if s["name"] == "read_state")
     member = len(json.dumps({"read_state": info.metadata["read_state"]}, sort_keys=True, separators=(",", ":")).encode()) - 1
     descriptor = len(json.dumps(section, sort_keys=True, separators=(",", ":")).encode()) + 1

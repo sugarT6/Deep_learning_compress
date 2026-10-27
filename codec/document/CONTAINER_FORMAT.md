@@ -35,7 +35,7 @@ All fixed-width integers are little-endian:
 
 ```text
 fixed prefix (20 bytes)
-canonical JSON metadata
+stored metadata (canonical JSON, optionally zlib-compressed)
 header_gzip section
 base_gzip section
 plus_gzip section
@@ -49,18 +49,35 @@ The fixed prefix is:
 |---:|---:|---|
 | 0 | 8 | magic `FQDC0001` |
 | 8 | 2 | format version: 1 legacy, 2 prior, 3 transmitted head, 4 read states |
-| 10 | 2 | flags, currently 0 |
-| 12 | 4 | canonical JSON metadata length |
-| 16 | 4 | CRC32 of the JSON metadata bytes |
+| 10 | 2 | flags: bit 0 means zlib-compressed metadata; all other bits must be zero |
+| 12 | 4 | stored metadata length |
+| 16 | 4 | CRC32 of the stored metadata bytes |
 
 Metadata is UTF-8 JSON serialized with sorted keys and no insignificant
-whitespace. Section offsets are relative to the first byte after metadata, so
+whitespace. The default flag value remains zero and preserves the existing wire
+representation. `encode --compress-metadata` sets bit 0 and stores one zlib
+stream containing exactly those canonical JSON bytes. The CRC covers the stored
+stream, before decompression. Stored and decompressed metadata each have a 16 MiB
+limit; truncated streams, concatenated streams, trailing data, noncanonical JSON,
+and unknown flag bits are rejected. Existing readers that only accept zero flags
+reject compressed metadata; the updated reader accepts both representations for
+container versions 1–4. Adapter schemas and quality-range bytes are unchanged.
+
+Section offsets are relative to the first byte after stored metadata, so
 metadata length cannot recursively change its own offsets. The four sections
 (five for version 4)
 must be contiguous, ordered exactly as above, and consume the remainder of the
 file. Each section entry records its relative offset, compressed/stored byte
 length, logical uncompressed length, and CRC32. Truncation and trailing bytes
 are errors.
+
+For compressed metadata, adapter cost is the stored metadata length minus the
+length obtained after removing `head_adapter` and its null `probability_profile`
+member and recompressing with the same settings. Read-state framing is charged
+after the adapter, as a second incremental length; packed label bytes are charged
+separately. These increments sum to the actual additional stored bytes and avoid
+charging the ordinary container prefix twice. The encoder reports the original
+uncompressed adapter cost separately. See [ADAPTER_COMPACTION.md](ADAPTER_COMPACTION.md).
 
 Metadata records at least:
 
