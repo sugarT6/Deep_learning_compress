@@ -105,6 +105,10 @@ This probability diagnostic records training/validation curves without
 encoding the complete file.
 Completed full-model diagnostic runs can be evaluated with parameter-group
 reversions using [codec/document/ADAPTATION_ABLATION.md](codec/document/ADAPTATION_ABLATION.md).
+To compare saved base/LoRA/Full models on fresh reads excluded from all fitting
+and selection pools, see the [per-symbol code-length diagnostic](codec/document/CODE_LENGTH_DIAGNOSTIC.md).
+It reports code lengths by cycle, Q, quality transition and file block without
+retraining or complete-file compression.
 
 The earlier 4/6-layer compression-ratio comparison continues the existing 4-layer model
 to 80,000 total updates and trains a 6-layer, 3,297,946-parameter model from
