@@ -133,6 +133,7 @@ def run_diagnostic(
     device: torch.device = torch.device("cpu"),
     config: DiagnosticConfig = DiagnosticConfig(),
     progress: bool = True,
+    sample_cache: Optional[Path] = None,
 ):
     if mode not in ("both", "lora", "full"):
         raise ValueError("mode must be both, lora or full")
@@ -142,6 +143,10 @@ def run_diagnostic(
         raise FileNotFoundError(source)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"{output_dir}: choose a new empty diagnostic directory")
+    cached_records, cache_manifest = None, None
+    if sample_cache is not None:
+        from .adaptation_sample import load_sample
+        cached_records, cache_manifest = load_sample(source, sample_cache, config)
     loaded = load_training_checkpoint(checkpoint, device=device)
     model = loaded.model.eval()
     if config.lora_layers > model.config.num_layers:
@@ -156,6 +161,12 @@ def run_diagnostic(
     torch.manual_seed(config.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(config.seed)
+    base_metrics = None
+    if cached_records is not None:
+        base_metrics = score_records(model, cached_records[len(cached_records) * 3 // 4:],
+            device=device, batch_reads=config.eval_batch_reads, source=source,
+            total=config.quantization_total, version=2, quantized=True)
+        _write_json_atomic(output_dir / "base_validation_metrics.json", base_metrics)
     if progress:
         print(f"Diagnostic directory: {output_dir.resolve()}", file=sys.stderr, flush=True)
         print("Stage 1/3: fit the shared output head from the pretrained model", file=sys.stderr, flush=True)
@@ -179,8 +190,14 @@ def run_diagnostic(
     if progress:
         print(f"Shared head: {warmup['reason']}; prefix_reads={warmup['prefix_reads']}",
               file=sys.stderr, flush=True)
-        print("Stage 2/3: scan the FASTQ once for the fixed reservoir sample", file=sys.stderr, flush=True)
-    records, sample = sample_records(source, head_config, warmup["prefix_reads"], float("inf"))
+        print("Stage 2/3: " + ("reuse the frozen reservoir sample" if cached_records is not None
+              else "scan the FASTQ once for the fixed reservoir sample"), file=sys.stderr, flush=True)
+    if cached_records is None:
+        records, sample = sample_records(source, head_config, warmup["prefix_reads"], float("inf"))
+    else:
+        if warmup["prefix_reads"] != cache_manifest["prefix_reads"]:
+            raise ValueError("warm-up prefix does not match frozen sample exclusion")
+        records, sample = cached_records, cache_manifest["sample"]
     after = source.stat()
     if source_identity != {"size_bytes": after.st_size, "mtime_ns": after.st_mtime_ns}:
         raise ValueError("source file changed while preparing diagnostic reads")
@@ -222,6 +239,11 @@ def run_diagnostic(
             "a_negative_result_does_not_establish_an_entropy_or_capacity_limit",
         ],
     }
+    if cache_manifest is not None:
+        manifest["sample_cache"] = {"path": str(Path(sample_cache).resolve()),
+            "manifest_sha256": sha256_file(Path(sample_cache) / "manifest.json"),
+            "records_sha256": cache_manifest["records_sha256"]}
+        manifest["base_validation_metrics"] = base_metrics
     np.savez_compressed(
         output_dir / "split_indices.npz",
         train=np.asarray([r.read_index for r in train], dtype=np.int64),
@@ -269,6 +291,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("both", "lora", "full"), default="both")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--sample-cache", type=Path,
+                        help="reuse a frozen codec.adaptation_sample reservoir instead of rescanning FASTQ")
     for name, field in DiagnosticConfig.__dataclass_fields__.items():
         parser.add_argument("--" + name.replace("_", "-"), type=type(field.default), default=field.default)
     parser.add_argument("--no-progress", action="store_true")
@@ -286,7 +310,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_dir = Path(tempfile.mkdtemp(prefix=f"{args.input.name.split('.')[0]}_{args.mode}_",
                                            dir=args.output_root))
         report = run_diagnostic(args.input, args.checkpoint, output_dir=output_dir,
-                                mode=args.mode, device=device, config=config, progress=not args.no_progress)
+                                mode=args.mode, device=device, config=config, progress=not args.no_progress,
+                                sample_cache=args.sample_cache)
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     print(json.dumps(report, indent=2, sort_keys=True))

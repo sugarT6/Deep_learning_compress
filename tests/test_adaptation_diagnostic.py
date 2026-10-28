@@ -335,6 +335,77 @@ class AdaptationDiagnosticTest(unittest.TestCase):
                 run_diagnostic(source, checkpoint, output_dir=output,
                                config=self.diagnostic_config(), progress=False)
 
+    def test_cached_and_scanned_diagnostics_match_without_second_reservoir_scan(self):
+        from codec.adaptation_sample import prepare_sample, load_sample, content_digest
+        from codec.diagnose_adaptation import run_diagnostic
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = write_source(root)
+            _, checkpoint = tiny_model(root)
+            config = self.diagnostic_config(lora_layers=4)
+            cache = root / "cache"
+            prepared = prepare_sample(source, cache, config)
+            records, manifest = load_sample(source, cache, config)
+            self.assertEqual(content_digest(records), prepared["sample_content_sha256"])
+            self.assertEqual(manifest, prepared)
+            scanned = run_diagnostic(source, checkpoint, output_dir=root / "scan", mode="lora",
+                                     config=config, progress=False)
+            with mock.patch("codec.diagnose_adaptation.sample_records", side_effect=AssertionError("rescan")):
+                cached = run_diagnostic(source, checkpoint, output_dir=root / "cached", mode="lora",
+                                        config=config, progress=False, sample_cache=cache)
+            self.assertEqual(scanned["common_initial"], cached["common_initial"])
+            a, b = scanned["modes"]["lora"], cached["modes"]["lora"]
+            for key in ("selected_metrics", "selected_step", "batch_read_indices_sha256",
+                        "canonical_container_adapter_bytes"):
+                self.assertEqual(a[key], b[key])
+            self.assertGreater(b["canonical_container_adapter_bytes"], 0)
+            scan_manifest = json.loads((root / "scan/manifest.json").read_text())
+            cache_manifest = json.loads((root / "cached/manifest.json").read_text())
+            self.assertEqual(scan_manifest["split"], cache_manifest["split"])
+            self.assertEqual(scan_manifest["warm_model_sha256"], cache_manifest["warm_model_sha256"])
+            self.assertIsNotNone(cache_manifest["base_validation_metrics"]["quantized_bpq"])
+            self.assertFalse(any(root.rglob("*.fqdc")))
+
+    def test_sample_cache_rejects_wrong_config_source_and_corruption_before_model_load(self):
+        from codec.adaptation_sample import prepare_sample, load_sample
+        from codec.diagnose_adaptation import run_diagnostic
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = write_source(root)
+            cache, config = root / "cache", self.diagnostic_config()
+            prepare_sample(source, cache, config)
+            with mock.patch("codec.diagnose_adaptation.load_training_checkpoint", side_effect=AssertionError("load")):
+                with self.assertRaisesRegex(ValueError, "configuration mismatch"):
+                    run_diagnostic(source, root / "missing.pt", output_dir=root / "bad",
+                                   config=replace(config, seed=999), sample_cache=cache, progress=False)
+            with mock.patch("codec.adaptation_sample.sample_records", side_effect=AssertionError("rescan")):
+                with self.assertRaises(FileExistsError):
+                    prepare_sample(source, cache, config)
+            arrays = cache / "records.npz"
+            arrays.write_bytes(arrays.read_bytes() + b"corrupt")
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                load_sample(source, cache, config)
+            source.write_bytes(source.read_bytes() + b"@extra\nA\n+\n!\n")
+            with self.assertRaisesRegex(ValueError, "identity"):
+                load_sample(source, cache, config)
+
+    def test_sample_cache_rejects_overlapping_or_inconsistent_imports(self):
+        from codec.adaptation_sample import prepare_sample, load_sample, save_sample
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, config = write_source(root), self.diagnostic_config()
+            prepare_sample(source, root / "cache", config)
+            records, manifest = load_sample(source, root / "cache", config)
+            with self.assertRaisesRegex(ValueError, "indices"):
+                save_sample(source, root / "overlap", config,
+                            [replace(records[0], read_index=0)] + records[1:], manifest["sample"])
+            with self.assertRaisesRegex(ValueError, "indices"):
+                save_sample(source, root / "duplicate", config,
+                            [records[1]] + records[1:], manifest["sample"])
+            with self.assertRaisesRegex(ValueError, "counts"):
+                save_sample(source, root / "counts", config, records,
+                            dict(manifest["sample"], sampled_symbols=1))
+
     def test_invalid_budgets_and_modes_are_rejected(self):
         from codec.diagnose_adaptation import run_diagnostic
 
