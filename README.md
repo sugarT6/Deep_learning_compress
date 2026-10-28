@@ -113,6 +113,10 @@ Weights-only ordinary/first-order adapter-aware continuation commands, matched
 data accounting and the limits of the short-adaptation validation proxy are in
 [codec/document/TRAINING_ADAPTATION_AB.md](codec/document/TRAINING_ADAPTATION_AB.md).
 
+Four-layer continuation with original versus training-only quality-mode source
+sampling, exact matched loss-token/update budgets and strict recovery is in
+[codec/document/TRAINING_SAMPLING_AB.md](codec/document/TRAINING_SAMPLING_AB.md).
+
 Saved v8 adapters can reduce parameter precision and optionally compress their
 container metadata; see [codec/document/ADAPTER_COMPACTION.md](codec/document/ADAPTER_COMPACTION.md)
 for commands, exact storage accounting, and runtime validation limits.
