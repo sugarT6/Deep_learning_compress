@@ -117,11 +117,6 @@ Saved v8 adapters can reduce parameter precision and optionally compress their
 container metadata; see [codec/document/ADAPTER_COMPACTION.md](codec/document/ADAPTER_COMPACTION.md)
 for commands, exact storage accounting, and runtime validation limits.
 
-Frozen file-specific GRU predictors can also be imported as adapter v10 and
-encoded with the existing range coder. See [codec/document/QUALITY_GRU.md](codec/document/QUALITY_GRU.md)
-for the public feature contract, complete private parameter accounting and
-small-sample encode/decode verification commands.
-
 The earlier 4/6-layer compression-ratio comparison continues the existing 4-layer model
 to 80,000 total updates and trains a 6-layer, 3,297,946-parameter model from
 scratch for 80,000 updates. Both use 40 epochs of 2,000 steps. See the sampler

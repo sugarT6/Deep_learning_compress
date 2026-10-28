@@ -244,8 +244,6 @@ def _decode_quality_batch(
     decoded_symbols = 0
 
     with torch.inference_mode():
-        if hasattr(model, "quality_gru") and maximum_length:
-            state_inputs["quality_state"] = model.begin_quality_batch(bases, lengths, active_mask)
         for cycle in range(maximum_length):
             _synchronize_device(device)
             stage_started = time.perf_counter()
@@ -296,8 +294,7 @@ def _decode_quality_batch(
         if verify_cdf:
             _synchronize_device(device)
             stage_started = time.perf_counter()
-            full_logits = model.forward_full(bases, decoded, lengths, active_mask,
-                **{k: v for k, v in state_inputs.items() if k != "quality_state"})
+            full_logits = model.forward_full(bases, decoded, lengths, active_mask, **state_inputs)
             _synchronize_device(device)
             _add_timing(timings, "model_forward_full_verification", stage_started)
             stage_started = time.perf_counter()

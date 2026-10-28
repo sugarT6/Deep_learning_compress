@@ -234,10 +234,6 @@ def _quantize_verified_batch(
                         and np.array_equal(encoded[2], cdfs[:, -1])):
                     raise CodecDeterminismError("direct interval/full CDF mismatch")
             offset = 0
-            step_inputs = dict(state_inputs)
-            if hasattr(model, "quality_gru") and batch.max_read_length:
-                step_inputs["quality_state"] = model.begin_quality_batch(
-                    tensors["bases"], tensors["lengths"], tensors["active_mask"])
             for cycle in range(batch.max_read_length):
                 _synchronize_device(device)
                 stage_started = time.perf_counter()
@@ -246,7 +242,7 @@ def _quantize_verified_batch(
                     tensors["qualities"][:, :cycle],
                     tensors["lengths"],
                     tensors["active_mask"],
-                    **step_inputs,
+                    **state_inputs,
                 )
                 _synchronize_device(device)
                 _add_timing(

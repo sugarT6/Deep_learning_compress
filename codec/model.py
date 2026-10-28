@@ -664,23 +664,6 @@ class DirectQualityTransformer(nn.Module):
         distance = query - key
         return (distance < 0) | (distance >= self.config.context_length)
 
-    def _quality_input_features(self, bases, qualities, lengths, active_mask, *,
-                                base_features=None, position_features=None):
-        """Public, decoder-available inputs before the Transformer projection."""
-        prev_q, qmer_tokens = build_quality_history_tokens(qualities)
-        pieces = [self.prev_q_embedding(prev_q)]
-        pieces.extend(embedding(tokens) for embedding, tokens in zip(self.qmer_embeddings, qmer_tokens))
-        if base_features is None:
-            base_features = self.base_encoder(bases, active_mask)
-        pieces.append(base_features)
-        if position_features is None:
-            position_features = self._position_features(lengths, active_mask)
-        pieces.append(position_features)
-        if self.config.quality_prefix_features:
-            pieces.append(build_quality_prefix_features(
-                qualities, active_mask, self.config.position_length_scale))
-        return torch.cat(pieces, dim=-1), position_features
-
     def _hidden_impl(
         self,
         bases: torch.Tensor,
@@ -700,8 +683,22 @@ class DirectQualityTransformer(nn.Module):
             return self.output_head.weight.new_empty(
                 (bases.shape[0], 0, self.config.d_model)
             )
-        features, position_features = self._quality_input_features(bases, qualities, lengths, active_mask)
-        hidden = self.input_projection(features)
+        prev_q, qmer_tokens = build_quality_history_tokens(qualities)
+        pieces = [self.prev_q_embedding(prev_q)]
+        pieces.extend(
+            embedding(tokens)
+            for embedding, tokens in zip(self.qmer_embeddings, qmer_tokens)
+        )
+        pieces.append(self.base_encoder(bases, active_mask))
+        position_features = self._position_features(lengths, active_mask)
+        pieces.append(position_features)
+        if self.config.quality_prefix_features:
+            pieces.append(
+                build_quality_prefix_features(
+                    qualities, active_mask, self.config.position_length_scale
+                )
+            )
+        hidden = self.input_projection(torch.cat(pieces, dim=-1))
 
         # Active positions are a contiguous prefix of every read. A causal
         # query at an active cycle can therefore see only active keys, so a
@@ -745,14 +742,6 @@ class DirectQualityTransformer(nn.Module):
             raise ValueError(f"conditioned inference requires one read-state ID in [0, {class_count - 1}] per read")
 
     def _forward_impl(self, bases, qualities, lengths, active_mask, read_states=None):
-        if hasattr(self, "quality_gru"):
-            if read_states is not None:
-                raise ValueError("recurrent quality adapters do not accept read-state labels")
-            if bases.shape[1] == 0:
-                return self.quality_gru.head.weight.new_empty((bases.shape[0], 0, 42))
-            features, _ = self._quality_input_features(bases, qualities, lengths, active_mask)
-            logits = self.quality_gru(features)
-            return logits * active_mask.unsqueeze(-1).to(logits.dtype)
         hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask, read_states)
                   if isinstance(self.output_head, CrossLayerOutputHead)
                   else self._hidden_impl(bases, qualities, lengths, active_mask, read_states))
@@ -761,8 +750,6 @@ class DirectQualityTransformer(nn.Module):
 
     def forward_features(self, bases, qualities, lengths, active_mask, read_states=None):
         """Return causal output-head inputs, for frozen-feature adaptation only."""
-        if hasattr(self, "quality_gru"):
-            raise ValueError("Transformer feature adaptation requires a model without a recurrent adapter")
         self._validate_common_inputs(bases, lengths, active_mask)
         if qualities.shape != bases.shape:
             raise ValueError("qualities must have the same shape as bases")
@@ -770,8 +757,6 @@ class DirectQualityTransformer(nn.Module):
         return self._hidden_impl(bases, qualities, lengths, active_mask, read_states)
 
     def forward_cross_layer_features(self, bases, qualities, lengths, active_mask, read_states=None):
-        if hasattr(self, "quality_gru"):
-            raise ValueError("Transformer feature adaptation requires a model without a recurrent adapter")
         self._validate_common_inputs(bases, lengths, active_mask)
         if qualities.shape != bases.shape:
             raise ValueError("qualities must have the same shape as bases")
@@ -815,13 +800,6 @@ class DirectQualityTransformer(nn.Module):
         _validate_target_values(qualities, active_mask, name="qualities")
         return self._forward_impl(bases, qualities, lengths, active_mask, read_states)
 
-    def begin_quality_batch(self, bases, lengths, active_mask):
-        """Create optional decoder-owned recurrent state for this immutable batch."""
-        self._validate_common_inputs(bases, lengths, active_mask)
-        if not hasattr(self, "quality_gru"):
-            raise ValueError("batch recurrent state requires a recurrent quality adapter")
-        return self.quality_gru.begin_batch(self, bases, lengths, active_mask)
-
     def forward_step(
         self,
         bases: torch.Tensor,
@@ -829,14 +807,13 @@ class DirectQualityTransformer(nn.Module):
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
         read_states: Optional[torch.Tensor] = None,
-        *,
-        quality_state=None,
     ) -> torch.Tensor:
         """Predict one cycle from already-decoded quality history.
 
-        Transformer inference recomputes the full padded sequence. A recurrent
-        adapter can instead use decoder-owned ``quality_state`` to advance its
-        hidden state once, keeping the full batch shape used by the encoder.
+        The first implementation deliberately recomputes the full padded
+        sequence.  Keeping the same tensor shape and masks as ``forward_full``
+        makes their eval-mode outputs directly comparable before a future KV
+        cache optimization is attempted.
         """
 
         self._validate_common_inputs(bases, lengths, active_mask)
@@ -847,11 +824,6 @@ class DirectQualityTransformer(nn.Module):
             raise ValueError("quality prefix already covers the padded sequence")
         prefix_mask = active_mask[:, :cycle]
         _validate_target_values(quality_prefix, prefix_mask, name="quality_prefix")
-        if quality_state is not None:
-            if not hasattr(self, "quality_gru") or read_states is not None:
-                raise ValueError("recurrent state requires an unlabelled recurrent quality adapter")
-            logits = self.quality_gru.step(self, bases, quality_prefix, lengths, active_mask, quality_state)
-            return logits * active_mask[:, cycle:cycle + 1].to(logits.dtype)
         qualities = torch.full_like(bases, QUALITY_PAD_ID)
         qualities[:, :cycle] = quality_prefix
         logits = self._forward_impl(bases, qualities, lengths, active_mask, read_states)
