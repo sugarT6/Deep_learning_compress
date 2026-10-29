@@ -26,7 +26,7 @@ from torch.nn.utils import parametrize
 
 from .backbone_adapter import _tensors
 from .encode_fastpath import selected_quantized_bits
-from .head_adapter import apply_head_adapter, adapter_container_bytes
+from .head_adapter import apply_head_adapter
 from .probability_quantization import logits_to_cdfs, validate_total
 from .suffix_lora_adapter import install_suffix_lora, serialize_suffix_lora
 from .training_control import TrainingControl, TrainingControlConfig
@@ -401,7 +401,6 @@ def fit_branch(warm_model, train_records, validation_records, train_probe_record
         "history_path": str(history_path.resolve()),
         "checkpoint_path": str(checkpoint_path.resolve()),
         "adapter_path": str(adapter_path.resolve()) if adapter is not None else None,
-        "canonical_container_adapter_bytes": adapter_container_bytes(adapter) if adapter is not None else None,
         "wire_parameterization": wire_parameterization, "settings": settings,
         "stopped_early": stopped_early,
         "optimization_and_evaluation_seconds": optimization_and_evaluation_seconds,
