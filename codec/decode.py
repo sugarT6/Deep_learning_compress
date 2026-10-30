@@ -30,6 +30,7 @@ from .container import (
     CONTAINER_VERSION,
     ADAPTED_CONTAINER_VERSION,
     READ_STATE_CONTAINER_VERSION,
+    RANK_CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
     ContainerError,
     ContainerIntegrityError,
@@ -44,6 +45,7 @@ from .encode import (
     _synchronize_device,
     choose_device,
 )
+from .rank_coding import quality_order, validate_rank_metadata
 from .fastq_stream import (
     BASE_PAD_ID,
     DEFAULT_BATCH_READS,
@@ -109,7 +111,7 @@ def _validate_codec_metadata(
     if metadata["format"] != CONTAINER_FORMAT:
         raise ContainerError("unsupported container format")
     format_version = int(metadata["format_version"])
-    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION):
+    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION):
         raise ContainerError("unsupported container version")
     stored_batch_reads = int(metadata["batch_reads"])
     if batch_reads != stored_batch_reads:
@@ -140,7 +142,7 @@ def _validate_codec_metadata(
     if metadata["inference_runtime"]["dtype"] != "float32":
         raise ContainerError("unsupported model inference dtype")
     probability_profile = metadata.get("probability_profile")
-    if format_version == LEGACY_CONTAINER_VERSION or (format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION) and probability_profile is None):
+    if format_version == LEGACY_CONTAINER_VERSION or (format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION) and probability_profile is None):
         if probability_profile is not None:
             raise ContainerError("legacy container unexpectedly declares a prior")
         online_prior_config = None
@@ -178,7 +180,8 @@ def _validate_checkpoint(
     if feature_schema(loaded.model.config) != checkpoint_metadata["feature_schema"]:
         raise ModelMismatchError("checkpoint feature schema does not match container")
     loaded.model.eval()
-    if metadata["format_version"] in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION):
+    if metadata["format_version"] in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION) or (
+            metadata["format_version"] == RANK_CONTAINER_VERSION and "head_adapter" in metadata):
         from .head_adapter import apply_head_adapter
         apply_head_adapter(loaded.model, metadata["head_adapter"], observed_hash)
     return loaded.model
@@ -219,6 +222,7 @@ def _decode_quality_batch(
     online_prior: OnlinePriorState | MixturePriorState | None,
     quantization_version: int = 1,
     read_states: np.ndarray | None = None,
+    rank_cdf: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, int]:
     stage_started = time.perf_counter()
     bases, lengths, active_mask = _batch_tensors(base_records, device)
@@ -273,9 +277,16 @@ def _decode_quality_batch(
             _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
 
             stage_started = time.perf_counter()
-            cycle_symbols = range_decoder.decode_prevalidated_batch(
-                cycle_cdfs, total=quantization_total if quantization_version == 1 else None
-            )
+            if rank_cdf is None:
+                cycle_symbols = range_decoder.decode_prevalidated_batch(
+                    cycle_cdfs, total=quantization_total if quantization_version == 1 else None
+                )
+            else:
+                order = quality_order(cycle_cdfs)
+                ranks = range_decoder.decode_prevalidated_batch(
+                    np.broadcast_to(rank_cdf, (active_rows.size, rank_cdf.size)),
+                    total=int(rank_cdf[-1]))
+                cycle_symbols = order[np.arange(active_rows.size), ranks]
             if isinstance(online_prior, AdaptivePriorState):
                 online_prior.observe_symbols(np.asarray(cycle_symbols, dtype=np.int64))
             active_rows_tensor = torch.as_tensor(
@@ -396,6 +407,9 @@ def _decode_to_handle(
     online_prior_config: OnlinePriorConfig | MixturePriorConfig | None,
 ) -> Tuple[int, int, str]:
     metadata = container_info.metadata
+    rank_cdf = (validate_rank_metadata(metadata["rank_encoding"], quantization_total,
+                                      int(metadata["quality_symbol_count"]))
+                if metadata["format_version"] == RANK_CONTAINER_VERSION else None)
     read_count = int(metadata["read_count"])
     reconstructed_digest = hashlib.sha256()
     reconstructed_size = 0
@@ -471,6 +485,7 @@ def _decode_to_handle(
                 online_prior=online_prior,
                 quantization_version=int(metadata["probability_quantization"]["version"]),
                 read_states=state_reader.read(current_batch_reads) if state_reader else None,
+                rank_cdf=rank_cdf,
             )
             decoded_symbols += batch_symbols
             stage_started = time.perf_counter()

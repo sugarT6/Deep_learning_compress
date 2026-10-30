@@ -26,7 +26,8 @@ LEGACY_CONTAINER_VERSION = 1
 CONTAINER_VERSION = 2
 ADAPTED_CONTAINER_VERSION = 3
 READ_STATE_CONTAINER_VERSION = 4
-SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION)
+RANK_CONTAINER_VERSION = 5
+SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION)
 CONTAINER_MAGIC = b"FQDC0001"
 CONTAINER_FLAGS = 0
 METADATA_ZLIB_FLAG = 1
@@ -321,7 +322,19 @@ def _validate_metadata(
     _integer(quantization.get("phred_offset"), name="phred_offset")
 
     probability_profile = metadata.get("probability_profile")
-    if format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION):
+    if format_version == RANK_CONTAINER_VERSION:
+        try:
+            from .rank_coding import validate_rank_metadata
+            validate_rank_metadata(metadata.get("rank_encoding"), quantization["total"],
+                                   metadata["quality_symbol_count"])
+        except ValueError as exc:
+            raise ContainerError(f"invalid rank_encoding: {exc}") from exc
+        if probability_profile is not None or "read_state" in metadata:
+            raise ContainerError("rank coding requires neural-only probabilities without read-state labels")
+    elif "rank_encoding" in metadata:
+        raise ContainerError("rank_encoding requires container version 5")
+    if format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION) or (
+            format_version == RANK_CONTAINER_VERSION and "head_adapter" in metadata):
         if "probability_profile" not in metadata:
             raise ContainerError("version-3 requires explicit probability_profile (null for neural-only)")
         try:
@@ -348,7 +361,7 @@ def _validate_metadata(
         except ValueError as exc:
             raise ContainerError(f"invalid head_adapter: {exc}") from exc
     elif "head_adapter" in metadata:
-        raise ContainerError("head_adapter requires container version 3 or 4")
+        raise ContainerError("head_adapter requires container version 3, 4 or 5")
     if format_version != READ_STATE_CONTAINER_VERSION and "read_state" in metadata:
         raise ContainerError("read_state requires container version 4")
     if format_version == LEGACY_CONTAINER_VERSION:

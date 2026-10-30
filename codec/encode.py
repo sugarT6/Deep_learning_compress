@@ -33,6 +33,7 @@ from .container import (
     CONTAINER_VERSION,
     ADAPTED_CONTAINER_VERSION,
     READ_STATE_CONTAINER_VERSION,
+    RANK_CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
     ContainerError,
     SectionSource,
@@ -75,6 +76,7 @@ from .range_encoder import RangeEncoder
 from .head_adapter import HeadAdaptationConfig, adapt_output_head, apply_head_adapter, adapter_container_bytes
 from .container import adaptation_metadata_bytes
 from .read_state import StateWriter, classify_reads, label_metadata, state_container_overhead
+from .rank_coding import ranks_from_cdfs, make_rank_metadata, validate_rank_metadata, global_rank_bits
 
 
 SUPPORTED_INPUT_SUFFIXES = SUPPORTED_FASTQ_SUFFIXES
@@ -119,6 +121,10 @@ class EncodeStatistics:
     prediction_top1_accuracy: Optional[float]
     prediction_correct_symbols: int
     prediction_report_path: str
+    quality_coding: str = "neural"
+    rank_histogram: Optional[list] = None
+    rank_table_bytes: int = 0
+    original_quantized_theoretical_bits: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -171,6 +177,7 @@ def _quantize_verified_batch(
     quantization_version: int = 1,
     read_states: Optional[np.ndarray] = None,
     prediction_report: Optional[PredictionReport] = None,
+    rank_coding: bool = False,
 ) -> Tuple[np.ndarray, Any, float, float]:
     """Return cycle-major symbols and CDFs (v1) or low/high/total arrays (v2)."""
 
@@ -216,18 +223,21 @@ def _quantize_verified_batch(
             fused_logits = fuse_batch_logits(online_prior, active_logits, previous, cycles)
         _add_timing(timings, "prior_fusion", stage_started)
         stage_started = time.perf_counter()
-        encoded = (logits_to_intervals(fused_logits, symbols, total=total) if quantization_version == 2
-                   else logits_to_cdfs(fused_logits, total=total))
+        encoded = (logits_to_intervals(fused_logits, symbols, total=total)
+                   if quantization_version == 2 and not rank_coding
+                   else logits_to_cdfs(fused_logits, total=total, version=quantization_version))
         _add_timing(timings, "cdf_quantization", stage_started)
         stage_started = time.perf_counter()
         theoretical_bits = (float(-np.log2((encoded[1]-encoded[0]).astype(np.float64)/encoded[2]).sum())
-                            if quantization_version == 2 else selected_quantized_bits(symbols, encoded, total))
+                            if quantization_version == 2 and not rank_coding
+                            else selected_quantized_bits(symbols, encoded,
+                                encoded[:, -1] if quantization_version == 2 else total))
         _add_timing(timings, "quantized_bits", stage_started)
 
         if verify_cdf:
             cdfs = (logits_to_cdfs(fused_logits, total=total, version=2)
-                    if quantization_version == 2 else encoded)
-            if quantization_version == 2:
+                    if quantization_version == 2 and not rank_coding else encoded)
+            if quantization_version == 2 and not rank_coding:
                 indices = np.arange(symbols.size)
                 if not (np.array_equal(encoded[0], cdfs[indices, symbols])
                         and np.array_equal(encoded[1], cdfs[indices, symbols+1])
@@ -291,10 +301,18 @@ def _encode_fastq_compat(
     quantization_version: int = 1,
     coder_backend: str = "auto",
     compress_metadata: bool = False,
+    quality_coding: str = "neural",
 ) -> EncodeStatistics:
     """Shared engine; expert profiles are for historical decoder fixtures only."""
 
     started = time.perf_counter()
+    if quality_coding not in ("neural", "rank"):
+        raise ValueError("quality_coding must be neural or rank")
+    use_rank = quality_coding == "rank"
+    if use_rank and online_prior_config is not None:
+        raise ValueError("rank coding does not support historical probability profiles")
+    if use_rank and head_adaptation_config is not None and head_adaptation_config.read_quality_state:
+        raise ValueError("rank coding does not support read-state adapters")
     if type(compress_metadata) is not bool:
         raise ValueError("compress_metadata must be a boolean")
     input_path = Path(input_path)
@@ -415,6 +433,9 @@ def _encode_fastq_compat(
     quantized_theoretical_bits = 0.0
     neural_only_theoretical_bits = 0.0
     prediction_report = PredictionReport()
+    rank_counts = np.zeros(QUALITY_ALPHABET_SIZE, dtype=np.int64)
+    rank_metadata = None
+    original_quantized_bits = 0.0
     online_prior = make_prior_state(online_prior_config) if online_prior_config is not None else None
     progress_bar = None
     if progress and tqdm is not None:
@@ -431,6 +452,8 @@ def _encode_fastq_compat(
             quality_path = temporary_root / "quality.range"
             state_path = temporary_root / "read_state.bin"
             state_enabled = hasattr(model, "read_state_conditioning")
+            if use_rank and state_enabled:
+                raise ValueError("rank coding does not support read-state adapters")
             if state_enabled and online_prior_config is not None:
                 raise ValueError("read-state encoding requires neural-only probabilities")
 
@@ -440,7 +463,7 @@ def _encode_fastq_compat(
                 base_path, "base", compresslevel=GZIP_COMPRESSLEVEL
             ) as base_writer, SideStreamWriter(
                 plus_path, "plus", compresslevel=GZIP_COMPRESSLEVEL
-            ) as plus_writer, state_path.open("wb") as state_handle:
+            ) as plus_writer, state_path.open("wb") as state_handle, (temporary_root / "ranks.u1").open("wb") as rank_spool:
                 state_writer = (StateWriter(state_handle,
                     class_count=model.read_state_conditioning.class_count) if state_enabled else None)
                 batch_iterator = iter_fastq_batches(
@@ -500,9 +523,14 @@ def _encode_fastq_compat(
                         quantization_version=quantization_version,
                         read_states=read_states,
                         prediction_report=prediction_report,
+                        rank_coding=use_rank,
                     )
                     stage_started = time.perf_counter()
-                    if quantization_version == 2:
+                    if use_rank:
+                        ranks = ranks_from_cdfs(cdfs, symbols)
+                        rank_spool.write(ranks.tobytes())
+                        rank_counts += np.bincount(ranks, minlength=QUALITY_ALPHABET_SIZE)
+                    elif quantization_version == 2:
                         range_encoder.encode_prevalidated_intervals(*cdfs)
                     else:
                         range_encoder.encode_prevalidated_batch(symbols, cdfs, total=quantization_total)
@@ -527,6 +555,29 @@ def _encode_fastq_compat(
                     state_writer.finish()
 
             stage_started = time.perf_counter()
+            if use_rank:
+                original_quantized_bits = quantized_theoretical_bits
+                rank_metadata = make_rank_metadata(rank_counts.tolist(), quantization_total)
+                rank_cdf = validate_rank_metadata(rank_metadata, quantization_total, quality_symbols)
+                quantized_theoretical_bits = global_rank_bits(rank_counts, rank_cdf)
+                print("Rank coding: fixed global histogram; encoding temporary rank stream", file=sys.stderr)
+                with (temporary_root / "ranks.u1").open("rb") as handle:
+                    rank_progress = (tqdm(total=quality_symbols, desc="encode ranks", unit="Q")
+                                     if progress and tqdm is not None else None)
+                    try:
+                        while True:
+                            chunk = handle.read(1 << 20)
+                            if not chunk:
+                                break
+                            ranks = np.frombuffer(chunk, dtype=np.uint8).astype(np.int64)
+                            range_encoder.encode_prevalidated_intervals(
+                                rank_cdf[ranks], rank_cdf[ranks + 1],
+                                np.full(ranks.size, quantization_total, dtype=np.int64))
+                            if rank_progress is not None:
+                                rank_progress.update(ranks.size)
+                    finally:
+                        if rank_progress is not None:
+                            rank_progress.close()
             range_stream = range_encoder.finish()
             quality_path.write_bytes(range_stream)
             _add_timing(timings, "range_finalize_and_stage", stage_started)
@@ -598,6 +649,9 @@ def _encode_fastq_compat(
                 if state_writer.count != read_count:
                     raise ContainerError("read-state label count does not match FASTQ reads")
                 adaptation_report["read_state_class_counts"] = state_writer.class_counts.tolist()
+            if use_rank:
+                metadata["format_version"] = RANK_CONTAINER_VERSION
+                metadata["rank_encoding"] = rank_metadata
             stage_started = time.perf_counter()
             container_info = write_container(
                 output_path,
@@ -628,6 +682,17 @@ def _encode_fastq_compat(
     print(f"Prediction report: {prediction_report_path.resolve()}", file=sys.stderr)
     output_bytes = container_info.file_size
     range_stream_bytes = container_info.section("quality_range").length
+    rank_table_bytes = 0
+    if use_rank:
+        from .container import metadata_payload
+        rank_baseline = dict(container_info.metadata)
+        rank_baseline.pop("head_adapter", None)
+        if rank_baseline.get("probability_profile", object()) is None:
+            rank_baseline.pop("probability_profile")
+        without_rank = dict(rank_baseline)
+        without_rank.pop("rank_encoding")
+        rank_table_bytes = (len(metadata_payload(rank_baseline, compressed=compress_metadata))
+                            - len(metadata_payload(without_rank, compressed=compress_metadata)))
     state_stream_bytes, state_metadata_bytes = state_container_overhead(container_info)
     if compress_metadata:
         adapter_bytes, state_metadata_bytes = adaptation_metadata_bytes(container_info.metadata, compressed=True)
@@ -697,7 +762,7 @@ def _encode_fastq_compat(
         head_adaptation=adaptation_report,
         quality_and_adapter_bytes=range_stream_bytes + (
             adaptation_report["container_adapter_bytes"] if adaptation_report else 0)
-            + state_stream_bytes + state_metadata_bytes,
+            + state_stream_bytes + state_metadata_bytes + rank_table_bytes,
         coder_backend=range_encoder.backend,
         read_state_stream_bytes=state_stream_bytes,
         read_state_metadata_bytes=state_metadata_bytes,
@@ -705,6 +770,10 @@ def _encode_fastq_compat(
         prediction_top1_accuracy=prediction_report.accuracy,
         prediction_correct_symbols=prediction_report.correct_symbols,
         prediction_report_path=str(prediction_report_path.resolve()),
+        quality_coding=quality_coding,
+        rank_histogram=rank_counts.tolist() if use_rank else None,
+        rank_table_bytes=rank_table_bytes,
+        original_quantized_theoretical_bits=original_quantized_bits if use_rank else None,
     )
 
 
@@ -719,6 +788,7 @@ def encode_fastq(
     quantization_version: int = 1,
     coder_backend: str = "auto",
     compress_metadata: bool = False,
+    quality_coding: str = "neural",
 ) -> EncodeStatistics:
     """Encode neural probabilities and write a sibling .predictions.txt report."""
     return _encode_fastq_compat(
@@ -730,6 +800,7 @@ def encode_fastq(
         quantization_version=quantization_version,
         coder_backend=coder_backend,
         compress_metadata=compress_metadata,
+        quality_coding=quality_coding,
     )
 
 
@@ -756,6 +827,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("output", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--quality-coding", choices=("neural", "rank"), default="neural",
+                        help="rank: encode neural probability ranks using one transmitted whole-file histogram")
     parser.add_argument("--batch-reads", type=int, default=DEFAULT_BATCH_READS)
     parser.add_argument("--quantization-total", type=int, default=TOTAL)
     parser.add_argument("--quantizer", choices=("largest-remainder", "floor"), default="largest-remainder",
@@ -882,6 +955,7 @@ def main() -> int:
             head_adapter_path=args.head_adapter,
             save_head_adapter_path=args.save_head_adapter,
             compress_metadata=args.compress_metadata,
+            quality_coding=args.quality_coding,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
