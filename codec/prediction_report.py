@@ -1,7 +1,8 @@
 """Bounded diagnostic text reports for the quality model's predictions.
 
-The first line reports top-1 accuracy over every observed quality symbol.  The
-remaining lines show the five largest *unquantized* softmax probabilities for
+The first line reports top-1 accuracy over every observed quality symbol. Four
+lines then report the fractions at ranks 1, 2, 3 and all remaining ranks.
+The remaining lines show the five largest *unquantized* softmax probabilities for
 at most the first 1,000 positions, in the order supplied by the encoder.  These
 sampled lines are a preview, rather than a representative accuracy estimate.
 Quality values are numeric Phred values Q0--Q41, not FASTQ ASCII characters.
@@ -27,7 +28,9 @@ class PredictionReport:
     order, before probability quantization.  Only the preview is limited by
     ``max_positions``; ``correct``, ``total``, and ``accuracy`` always include
     every observed symbol.  ``accuracy`` is a fraction, or ``None`` for an
-    empty stream.  Exact score ties choose the smaller quality value first.
+    empty stream. Rank fractions use the whole stream, not the bounded preview;
+    ranks are one-based and mutually exclusive. Exact score ties choose the
+    smaller quality value first.
     Neither logits nor symbols are modified or retained.
     """
 
@@ -45,6 +48,7 @@ class PredictionReport:
         self._max_positions = normalized_max
         self._correct = 0
         self._total = 0
+        self._rank_counts = np.zeros(4, dtype=np.int64)
         self._preview_lines: List[str] = []
 
     @property
@@ -74,8 +78,9 @@ class PredictionReport:
     def observe(self, logits: np.ndarray, symbols: np.ndarray) -> None:
         """Observe ``[N, 42]`` logits and ``[N]`` integer true qualities.
 
-        All values are validated before any accumulated counts change.  The
-        preview uses float64 stable softmax; later batches need only argmax.
+        All values are validated before any accumulated counts change.
+        The preview uses float64 stable softmax. Whole-stream ranks are computed
+        by comparing scores directly; no full softmax or sorting is required.
         """
 
         scores = np.asarray(logits)
@@ -95,8 +100,15 @@ class PredictionReport:
         if not len(observed):
             return
 
-        predicted = scores.argmax(axis=1)
-        correct = predicted == observed
+        true_scores = scores[np.arange(len(observed)), observed, None]
+        rank_indices = np.count_nonzero(scores > true_scores, axis=1)
+        rank_indices += np.count_nonzero(
+            (scores == true_scores)
+            & (np.arange(QUALITY_ALPHABET_SIZE)[None, :] < observed[:, None]),
+            axis=1,
+        )
+        rank_counts = np.bincount(np.minimum(rank_indices, 3), minlength=4)
+        correct = rank_indices == 0
         preview_count = min(
             self._max_positions - len(self._preview_lines), len(observed)
         )
@@ -124,6 +136,7 @@ class PredictionReport:
 
         self._correct += int(np.count_nonzero(correct))
         self._total += len(observed)
+        self._rank_counts += rank_counts
         self._preview_lines.extend(new_lines)
 
     def write(self, path: Union[str, Path]) -> None:
@@ -143,6 +156,10 @@ class PredictionReport:
                     f"prediction_accuracy={value} "
                     f"correct={self._correct} total={self._total}\n"
                 )
+                for label, count in zip(("rank1", "rank2", "rank3", "rank其它"),
+                                        self._rank_counts):
+                    proportion = f"{100.0 * (int(count) / self._total):.6f}%" if self._total else "N/A"
+                    stream.write(f"{label} {proportion}\n")
                 for line in self._preview_lines:
                     stream.write(line + "\n")
         except BaseException:

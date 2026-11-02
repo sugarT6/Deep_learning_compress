@@ -92,7 +92,7 @@ class PredictionReportIntegrationTest(unittest.TestCase):
         report = output.with_suffix(".predictions.txt")
         self.assertEqual(statistics.prediction_report_path, str(report.resolve()))
         lines = report.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 1 + min(1000, len(symbols)))
+        self.assertEqual(len(lines), 5 + min(1000, len(symbols)))
         header = re.fullmatch(r"prediction_accuracy=(\S+) correct=(\d+) total=(\d+)", lines[0])
         self.assertIsNotNone(header, lines[0])
         correct = int((probabilities.argmax(axis=1) == symbols).sum()) if len(symbols) else 0
@@ -105,7 +105,20 @@ class PredictionReportIntegrationTest(unittest.TestCase):
         else:
             self.assertEqual(header[1], "N/A")
             self.assertIsNone(statistics.prediction_top1_accuracy)
-        for index, line in enumerate(lines[1:]):
+        if len(symbols):
+            order = np.argsort(-probabilities, axis=1, kind="stable")
+            ranks = np.nonzero(order == symbols[:, None])[1]
+            counts = [int((ranks == rank).sum()) for rank in range(3)]
+            counts.append(int((ranks >= 3).sum()))
+            self.assertEqual(sum(counts), len(symbols))
+            self.assertEqual(counts[0], correct)
+            self.assertEqual(lines[1:5], [
+                f"{label} {count / len(symbols) * 100:.6f}%"
+                for label, count in zip(("rank1", "rank2", "rank3", "rank其它"), counts)
+            ])
+        else:
+            self.assertEqual(lines[1:5], ["rank1 N/A", "rank2 N/A", "rank3 N/A", "rank其它 N/A"])
+        for index, line in enumerate(lines[5:]):
             pairs = line.split()
             expected_top = np.argsort(-probabilities[index], kind="stable")[:5]
             correct_prediction = expected_top[0] == symbols[index]
@@ -169,7 +182,7 @@ class PredictionReportIntegrationTest(unittest.TestCase):
             statistics = self._encode(source, output, checkpoint, head_adapter_path=adapter_path)
             lines = self._assert_report(output, statistics, symbols, probabilities)
             self.assertEqual(statistics.prediction_top1_accuracy, 1.0)
-            self.assertTrue(all(line.endswith(" yes") for line in lines[1:]))
+            self.assertTrue(all(line.endswith(" yes") for line in lines[5:]))
             restored = root / "restored.fq"
             decode_fastq(output, restored, checkpoint, device=torch.device("cpu"),
                          batch_reads=31, progress=False)
@@ -210,6 +223,49 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                         streams.append(encoder.finish())
                     self.assertEqual(streams[0], streams[1])
                     self.assertEqual(report.total_symbols, int(batch.active_mask.sum()))
+                    expected_symbols, expected_probabilities = self._expected(model, source, 31)
+                    report_path = root / f"quantizer{version}.predictions.txt"
+                    report.write(report_path)
+                    lines = report_path.read_text(encoding="utf-8").splitlines()
+                    ranks = np.nonzero(
+                        np.argsort(-expected_probabilities, axis=1, kind="stable")
+                        == expected_symbols[:, None]
+                    )[1]
+                    self.assertEqual(lines[1:5], [
+                        f"rank1 {(ranks == 0).mean() * 100:.6f}%",
+                        f"rank2 {(ranks == 1).mean() * 100:.6f}%",
+                        f"rank3 {(ranks == 2).mean() * 100:.6f}%",
+                        f"rank其它 {(ranks >= 3).mean() * 100:.6f}%",
+                    ])
+
+    def test_report_ranks_use_unquantized_scores_and_individual_rank_frequencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, model = self._checkpoint(root, uniform=True)
+            with torch.no_grad():
+                model.output_head.bias[5] = 3e-6
+                model.output_head.bias[6] = 2e-6
+                model.output_head.bias[20] = 1e-6
+            # These distinctions disappear in the floor-quantized CDF, but
+            # the prediction report must still order Q5, Q6, Q20, then Q0.
+            save_training_checkpoint(
+                checkpoint, model=model, optimizer=None, epoch=1, global_step=1,
+                data_split={}, sampler_config={}, sampler_statistics={},
+                best_validation_bits_per_quality=1.0, validation_metrics={},
+            )
+            source = root / "input.fq"
+            source.write_bytes(b"".join(
+                b"@r\nA\n+\n" + bytes([33 + quality]) + b"\n"
+                for quality in (5, 6, 20, 0)
+            ))
+            symbols, probabilities = self._expected(model, source, 31)
+            output = root / "close_logits.fqdc"
+            statistics = self._encode(source, output, checkpoint)
+            lines = self._assert_report(output, statistics, symbols, probabilities)
+            self.assertEqual(lines[1:5], [
+                "rank1 25.000000%", "rank2 25.000000%", "rank3 25.000000%",
+                "rank其它 25.000000%",
+            ])
 
     def test_ties_choose_smaller_q_in_top_one_and_top_five(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -220,7 +276,7 @@ class PredictionReportIntegrationTest(unittest.TestCase):
             output = root / "uniform.fqdc"
             statistics = self._encode(source, output, checkpoint)
             lines = self._assert_report(output, statistics, symbols, probabilities)
-            for line in lines[1:]:
+            for line in lines[5:]:
                 self.assertEqual([int(value) for value in line.split()[:10:2]], [0, 1, 2, 3, 4])
 
     def test_no_quality_symbols_produce_header_only_without_nan(self):
