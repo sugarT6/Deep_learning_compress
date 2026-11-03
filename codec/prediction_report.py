@@ -1,7 +1,7 @@
 """Bounded diagnostic text reports for the quality model's predictions.
 
-The first line reports top-1 accuracy over every observed quality symbol. Four
-lines then report the fractions at ranks 1, 2, 3 and all remaining ranks.
+The first line reports top-1 accuracy over every observed quality symbol. Seven
+lines then report the fractions at ranks 1 through 6 and all remaining ranks.
 The remaining lines show the five largest *unquantized* softmax probabilities for
 at most the first 1,000 positions, in the order supplied by the encoder.  These
 sampled lines are a preview, rather than a representative accuracy estimate.
@@ -19,6 +19,7 @@ import numpy as np
 
 QUALITY_ALPHABET_SIZE = 42
 MAX_REPORT_POSITIONS = 1000
+MAX_REPORTED_RANK = 6
 
 
 class PredictionReport:
@@ -48,7 +49,7 @@ class PredictionReport:
         self._max_positions = normalized_max
         self._correct = 0
         self._total = 0
-        self._rank_counts = np.zeros(4, dtype=np.int64)
+        self._rank_counts = np.zeros(MAX_REPORTED_RANK + 1, dtype=np.int64)
         self._preview_lines: List[str] = []
 
     @property
@@ -107,7 +108,8 @@ class PredictionReport:
             & (np.arange(QUALITY_ALPHABET_SIZE)[None, :] < observed[:, None]),
             axis=1,
         )
-        rank_counts = np.bincount(np.minimum(rank_indices, 3), minlength=4)
+        rank_counts = np.bincount(np.minimum(rank_indices, MAX_REPORTED_RANK),
+                                  minlength=MAX_REPORTED_RANK + 1)
         correct = rank_indices == 0
         preview_count = min(
             self._max_positions - len(self._preview_lines), len(observed)
@@ -156,8 +158,8 @@ class PredictionReport:
                     f"prediction_accuracy={value} "
                     f"correct={self._correct} total={self._total}\n"
                 )
-                for label, count in zip(("rank1", "rank2", "rank3", "rank其它"),
-                                        self._rank_counts):
+                labels = tuple(f"rank{rank}" for rank in range(1, MAX_REPORTED_RANK + 1)) + ("rank其它",)
+                for label, count in zip(labels, self._rank_counts):
                     proportion = f"{100.0 * (int(count) / self._total):.6f}%" if self._total else "N/A"
                     stream.write(f"{label} {proportion}\n")
                 for line in self._preview_lines:
