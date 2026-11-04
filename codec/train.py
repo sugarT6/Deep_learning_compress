@@ -106,6 +106,7 @@ class BalancedTrainingSampler:
         seed: int,
         steps_per_epoch: int = 2000,
         family_weights: Optional[Mapping[str, int]] = None,
+        feature_block_reads: int = 0,
     ) -> None:
         if not 0.0 < train_fraction < 1.0:
             raise ValueError("train_fraction must be between 0 and 1")
@@ -115,6 +116,10 @@ class BalancedTrainingSampler:
             raise ValueError("steps_per_epoch must be positive")
         if not datasets:
             raise ValueError("at least one training dataset is required")
+        if type(feature_block_reads) is not int or feature_block_reads < 0:
+            raise ValueError("feature_block_reads must be a nonnegative integer")
+        if feature_block_reads and feature_block_reads != batch_reads:
+            raise ValueError("block-conditioned sampling requires batch_reads == feature_block_reads")
         if any(not dataset.training_source for dataset in datasets):
             raise ValueError("training sampler may not include unseen datasets")
 
@@ -134,6 +139,7 @@ class BalancedTrainingSampler:
         self.batch_reads = int(batch_reads)
         self.seed = int(seed)
         self.steps_per_epoch = int(steps_per_epoch)
+        self.feature_block_reads = feature_block_reads
         if len({dataset.accession for dataset in datasets}) != len(datasets):
             raise ValueError("training dataset accessions must be unique")
         self._rng = np.random.default_rng(seed)
@@ -170,6 +176,16 @@ class BalancedTrainingSampler:
                     )
                 train_stop = int(math.floor(reader.metadata.read_count * train_fraction))
                 train_stop = min(max(train_stop, 1), reader.metadata.read_count - 1)
+                if feature_block_reads:
+                    # Round upward so old floor(N*fraction) training reads do
+                    # not silently move into this run's validation suffix.
+                    train_stop = ((train_stop + feature_block_reads - 1) // feature_block_reads) * feature_block_reads
+                    if train_stop >= reader.metadata.read_count:
+                        reader.close()
+                        raise ValueError(
+                            f"{dataset.accession}: not enough reads for an upward-aligned "
+                            "training split and a separate validation block"
+                        )
                 self._readers[dataset.accession] = reader
                 self._train_stops[dataset.accession] = train_stop
                 self._block_rounds[dataset.accession] = 0
@@ -299,6 +315,9 @@ class BalancedTrainingSampler:
                 "family_weights": dict(self.family_weights),
                 "remainder_policy": "persistent_family_cycle_and_within_family_rotation",
             })
+        if self.feature_block_reads:
+            config["feature_block_reads"] = self.feature_block_reads
+            config["split_alignment"] = "ceil_to_file_relative_block_boundary"
         return config
 
     def state_dict(self) -> Dict[str, Any]:
@@ -437,6 +456,19 @@ def evaluate_validation(
     max_reads_per_file: int,
     device: torch.device,
 ) -> Tuple[Sequence[DatasetMetrics], Dict[str, Any]]:
+    if model.config.block_quality_features:
+        from .block_training import evaluate_block_reader_range, summarize_block_metrics
+        block_metrics = [
+            evaluate_block_reader_range(
+                model, sampler.reader_for(dataset.accession), dataset,
+                category="validation", start=sampler.train_stop_for(dataset.accession),
+                stop=sampler.reader_for(dataset.accession).metadata.read_count,
+                batch_reads=min(sampler.batch_reads, 32), max_reads=max_reads_per_file,
+                device=device,
+            )
+            for dataset in sampler.datasets
+        ]
+        return block_metrics, summarize_block_metrics(block_metrics)
     metrics = []
     for dataset in sampler.datasets:
         reader = sampler.reader_for(dataset.accession)
@@ -483,6 +515,7 @@ def run_training(
     init_from: Optional[Path] = None,
     family_weights: Optional[Mapping[str, int]] = None,
     control_config: Optional[TrainingControlConfig] = None,
+    microbatch_reads: int = 0,
 ) -> Path:
     """Train and select checkpoints using only train-source validation reads."""
 
@@ -494,6 +527,19 @@ def run_training(
         raise ValueError("training and unseen datasets must not overlap")
     if validation_max_reads_per_file < 0:
         raise ValueError("validation_max_reads_per_file must be nonnegative")
+    if type(microbatch_reads) is not int or microbatch_reads < 0:
+        raise ValueError("microbatch_reads must be a nonnegative integer")
+    selection_metric = SELECTION_METRIC
+    if model_config.block_quality_features:
+        from .block_training import BLOCK_SELECTION_METRIC
+        if batch_reads != model_config.block_reads:
+            raise ValueError("block-conditioned training requires --batch-reads == --block-reads")
+        microbatch_reads = microbatch_reads or min(32, batch_reads)
+        if microbatch_reads > batch_reads:
+            raise ValueError("microbatch_reads must not exceed batch_reads")
+        selection_metric = BLOCK_SELECTION_METRIC
+    elif microbatch_reads:
+        raise ValueError("microbatch_reads requires block-quality features")
     if (not all(math.isfinite(value) for value in (learning_rate, weight_decay, grad_clip))
             or learning_rate <= 0 or weight_decay < 0 or grad_clip <= 0):
         raise ValueError("invalid optimizer configuration")
@@ -533,6 +579,7 @@ def run_training(
         seed=seed,
         steps_per_epoch=steps_per_epoch,
         family_weights=family_weights,
+        feature_block_reads=model_config.block_reads if model_config.block_quality_features else 0,
     ) as sampler:
         split_manifest = sampler.data_split_manifest(unseen_datasets)
         validation_counts = {}
@@ -545,6 +592,12 @@ def run_training(
                 min(validation_max_reads_per_file, available)
                 if validation_max_reads_per_file else available
             )
+            if model_config.block_quality_features and validation_max_reads_per_file:
+                validation_counts[dataset.accession] = min(
+                    available,
+                    ((validation_max_reads_per_file + model_config.block_reads - 1)
+                     // model_config.block_reads) * model_config.block_reads,
+                )
         run_config = {
             "model_config": model_config.to_dict(),
             "feature_schema": feature_schema(model_config),
@@ -565,19 +618,36 @@ def run_training(
             "validation_max_reads_per_file": validation_max_reads_per_file,
             "validation_read_rule": "fixed_start_of_validation_suffix_contiguous",
             "validation_read_counts": validation_counts,
-            "selection_metric": SELECTION_METRIC,
+            "selection_metric": selection_metric,
             "device": str(device),
             "seed": seed,
             "training_control": control_config.to_dict(),
         }
+        if model_config.block_quality_features:
+            from .block_features import block_feature_schema
+            run_config["block_training"] = {
+                "descriptor": block_feature_schema(block_reads=model_config.block_reads),
+                "mode": model_config.block_feature_mode,
+                "microbatch_reads": microbatch_reads,
+                "optimizer_step": "one_complete_block; Q-token-weighted gradient accumulation",
+                "conditioning_values": "decoded_uint8_wire_descriptor_only",
+                "all_parameters_trainable": True,
+                "selection_includes": "floor-v2 Q bits plus fixed descriptor bytes; container framing excluded",
+            }
+            run_config["validation_read_rule"] = "fixed_start_of_validation_suffix_round_up_to_complete_blocks"
         if init_from is not None:
             # Loading constructs a temporary CPU model. Preserve RNG draws for
             # this run's dropout, independently of how its weights were loaded.
             with torch.random.fork_rng(devices=[]):
                 loaded = load_training_checkpoint(init_from)
-            if loaded.model.config != model_config:
-                raise ValueError("init-from model configuration does not match requested model")
-            model.load_state_dict(loaded.model.state_dict(), strict=True)
+            if model_config.block_quality_features:
+                from .block_training import transfer_block_initialization, validate_parent_split
+                validate_parent_split(loaded.payload, split_manifest)
+                transfer_block_initialization(model, loaded.model)
+            else:
+                if loaded.model.config != model_config:
+                    raise ValueError("init-from model configuration does not match requested model")
+                model.load_state_dict(loaded.model.state_dict(), strict=True)
             digest = hashlib.sha256()
             with Path(init_from).open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -607,7 +677,7 @@ def run_training(
                 restored_control_state = saved_training.get("control_state")
                 if restored_control_state is None:
                     raise ValueError("checkpoint lacks training control state")
-            if payload.get("selection_metric") != SELECTION_METRIC:
+            if payload.get("selection_metric") != selection_metric:
                 raise ValueError("resume checkpoint selection metric mismatch")
             start_epoch = payload["epoch"] + 1
             if epochs < start_epoch:
@@ -634,8 +704,8 @@ def run_training(
                 "run_config", {}
             )
             if (
-                best_payload.get("selection_metric") != SELECTION_METRIC
-                or best_payload["validation_metrics"][SELECTION_METRIC] != best_validation_bits
+                best_payload.get("selection_metric") != selection_metric
+                or best_payload["validation_metrics"][selection_metric] != best_validation_bits
                 or _resume_contract(best_config) != _resume_contract(previous_config)
             ):
                 raise ValueError("resume requires the matching best.pt beside its checkpoint")
@@ -681,16 +751,39 @@ def run_training(
                 sample = sampler.sample_batch()
                 tensors = fastq_batch_to_tensors(sample.batch, device)
                 optimizer.zero_grad(set_to_none=True)
-                logits = model.forward_full(**tensors)
-                loss = masked_cross_entropy(
-                    logits, tensors["qualities"], tensors["active_mask"]
-                )
-                loss.backward()
+                if model_config.block_quality_features:
+                    from .block_features import encode_block_features, decode_block_features
+                    payload = encode_block_features(sample.batch)
+                    condition = torch.as_tensor(
+                        decode_block_features(payload).copy(), device=device,
+                    ).unsqueeze(0).expand(sample.batch.read_count, -1)
+                    symbols = int(tensors["active_mask"].sum().item())
+                    if not symbols:
+                        raise ValueError("sampled training block has no quality symbols")
+                    loss_value = 0.0
+                    for begin in range(0, sample.batch.read_count, microbatch_reads):
+                        end = min(begin + microbatch_reads, sample.batch.read_count)
+                        micro = {key: value[begin:end] for key, value in tensors.items()}
+                        micro_symbols = int(micro["active_mask"].sum().item())
+                        if not micro_symbols:
+                            continue
+                        logits = model.forward_full(**micro, block_features=condition[begin:end])
+                        loss = masked_cross_entropy(logits, micro["qualities"], micro["active_mask"])
+                        weight = micro_symbols / symbols
+                        (loss * weight).backward()
+                        loss_value += float(loss.detach().item()) * weight
+                else:
+                    logits = model.forward_full(**tensors)
+                    loss = masked_cross_entropy(
+                        logits, tensors["qualities"], tensors["active_mask"]
+                    )
+                    loss.backward()
+                    loss_value = float(loss.item())
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
 
                 symbols = int(tensors["active_mask"].sum().item())
-                epoch_nats += float(loss.item()) * symbols
+                epoch_nats += loss_value * symbols
                 epoch_symbols += symbols
                 epoch_tokens_by_dataset[sample.dataset.accession] += symbols
                 global_step += 1
@@ -711,7 +804,7 @@ def run_training(
                 max_reads_per_file=validation_max_reads_per_file,
                 device=device,
             )
-            validation_bits = validation_summary[SELECTION_METRIC]
+            validation_bits = validation_summary[selection_metric]
             if not math.isfinite(validation_bits):
                 raise ValueError("validation dataset macro must be finite")
             stopped_early = control.step(validation_bits)
@@ -738,6 +831,8 @@ def run_training(
                 "early_stopping_bad_epochs": control.bad_epochs,
                 "stopped_early": stopped_early,
             }
+            if model_config.block_quality_features:
+                epoch_record["selection_metric"] = selection_metric
             with (output_dir / "training_log.jsonl").open(
                 "a", encoding="utf-8"
             ) as handle:
@@ -756,7 +851,7 @@ def run_training(
                 "sampler_statistics": sampling_statistics,
                 "best_validation_bits_per_quality": best_validation_bits,
                 "validation_metrics": validation_summary,
-                "selection_metric": SELECTION_METRIC,
+                "selection_metric": selection_metric,
                 "sampler_state": sampler.state_dict(),
                 "training_state": {
                     "version": 2,
@@ -774,17 +869,29 @@ def run_training(
             if improved:
                 save_training_checkpoint(best_path, **checkpoint_arguments)
             if progress:
-                print(
-                    f"epoch={epoch} loss={train_loss:.4f} "
-                    f"train_bits={train_bits:.4f} "
-                    f"val_dataset_macro={validation_bits:.4f} "
-                    f"val_micro={validation_summary['symbol_micro_bits_per_quality']:.4f} "
-                    f"val_family_macro={validation_summary['platform_family_macro_bits_per_quality']:.4f} "
-                    f"val_worst={validation_summary['worst_dataset']['bits_per_quality']:.4f} "
-                    f"best_val_bits={best_validation_bits:.4f}",
-                    f"lr={epoch_learning_rate:.6g} next_lr={optimizer.param_groups[0]['lr']:.6g}",
-                    flush=True,
-                )
+                if model_config.block_quality_features:
+                    print(
+                        f"epoch={epoch} train_Q_bpq={train_bits:.6f} "
+                        f"val_Q_bpq={validation_summary[SELECTION_METRIC]:.6f} "
+                        f"val_Q_floor_bpq={validation_summary['dataset_macro_quantized_Q_bits_per_quality']:.6f} "
+                        f"val_Q_plus_side_bpq={validation_bits:.6f} "
+                        f"side_bytes={validation_summary['block_side_bits'] // 8} "
+                        f"best_val_Q_plus_side_bpq={best_validation_bits:.6f} "
+                        f"lr={epoch_learning_rate:.6g} next_lr={optimizer.param_groups[0]['lr']:.6g}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"epoch={epoch} loss={train_loss:.4f} "
+                        f"train_bits={train_bits:.4f} "
+                        f"val_dataset_macro={validation_bits:.4f} "
+                        f"val_micro={validation_summary['symbol_micro_bits_per_quality']:.4f} "
+                        f"val_family_macro={validation_summary['platform_family_macro_bits_per_quality']:.4f} "
+                        f"val_worst={validation_summary['worst_dataset']['bits_per_quality']:.4f} "
+                        f"best_val_bits={best_validation_bits:.4f}",
+                        f"lr={epoch_learning_rate:.6g} next_lr={optimizer.param_groups[0]['lr']:.6g}",
+                        flush=True,
+                    )
             if stopped_early:
                 if progress:
                     print(f"early stopping after epoch {epoch}", flush=True)
@@ -792,7 +899,7 @@ def run_training(
         _write_json_atomic(
             output_dir / "sampling_statistics.json", sampler.statistics_dict()
         )
-        _write_json_atomic(output_dir / "training_summary.json", {
+        training_summary = {
             "start_epoch": start_epoch, "completed_epoch": epoch,
             "requested_epochs": epochs, "global_step": global_step,
             "training_quality_tokens": training_quality_tokens,
@@ -802,7 +909,10 @@ def run_training(
             "best_validation_bits_per_quality": best_validation_bits,
             "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
             "final_learning_rate": optimizer.param_groups[0]["lr"],
-        })
+        }
+        if model_config.block_quality_features:
+            training_summary["selection_metric"] = selection_metric
+        _write_json_atomic(output_dir / "training_summary.json", training_summary)
     return best_path
 
 
@@ -822,6 +932,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--steps-per-epoch", type=int, default=2000)
     parser.add_argument("--batch-reads", type=int, default=256)
+    parser.add_argument("--block-quality-features", action="store_true",
+                        help="condition on a paid 16-byte quality descriptor per fixed contiguous read block")
+    parser.add_argument("--block-reads", type=int, default=256,
+                        help="reads sharing one descriptor; block mode requires batch-reads to match")
+    parser.add_argument("--block-feature-mode", choices=("features", "constant"), default="features",
+                        help="constant keeps the same conditioner but supplies a known zero descriptor")
+    parser.add_argument("--block-conditioning-dim", type=int, default=32)
+    parser.add_argument("--microbatch-reads", type=int, default=0,
+                        help="block-mode gradient accumulation size; 0 selects up to 32 reads")
     initialization = parser.add_mutually_exclusive_group()
     initialization.add_argument(
         "--resume", type=Path,
@@ -890,6 +1009,10 @@ def main() -> int:
             base_memory_heads=args.base_memory_heads,
             base_memory_layers=args.base_memory_layers,
             base_cross_attention_layers=args.base_cross_attention_layers,
+            block_quality_features=args.block_quality_features,
+            block_reads=args.block_reads,
+            block_feature_mode=args.block_feature_mode,
+            block_conditioning_dim=args.block_conditioning_dim,
         )
         best_path = run_training(
             cache_dir=args.cache_dir,
@@ -908,6 +1031,7 @@ def main() -> int:
             progress=not args.no_progress,
             resume=args.resume,
             init_from=args.init_from,
+            microbatch_reads=args.microbatch_reads,
             train_datasets=EXPANDED_TRAIN_DATASETS if args.training_set == "expanded20" else TRAIN_DATASETS,
             unseen_datasets=EXPANDED_UNSEEN_DATASETS if args.training_set == "expanded20" else UNSEEN_DATASETS,
             family_weights=EXPANDED_FAMILY_WEIGHTS if args.training_set == "expanded20" else None,

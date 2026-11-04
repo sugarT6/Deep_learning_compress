@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .base_memory import BaseMemoryDecoderLayer, BaseMemoryEncoder
+from .block_conditioning import BLOCK_FEATURE_DIM, BlockQualityConditioning
 from .relative_attention import RelativePositionTransformerEncoderLayer
 from .fastq_stream import (
     BASE_ALPHABET_SIZE,
@@ -69,6 +70,10 @@ class DirectQualityModelConfig:
     base_memory_heads: int = 4
     base_memory_layers: int = 2
     base_cross_attention_layers: int = 2
+    block_quality_features: bool = False
+    block_reads: int = 256
+    block_feature_mode: str = "features"
+    block_conditioning_dim: int = 32
 
     def __post_init__(self) -> None:
         if self.architecture != MODEL_ARCHITECTURE:
@@ -124,6 +129,15 @@ class DirectQualityModelConfig:
             raise ValueError("base_memory_dim must be divisible by base_memory_heads")
         if self.base_cross_attention and self.base_cross_attention_layers > self.num_layers:
             raise ValueError("base_cross_attention_layers cannot exceed num_layers")
+        if type(self.block_quality_features) is not bool:
+            raise ValueError("block_quality_features must be bool")
+        for name in ("block_reads", "block_conditioning_dim"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.block_feature_mode not in ("features", "constant"):
+            raise ValueError("block_feature_mode must be features or constant")
+        if self.block_quality_features and (self.relative_position_bias or self.base_cross_attention):
+            raise ValueError("block quality conditioning cannot combine with relative position or base memory")
 
     def to_dict(self) -> Dict[str, Any]:
         values = asdict(self)
@@ -139,6 +153,10 @@ class DirectQualityModelConfig:
             ("base_memory_heads", 4),
             ("base_memory_layers", 2),
             ("base_cross_attention_layers", 2),
+            ("block_quality_features", False),
+            ("block_reads", 256),
+            ("block_feature_mode", "features"),
+            ("block_conditioning_dim", 32),
         ):
             if values[name] == default:
                 values.pop(name)
@@ -224,6 +242,19 @@ def feature_schema(config: Optional[DirectQualityModelConfig] = None) -> Dict[st
             )),
             "side_information_bytes": 0,
         }
+    if config is not None and config.block_quality_features:
+        from .block_features import block_feature_schema
+        schema["version"] = 4
+        schema["features"]["block_quality"] = dict(
+            block_feature_schema(block_reads=config.block_reads),
+            conditioning=dict(
+                type="shared_mlp_layer_input_film",
+                hidden_dim=config.block_conditioning_dim,
+                mode=config.block_feature_mode,
+                zero_initialized_output=True,
+            ),
+            input_source="explicitly supplied decoded block features; never inferred inside the model",
+        )
     return schema
 
 
@@ -603,6 +634,11 @@ class DirectQualityTransformer(nn.Module):
         self.output_head = nn.Linear(
             self.config.d_model, QUALITY_ALPHABET_SIZE
         )
+        if self.config.block_quality_features:
+            self.block_conditioning = BlockQualityConditioning(
+                self.config.d_model, self.config.num_layers,
+                self.config.block_conditioning_dim,
+            )
 
     def _validate_common_inputs(
         self,
@@ -671,7 +707,9 @@ class DirectQualityTransformer(nn.Module):
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
         read_states: Optional[torch.Tensor] = None,
+        block_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        self._validate_block_features(block_features, bases)
         if hasattr(self, "read_state_conditioning"):
             self._validate_read_states(read_states, bases.shape[0])
             if read_states.device != bases.device:
@@ -710,7 +748,15 @@ class DirectQualityTransformer(nn.Module):
                 category=UserWarning,
             )
             mask = self._attention_mask(sequence_length, bases.device)
-            if self.config.base_cross_attention:
+            if self.config.block_quality_features:
+                features = (torch.zeros_like(block_features)
+                            if self.config.block_feature_mode == "constant" else block_features)
+                scales, shifts = self.block_conditioning(features)
+                for index, layer in enumerate(self.transformer.layers):
+                    hidden = hidden * (1.0 + scales[:, index, None, :]) + shifts[:, index, None, :]
+                    hidden = layer(hidden, src_mask=mask)
+                hidden = self.transformer.norm(hidden)
+            elif self.config.base_cross_attention:
                 memory = self.base_memory_encoder(bases, active_mask, position_features)
                 for index, layer in enumerate(self.transformer.layers):
                     if (hasattr(self, "read_state_conditioning")
@@ -734,6 +780,22 @@ class DirectQualityTransformer(nn.Module):
                 hidden = self.transformer(hidden, mask=mask)
         return hidden
 
+    def _validate_block_features(self, features, bases):
+        if not self.config.block_quality_features:
+            if features is not None:
+                raise ValueError("block features require a block-conditioned model")
+            return
+        if hasattr(self, "read_state_conditioning"):
+            raise ValueError("block quality conditioning cannot combine with read-state conditioning")
+        if (not isinstance(features, torch.Tensor) or features.dtype != torch.float32
+                or features.shape != (bases.shape[0], BLOCK_FEATURE_DIM)):
+            raise ValueError("block-conditioned inference requires explicit float32 [batch, 16] block features")
+        if features.device != bases.device:
+            raise ValueError("block features and bases must be on the same device")
+        if (not bool(torch.isfinite(features).all())
+                or bool(torch.any((features < 0) | (features > 1)))):
+            raise ValueError("block features must be finite normalized values in [0, 1]")
+
     def _validate_read_states(self, read_states, batch_size):
         class_count = self.read_state_conditioning.class_count
         if (not isinstance(read_states, torch.Tensor) or read_states.dtype != torch.long
@@ -741,29 +803,29 @@ class DirectQualityTransformer(nn.Module):
                 or torch.any((read_states < 0) | (read_states >= class_count))):
             raise ValueError(f"conditioned inference requires one read-state ID in [0, {class_count - 1}] per read")
 
-    def _forward_impl(self, bases, qualities, lengths, active_mask, read_states=None):
-        hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask, read_states)
+    def _forward_impl(self, bases, qualities, lengths, active_mask, read_states=None, block_features=None):
+        hidden = (self._cross_hidden_impl(bases, qualities, lengths, active_mask, read_states, block_features)
                   if isinstance(self.output_head, CrossLayerOutputHead)
-                  else self._hidden_impl(bases, qualities, lengths, active_mask, read_states))
+                  else self._hidden_impl(bases, qualities, lengths, active_mask, read_states, block_features))
         logits = self.output_head(hidden)
         return logits * active_mask.unsqueeze(-1).to(logits.dtype)
 
-    def forward_features(self, bases, qualities, lengths, active_mask, read_states=None):
+    def forward_features(self, bases, qualities, lengths, active_mask, read_states=None, block_features=None):
         """Return causal output-head inputs, for frozen-feature adaptation only."""
         self._validate_common_inputs(bases, lengths, active_mask)
         if qualities.shape != bases.shape:
             raise ValueError("qualities must have the same shape as bases")
         _validate_target_values(qualities, active_mask, name="qualities")
-        return self._hidden_impl(bases, qualities, lengths, active_mask, read_states)
+        return self._hidden_impl(bases, qualities, lengths, active_mask, read_states, block_features)
 
-    def forward_cross_layer_features(self, bases, qualities, lengths, active_mask, read_states=None):
+    def forward_cross_layer_features(self, bases, qualities, lengths, active_mask, read_states=None, block_features=None):
         self._validate_common_inputs(bases, lengths, active_mask)
         if qualities.shape != bases.shape:
             raise ValueError("qualities must have the same shape as bases")
         _validate_target_values(qualities, active_mask, name="qualities")
-        return self._cross_hidden_impl(bases, qualities, lengths, active_mask, read_states)
+        return self._cross_hidden_impl(bases, qualities, lengths, active_mask, read_states, block_features)
 
-    def _cross_hidden_impl(self, bases, qualities, lengths, active_mask, read_states=None):
+    def _cross_hidden_impl(self, bases, qualities, lengths, active_mask, read_states=None, block_features=None):
         """Pack final features and per-position, affine-free LN of block 3.
 
         Capture the existing forward instead of rerunning the backbone. The
@@ -772,13 +834,13 @@ class DirectQualityTransformer(nn.Module):
         if self.config.num_layers < 4:
             raise ValueError("cross-layer adaptation requires at least 4 Transformer layers")
         if bases.shape[1] == 0:
-            return self._hidden_impl(bases, qualities, lengths, active_mask, read_states).repeat(1, 1, 2)
+            return self._hidden_impl(bases, qualities, lengths, active_mask, read_states, block_features).repeat(1, 1, 2)
         captured = []
         def capture(module, inputs, output):
             captured.append(output)
         handle = self.transformer.layers[2].register_forward_hook(capture)
         try:
-            final = self._hidden_impl(bases, qualities, lengths, active_mask, read_states)
+            final = self._hidden_impl(bases, qualities, lengths, active_mask, read_states, block_features)
         finally:
             handle.remove()
         middle = F.layer_norm(captured[0], (self.config.d_model,), weight=None, bias=None, eps=1e-5)
@@ -791,6 +853,7 @@ class DirectQualityTransformer(nn.Module):
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
         read_states: Optional[torch.Tensor] = None,
+        block_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict all positions with teacher-forced, strictly causal history."""
 
@@ -798,7 +861,7 @@ class DirectQualityTransformer(nn.Module):
         if qualities.shape != bases.shape:
             raise ValueError("qualities must have the same shape as bases")
         _validate_target_values(qualities, active_mask, name="qualities")
-        return self._forward_impl(bases, qualities, lengths, active_mask, read_states)
+        return self._forward_impl(bases, qualities, lengths, active_mask, read_states, block_features)
 
     def forward_step(
         self,
@@ -807,6 +870,7 @@ class DirectQualityTransformer(nn.Module):
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
         read_states: Optional[torch.Tensor] = None,
+        block_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict one cycle from already-decoded quality history.
 
@@ -826,7 +890,7 @@ class DirectQualityTransformer(nn.Module):
         _validate_target_values(quality_prefix, prefix_mask, name="quality_prefix")
         qualities = torch.full_like(bases, QUALITY_PAD_ID)
         qualities[:, :cycle] = quality_prefix
-        logits = self._forward_impl(bases, qualities, lengths, active_mask, read_states)
+        logits = self._forward_impl(bases, qualities, lengths, active_mask, read_states, block_features)
         return logits[:, cycle, :]
 
     def forward(
@@ -836,5 +900,6 @@ class DirectQualityTransformer(nn.Module):
         lengths: torch.Tensor,
         active_mask: torch.Tensor,
         read_states: Optional[torch.Tensor] = None,
+        block_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.forward_full(bases, qualities, lengths, active_mask, read_states)
+        return self.forward_full(bases, qualities, lengths, active_mask, read_states, block_features)

@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import io
 import json
+import copy
 import operator
 import os
 import shutil
@@ -27,7 +28,8 @@ CONTAINER_VERSION = 2
 ADAPTED_CONTAINER_VERSION = 3
 READ_STATE_CONTAINER_VERSION = 4
 RANK_CONTAINER_VERSION = 5
-SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION)
+BLOCK_FEATURE_CONTAINER_VERSION = 6
+SUPPORTED_CONTAINER_VERSIONS = (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION, BLOCK_FEATURE_CONTAINER_VERSION)
 CONTAINER_MAGIC = b"FQDC0001"
 CONTAINER_FLAGS = 0
 METADATA_ZLIB_FLAG = 1
@@ -219,6 +221,32 @@ def adaptation_metadata_bytes(metadata: Mapping[str, Any], *, compressed: bool =
     return adapter, labels
 
 
+def block_feature_metadata_bytes(metadata: Mapping[str, Any], *, compressed: bool = False) -> int:
+    """Charge every block-specific metadata field and the additional section.
+
+    The counterfactual baseline keeps the actual container version and checkpoint
+    SHA, while removing block conditioning from its configuration and rebuilding
+    the corresponding plain feature schema.  The difference therefore measures
+    block-specific information under the chosen metadata transport; it is not
+    the size difference between two independently generated codec containers.
+    """
+
+    if "block_features" not in metadata:
+        return 0
+    from .model import DirectQualityModelConfig, feature_schema
+
+    baseline = copy.deepcopy(dict(metadata))
+    baseline.pop("block_features")
+    baseline["sections"] = [section for section in metadata["sections"] if section["name"] != "block_features"]
+    config = dict(baseline["checkpoint"]["model_config"])
+    for name in ("block_quality_features", "block_reads", "block_feature_mode", "block_conditioning_dim"):
+        config.pop(name, None)
+    plain_config = DirectQualityModelConfig.from_dict(config)
+    baseline["checkpoint"]["model_config"] = plain_config.to_dict()
+    baseline["checkpoint"]["feature_schema"] = feature_schema(plain_config)
+    return len(metadata_payload(metadata, compressed=compressed)) - len(metadata_payload(baseline, compressed=compressed))
+
+
 def _integer(value: Any, *, name: str, minimum: int = 0) -> int:
     if isinstance(value, bool):
         raise ContainerError(f"{name} must be an integer")
@@ -322,6 +350,37 @@ def _validate_metadata(
     _integer(quantization.get("phred_offset"), name="phred_offset")
 
     probability_profile = metadata.get("probability_profile")
+    block_configured = checkpoint["model_config"].get("block_quality_features", False)
+    if format_version == BLOCK_FEATURE_CONTAINER_VERSION:
+        from .block_features import BLOCK_FEATURE_BYTES, block_feature_schema
+        block = metadata.get("block_features")
+        config = checkpoint["model_config"]
+        if block_configured is not True or not isinstance(block, dict):
+            raise ContainerError("version-6 requires a block-conditioned checkpoint and block_features metadata")
+        block_reads = _integer(config.get("block_reads", 256), name="checkpoint block_reads", minimum=1)
+        mode = config.get("block_feature_mode", "features")
+        if block_reads > MAX_BATCH_READS or batch_reads != block_reads:
+            raise ContainerError("block-conditioned batch_reads must equal checkpoint block_reads and not exceed 256")
+        if mode not in ("features", "constant") or block.get("mode") != mode:
+            raise ContainerError("block feature mode does not match checkpoint")
+        if block.get("schema") != block_feature_schema(block_reads=block_reads):
+            raise ContainerError("unsupported or mismatched block feature schema")
+        if _integer(block.get("block_count"), name="block_count") != expected_batches:
+            raise ContainerError("block_count does not match read_count")
+        expected_block_bytes = expected_batches * (BLOCK_FEATURE_BYTES if mode == "features" else 0)
+        if _integer(block.get("stream_bytes"), name="block feature stream_bytes") != expected_block_bytes:
+            raise ContainerError("block feature stream length does not match block count and mode")
+        if probability_profile is not None or any(name in metadata for name in ("head_adapter", "read_state", "rank_encoding")):
+            raise ContainerError("block coding does not support probability profiles, adapters, read states, or rank coding")
+        sections = metadata.get("sections", [])
+        block_sections = [section for section in sections if isinstance(section, dict) and section.get("name") == "block_features"]
+        if len(block_sections) != 1 or any(
+            _integer(block_sections[0].get(name), name=f"block_features.{name}") != expected_block_bytes
+            for name in ("length", "uncompressed_length")
+        ):
+            raise ContainerError("block feature section length does not match block count and mode")
+    elif "block_features" in metadata or block_configured is True:
+        raise ContainerError("block quality features require container version 6")
     if format_version == RANK_CONTAINER_VERSION:
         try:
             from .rank_coding import validate_rank_metadata
@@ -401,7 +460,7 @@ def _validate_metadata(
 
 
 def _section_infos(sources: Sequence[SectionSource], version=ADAPTED_CONTAINER_VERSION) -> Tuple[SectionInfo, ...]:
-    expected_names = SECTION_NAMES + (("read_state",) if version == READ_STATE_CONTAINER_VERSION else ())
+    expected_names = _section_names(version)
     if tuple(source.name for source in sources) != expected_names:
         raise ContainerError(f"sections must appear exactly as {expected_names}")
     offset = 0
@@ -491,8 +550,16 @@ def write_container(
     )
 
 
+def _section_names(version: int) -> Tuple[str, ...]:
+    if version == READ_STATE_CONTAINER_VERSION:
+        return SECTION_NAMES + ("read_state",)
+    if version == BLOCK_FEATURE_CONTAINER_VERSION:
+        return SECTION_NAMES + ("block_features",)
+    return SECTION_NAMES
+
+
 def _parse_section_infos(raw_sections: Any, version=ADAPTED_CONTAINER_VERSION) -> Tuple[SectionInfo, ...]:
-    expected_names = SECTION_NAMES + (("read_state",) if version == READ_STATE_CONTAINER_VERSION else ())
+    expected_names = _section_names(version)
     if not isinstance(raw_sections, list) or len(raw_sections) != len(expected_names):
         raise ContainerError(f"container must contain exactly {len(expected_names)} sections")
     sections = []

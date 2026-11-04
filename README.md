@@ -73,6 +73,11 @@ probability assigned to the true Q, and read-position statistics for true-Q
 probability at most 0.3. Existing commands need no new flag;
 see [prediction report format](codec/document/PREDICTION_REPORT.md).
 
+Opt-in `--block-quality-features` training supplies a paid 16-byte quality
+description per fixed block of 256 contiguous reads. It supports continued
+expanded20 training, a matched constant-feature control, and lossless v6
+containers. See [block-feature training](codec/document/BLOCK_QUALITY_FEATURES.md).
+
 Stage B uses strictly shifted previous quality, causal Q-mer histories for
 `k=2,3,4`, complete decoder-known base reads, position/read length, and an
 active mask. `forward_full` performs causal teacher-forced prediction for

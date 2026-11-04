@@ -31,6 +31,7 @@ from .container import (
     ADAPTED_CONTAINER_VERSION,
     READ_STATE_CONTAINER_VERSION,
     RANK_CONTAINER_VERSION,
+    BLOCK_FEATURE_CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
     ContainerError,
     ContainerIntegrityError,
@@ -54,7 +55,9 @@ from .fastq_stream import (
     QUALITY_ALPHABET_SIZE,
     QUALITY_PAD_ID,
     encode_base_ids,
+    make_fastq_batch,
 )
+from .block_features import BLOCK_FEATURE_BYTES, decode_block_features, encode_block_features
 from .model import DirectQualityModelConfig, DirectQualityTransformer, feature_schema
 from .online_prior import (
     OnlinePriorConfig,
@@ -111,7 +114,7 @@ def _validate_codec_metadata(
     if metadata["format"] != CONTAINER_FORMAT:
         raise ContainerError("unsupported container format")
     format_version = int(metadata["format_version"])
-    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION):
+    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION, BLOCK_FEATURE_CONTAINER_VERSION):
         raise ContainerError("unsupported container version")
     stored_batch_reads = int(metadata["batch_reads"])
     if batch_reads != stored_batch_reads:
@@ -142,7 +145,7 @@ def _validate_codec_metadata(
     if metadata["inference_runtime"]["dtype"] != "float32":
         raise ContainerError("unsupported model inference dtype")
     probability_profile = metadata.get("probability_profile")
-    if format_version == LEGACY_CONTAINER_VERSION or (format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION) and probability_profile is None):
+    if format_version == LEGACY_CONTAINER_VERSION or (format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION, BLOCK_FEATURE_CONTAINER_VERSION) and probability_profile is None):
         if probability_profile is not None:
             raise ContainerError("legacy container unexpectedly declares a prior")
         online_prior_config = None
@@ -223,12 +226,15 @@ def _decode_quality_batch(
     quantization_version: int = 1,
     read_states: np.ndarray | None = None,
     rank_cdf: np.ndarray | None = None,
+    block_features: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, int]:
     stage_started = time.perf_counter()
     bases, lengths, active_mask = _batch_tensors(base_records, device)
     _synchronize_device(device)
     _add_timing(timings, "tensor_transfer", stage_started)
     state_inputs = {} if read_states is None else {"read_states": torch.as_tensor(read_states, dtype=torch.long, device=device)}
+    if block_features is not None:
+        state_inputs["block_features"] = torch.as_tensor(block_features, dtype=torch.float32, device=device)
     read_count, maximum_length = bases.shape
     decoded = torch.full(
         (read_count, maximum_length),
@@ -417,6 +423,9 @@ def _decode_to_handle(
     online_prior = make_prior_state(online_prior_config)
 
     with ExitStack() as stack:
+        block_handle = (stack.enter_context(container_info.open_section("block_features"))
+                        if metadata["format_version"] == BLOCK_FEATURE_CONTAINER_VERSION else None)
+        block_mode = metadata["block_features"]["mode"] if block_handle is not None else None
         state_reader = (StateReader(stack.enter_context(container_info.open_section("read_state")), read_count,
                                    class_count=metadata["read_state"]["class_count"])
                         if metadata["format_version"] == READ_STATE_CONTAINER_VERSION else None)
@@ -473,6 +482,14 @@ def _decode_to_handle(
                 pluses.append(plus)
             _add_timing(timings, "side_stream_read", stage_started)
 
+            block_inputs = None
+            block_payload = None
+            if block_handle is not None:
+                block_payload = (block_handle.read(BLOCK_FEATURE_BYTES)
+                                 if block_mode == "features" else bytes(BLOCK_FEATURE_BYTES))
+                if len(block_payload) != BLOCK_FEATURE_BYTES:
+                    raise ContainerIntegrityError("truncated block feature description")
+                block_inputs = np.broadcast_to(decode_block_features(block_payload), (current_batch_reads, BLOCK_FEATURE_BYTES)).copy()
             decoded, batch_symbols = _decode_quality_batch(
                 model,
                 range_decoder,
@@ -486,7 +503,17 @@ def _decode_to_handle(
                 quantization_version=int(metadata["probability_quantization"]["version"]),
                 read_states=state_reader.read(current_batch_reads) if state_reader else None,
                 rank_cdf=rank_cdf,
+                block_features=block_inputs,
             )
+            if block_mode == "features":
+                decoded_batch = make_fastq_batch(
+                    [encode_base_ids(record.field) for record in bases],
+                    [decoded[row, :len(record.field)] for row, record in enumerate(bases)],
+                    range(batch_start, batch_start + current_batch_reads),
+                    source_name=metadata["source_basename"],
+                )
+                if encode_block_features(decoded_batch) != block_payload:
+                    raise ContainerIntegrityError("decoded qualities do not match transmitted block description")
             decoded_symbols += batch_symbols
             stage_started = time.perf_counter()
             for row, (header, base, plus) in enumerate(
@@ -504,6 +531,8 @@ def _decode_to_handle(
         stage_started = time.perf_counter()
         if state_reader is not None:
             state_reader.finish()
+        if block_handle is not None and block_handle.read(1):
+            raise ContainerIntegrityError("block feature stream has trailing descriptions")
         header_reader.finish()
         base_reader.finish()
         plus_reader.finish()

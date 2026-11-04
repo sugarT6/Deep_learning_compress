@@ -34,6 +34,7 @@ from .container import (
     ADAPTED_CONTAINER_VERSION,
     READ_STATE_CONTAINER_VERSION,
     RANK_CONTAINER_VERSION,
+    BLOCK_FEATURE_CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
     ContainerError,
     SectionSource,
@@ -74,7 +75,10 @@ from .probability_quantization import (
 )
 from .range_encoder import RangeEncoder
 from .head_adapter import HeadAdaptationConfig, adapt_output_head, apply_head_adapter, adapter_container_bytes
-from .container import adaptation_metadata_bytes
+from .container import adaptation_metadata_bytes, block_feature_metadata_bytes
+from .block_features import (
+    BLOCK_FEATURE_BYTES, block_feature_schema, encode_block_features, decode_block_features,
+)
 from .read_state import StateWriter, classify_reads, label_metadata, state_container_overhead
 from .rank_coding import ranks_from_cdfs, make_rank_metadata, validate_rank_metadata, global_rank_bits
 
@@ -125,6 +129,9 @@ class EncodeStatistics:
     rank_histogram: Optional[list] = None
     rank_table_bytes: int = 0
     original_quantized_theoretical_bits: Optional[float] = None
+    block_feature_stream_bytes: int = 0
+    block_feature_metadata_bytes: int = 0
+    block_feature_stream_bits_per_quality: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -178,12 +185,15 @@ def _quantize_verified_batch(
     read_states: Optional[np.ndarray] = None,
     prediction_report: Optional[PredictionReport] = None,
     rank_coding: bool = False,
+    block_features: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Any, float, float]:
     """Return cycle-major symbols and CDFs (v1) or low/high/total arrays (v2)."""
 
     stage_started = time.perf_counter()
     tensors = fastq_batch_to_tensors(batch, device)
     state_inputs = {} if read_states is None else {"read_states": torch.as_tensor(read_states, dtype=torch.long, device=device)}
+    if block_features is not None:
+        state_inputs["block_features"] = torch.as_tensor(block_features, dtype=torch.float32, device=device)
     tensors.update(state_inputs)
     _synchronize_device(device)
     _add_timing(timings, "tensor_transfer", stage_started)
@@ -373,6 +383,15 @@ def _encode_fastq_compat(
     loaded = load_training_checkpoint(checkpoint_path, device=device)
     model = loaded.model
     model.eval()
+    block_enabled = bool(getattr(model.config, "block_quality_features", False))
+    if block_enabled:
+        if batch_reads != model.config.block_reads:
+            raise ValueError("block-conditioned encoding requires --batch-reads equal to checkpoint block_reads")
+        if (head_adaptation_config is not None or head_adapter_path is not None
+                or save_head_adapter_path is not None):
+            raise ValueError("block-conditioned encoding does not yet support file adapters")
+        if online_prior_config is not None or use_rank or hasattr(model, "read_state_conditioning"):
+            raise ValueError("block-conditioned encoding requires neural coding without priors or read-state adapters")
     _synchronize_device(device)
     _add_timing(timings, "checkpoint_hash_and_load", stage_started)
     adapter = None
@@ -451,6 +470,7 @@ def _encode_fastq_compat(
             plus_path = temporary_root / "plus.gz"
             quality_path = temporary_root / "quality.range"
             state_path = temporary_root / "read_state.bin"
+            block_path = temporary_root / "block_features.bin"
             state_enabled = hasattr(model, "read_state_conditioning")
             if use_rank and state_enabled:
                 raise ValueError("rank coding does not support read-state adapters")
@@ -463,7 +483,7 @@ def _encode_fastq_compat(
                 base_path, "base", compresslevel=GZIP_COMPRESSLEVEL
             ) as base_writer, SideStreamWriter(
                 plus_path, "plus", compresslevel=GZIP_COMPRESSLEVEL
-            ) as plus_writer, state_path.open("wb") as state_handle, (temporary_root / "ranks.u1").open("wb") as rank_spool:
+            ) as plus_writer, state_path.open("wb") as state_handle, (temporary_root / "ranks.u1").open("wb") as rank_spool, block_path.open("wb") as block_handle:
                 state_writer = (StateWriter(state_handle,
                     class_count=model.read_state_conditioning.class_count) if state_enabled else None)
                 batch_iterator = iter_fastq_batches(
@@ -500,6 +520,16 @@ def _encode_fastq_compat(
                     _add_timing(timings, "side_stream_record_write", stage_started)
 
                     read_states = None
+                    block_inputs = None
+                    if block_enabled:
+                        stage_started = time.perf_counter()
+                        payload = (encode_block_features(batch)
+                                   if model.config.block_feature_mode == "features" else bytes(BLOCK_FEATURE_BYTES))
+                        if model.config.block_feature_mode == "features":
+                            block_handle.write(payload)
+                        # Use the same quantized description the decoder receives.
+                        block_inputs = np.broadcast_to(decode_block_features(payload), (batch.read_count, BLOCK_FEATURE_BYTES)).copy()
+                        _add_timing(timings, "block_feature_compute_and_write", stage_started)
                     if state_writer is not None:
                         stage_started = time.perf_counter()
                         read_states = classify_reads(batch.qualities, batch.lengths,
@@ -524,6 +554,7 @@ def _encode_fastq_compat(
                         read_states=read_states,
                         prediction_report=prediction_report,
                         rank_coding=use_rank,
+                        block_features=block_inputs,
                     )
                     stage_started = time.perf_counter()
                     if use_rank:
@@ -652,6 +683,14 @@ def _encode_fastq_compat(
             if use_rank:
                 metadata["format_version"] = RANK_CONTAINER_VERSION
                 metadata["rank_encoding"] = rank_metadata
+            if block_enabled:
+                metadata["format_version"] = BLOCK_FEATURE_CONTAINER_VERSION
+                metadata["block_features"] = {
+                    "schema": block_feature_schema(block_reads=model.config.block_reads),
+                    "mode": model.config.block_feature_mode,
+                    "block_count": batch_count,
+                    "stream_bytes": block_path.stat().st_size,
+                }
             stage_started = time.perf_counter()
             container_info = write_container(
                 output_path,
@@ -667,7 +706,8 @@ def _encode_fastq_compat(
                         "plus_gzip", plus_path, plus_writer.uncompressed_length
                     ),
                     SectionSource("quality_range", quality_path, len(range_stream)),
-                ) + ((SectionSource("read_state", state_path, state_path.stat().st_size),) if state_enabled else ()),
+                ) + ((SectionSource("read_state", state_path, state_path.stat().st_size),) if state_enabled else ())
+                + ((SectionSource("block_features", block_path, block_path.stat().st_size),) if block_enabled else ()),
                 compress_metadata=compress_metadata,
             )
             _add_timing(timings, "container_write", stage_started)
@@ -694,6 +734,8 @@ def _encode_fastq_compat(
         rank_table_bytes = (len(metadata_payload(rank_baseline, compressed=compress_metadata))
                             - len(metadata_payload(without_rank, compressed=compress_metadata)))
     state_stream_bytes, state_metadata_bytes = state_container_overhead(container_info)
+    block_stream_bytes = container_info.section("block_features").length if block_enabled else 0
+    block_metadata_bytes = block_feature_metadata_bytes(container_info.metadata, compressed=compress_metadata)
     if compress_metadata:
         adapter_bytes, state_metadata_bytes = adaptation_metadata_bytes(container_info.metadata, compressed=True)
         if adaptation_report is not None:
@@ -762,7 +804,7 @@ def _encode_fastq_compat(
         head_adaptation=adaptation_report,
         quality_and_adapter_bytes=range_stream_bytes + (
             adaptation_report["container_adapter_bytes"] if adaptation_report else 0)
-            + state_stream_bytes + state_metadata_bytes + rank_table_bytes,
+            + state_stream_bytes + state_metadata_bytes + rank_table_bytes + block_stream_bytes + block_metadata_bytes,
         coder_backend=range_encoder.backend,
         read_state_stream_bytes=state_stream_bytes,
         read_state_metadata_bytes=state_metadata_bytes,
@@ -774,6 +816,9 @@ def _encode_fastq_compat(
         rank_histogram=rank_counts.tolist() if use_rank else None,
         rank_table_bytes=rank_table_bytes,
         original_quantized_theoretical_bits=original_quantized_bits if use_rank else None,
+        block_feature_stream_bytes=block_stream_bytes,
+        block_feature_metadata_bytes=block_metadata_bytes,
+        block_feature_stream_bits_per_quality=(block_stream_bytes * 8 / quality_symbols if quality_symbols else None),
     )
 
 

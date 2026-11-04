@@ -12,7 +12,10 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import torch
 
 from .checkpoint import load_training_checkpoint
-from .datasets import DATASETS, TRAIN_DATASETS, DirectQualityDataset
+from .datasets import (
+    DATASETS, TRAIN_DATASETS, DirectQualityDataset,
+    EXPANDED_TRAIN_DATASETS, EXPANDED_UNSEEN_DATASETS,
+)
 from .model import (
     DirectQualityTransformer,
     fastq_batch_to_tensors,
@@ -62,6 +65,12 @@ def evaluate_reader_range(
 ) -> DatasetMetrics:
     """Evaluate a contiguous split without using it for checkpoint selection."""
 
+    if model.config.block_quality_features:
+        from .block_training import evaluate_block_reader_range
+        return evaluate_block_reader_range(
+            model, reader, dataset, category=category, start=start, stop=stop,
+            batch_reads=batch_reads, max_reads=max_reads, device=device,
+        )
     if category not in EVALUATION_CATEGORIES:
         raise ValueError(f"unknown evaluation category {category!r}")
     if batch_reads <= 0 or batch_reads > 256:
@@ -134,7 +143,7 @@ def summarize_metric_group(metrics: Sequence[DatasetMetrics]) -> Dict[str, Any]:
             "symbols": family_symbols,
         }
     worst = max(metrics, key=lambda metric: metric.bits_per_quality)
-    return {
+    result = {
         "dataset_count": len(metrics),
         "dataset_macro_bits_per_quality": sum(
             metric.bits_per_quality for metric in metrics
@@ -152,6 +161,17 @@ def summarize_metric_group(metrics: Sequence[DatasetMetrics]) -> Dict[str, Any]:
             "bits_per_quality": worst.bits_per_quality,
         },
     }
+    if all(hasattr(metric, "quantized_Q_plus_block_side_bits_per_quality") for metric in metrics):
+        result.update({
+            "dataset_macro_quantized_Q_plus_block_side_bits_per_quality": sum(
+                metric.quantized_Q_plus_block_side_bits_per_quality for metric in metrics
+            ) / len(metrics),
+            "dataset_macro_quantized_Q_bits_per_quality": sum(
+                metric.quantized_bits / metric.symbols for metric in metrics
+            ) / len(metrics),
+            "block_side_bits": sum(metric.block_side_bits for metric in metrics),
+        })
+    return result
 
 
 def build_evaluation_summary(metrics: Sequence[DatasetMetrics]) -> Dict[str, Any]:
@@ -230,8 +250,18 @@ def evaluate_fixed_split(
     model = loaded.model
     split_manifest = loaded.payload["data_split"]
 
+    datasets = DATASETS
+    if model.config.block_quality_features:
+        registry = {
+            dataset.accession: dataset
+            for dataset in EXPANDED_TRAIN_DATASETS + EXPANDED_UNSEEN_DATASETS
+        }
+        accessions = list(split_manifest["datasets"]) + list(split_manifest.get("unseen_datasets", []))
+        if any(accession not in registry for accession in accessions):
+            raise ValueError("block checkpoint contains an unregistered dataset")
+        datasets = tuple(registry[accession] for accession in accessions)
     needed = []
-    for dataset in DATASETS:
+    for dataset in datasets:
         if dataset.training_source and not ({"train", "validation"} & set(categories)):
             continue
         if not dataset.training_source and "unseen_dataset" not in categories:
