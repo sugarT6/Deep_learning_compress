@@ -41,6 +41,12 @@ CUDA_VISIBLE_DEVICES=0 /home/share/huadjyin/home/tanglei2/envs/scgpt/bin/python 
 神经分布的理论 bit 数；`quantized_theoretical_bits` 是固定 rank 表的理论 bit 数。
 `quality_and_adapter_bytes` 包含 rank 码流、适配器及新增 rank 表的实际元数据增量。
 
+## 全文件预测报告
+
+每次编码自动写同名`.predictions.txt`，保留准确率和rank占比，随后按0.1宽度
+统计全文件真实Q的概率区间占比，再汇总`p_true <= 0.3`的read内位置分布。
+上面的40k＋仅输出头微调命令无需新开关；详见[预测报告格式](PREDICTION_REPORT.md)。
+
 ## 解码
 
 新版解码器自动识别 rank 容器版本 5。解码只需要 FQDC 和同一个 40k 共享 checkpoint，

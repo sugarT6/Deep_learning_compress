@@ -68,9 +68,9 @@ available for paired comparisons and old files remain decodable. See
 compression command, protocol and small-sample timing results.
 
 Every encode also writes a sibling `<output-stem>.predictions.txt` with the
-final adapted model's top-1 accuracy over all quality symbols, followed by
-top-five softmax probabilities for up to the first 1,000 coding positions.
-Correct top-1 predictions end with `yes`. Existing commands need no new flag;
+final adapted model's whole-file top-1 accuracy, rank fractions, ten bins of
+probability assigned to the true Q, and read-position statistics for true-Q
+probability at most 0.3. Existing commands need no new flag;
 see [prediction report format](codec/document/PREDICTION_REPORT.md).
 
 Stage B uses strictly shifted previous quality, causal Q-mer histories for

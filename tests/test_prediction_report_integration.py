@@ -74,7 +74,7 @@ class PredictionReportIntegrationTest(unittest.TestCase):
         return source
 
     def _expected(self, model, source, batch_reads):
-        symbols, probabilities = [], []
+        symbols, probabilities, positions = [], [], []
         with torch.inference_mode():
             for batch in iter_fastq_batches(source, batch_reads=batch_reads):
                 logits = model.forward_full(**fastq_batch_to_tensors(batch, torch.device("cpu")))
@@ -84,15 +84,17 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                 weights = np.exp(active_logits)
                 probabilities.extend(weights / weights.sum(axis=1, keepdims=True))
                 symbols.extend(batch.qualities[rows, cycles].tolist())
+                positions.extend((cycles + 1).tolist())
         if not symbols:
-            return np.empty(0, dtype=np.int64), np.empty((0, 42), dtype=np.float64)
-        return np.asarray(symbols), np.asarray(probabilities)
+            return np.empty(0, dtype=np.int64), np.empty((0, 42), dtype=np.float64), np.empty(0, dtype=np.int64)
+        return np.asarray(symbols), np.asarray(probabilities), np.asarray(positions)
 
-    def _assert_report(self, output, statistics, symbols, probabilities):
+    def _assert_report(self, output, statistics, symbols, probabilities, positions):
         report = output.with_suffix(".predictions.txt")
         self.assertEqual(statistics.prediction_report_path, str(report.resolve()))
         lines = report.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 8 + min(1000, len(symbols)))
+        maximum_position = int(positions.max()) if len(positions) else 0
+        self.assertEqual(len(lines), 20 + maximum_position)
         header = re.fullmatch(r"prediction_accuracy=(\S+) correct=(\d+) total=(\d+)", lines[0])
         self.assertIsNotNone(header, lines[0])
         correct = int((probabilities.argmax(axis=1) == symbols).sum()) if len(symbols) else 0
@@ -121,19 +123,31 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                 "rank1 N/A", "rank2 N/A", "rank3 N/A", "rank4 N/A",
                 "rank5 N/A", "rank6 N/A", "rank其它 N/A",
             ])
-        for index, line in enumerate(lines[8:]):
-            pairs = line.split()
-            expected_top = np.argsort(-probabilities[index], kind="stable")[:5]
-            correct_prediction = expected_top[0] == symbols[index]
-            self.assertEqual(pairs[-1] == "yes", correct_prediction)
-            if correct_prediction:
-                pairs.pop()
-            self.assertEqual(len(pairs), 10)
-            self.assertEqual([int(value) for value in pairs[::2]], expected_top.tolist())
-            np.testing.assert_allclose(
-                [float(value) for value in pairs[1::2]],
-                probabilities[index, expected_top], rtol=1e-7, atol=1e-10,
-            )
+        true_probabilities = probabilities[np.arange(len(symbols)), symbols.astype(np.int64)]
+        histogram, _ = np.histogram(true_probabilities, bins=np.arange(11) / 10)
+        self.assertEqual(int(histogram.sum()), len(symbols))
+        for index, count in enumerate(histogram):
+            interval = f"[{index / 10:.1f},{(index + 1) / 10:.1f}" + ("]" if index == 9 else ")")
+            value = f"{int(count) / len(symbols) * 100:.6f}%" if len(symbols) else "N/A"
+            self.assertEqual(lines[8 + index], f"{interval} {value}")
+        low = true_probabilities <= 0.3
+        low_count = int(low.sum())
+        low_fraction = f"{low_count / len(symbols) * 100:.6f}%" if len(symbols) else "N/A"
+        self.assertEqual(lines[18],
+                         f"low_probability=[0.0,0.3] count={low_count} total={len(symbols)} proportion={low_fraction}")
+        self.assertEqual(lines[19],
+                         "low_probability_positions (1-based; share=position_low/all_low; rate=position_low/position_total)")
+        recovered_low = 0
+        for position in range(1, maximum_position + 1):
+            at_position = positions == position
+            total = int(at_position.sum())
+            position_low = int((at_position & low).sum())
+            recovered_low += position_low
+            share = f"{position_low / low_count * 100:.6f}%" if low_count else "N/A"
+            rate = f"{position_low / total * 100:.6f}%" if total else "N/A"
+            self.assertEqual(lines[19 + position],
+                             f"position{position} {share} low={position_low} total={total} rate={rate}")
+        self.assertEqual(recovered_low, low_count)
         return lines
 
     def _encode(self, source, output, checkpoint, **options):
@@ -143,12 +157,12 @@ class PredictionReportIntegrationTest(unittest.TestCase):
             progress=False, **options,
         )
 
-    def test_all_symbols_accuracy_and_first_thousand_follow_cycle_major_order(self):
+    def test_all_symbols_accuracy_probability_bins_and_positions_use_entire_stream(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkpoint, model = self._checkpoint(root)
             source = self._source(root)
-            symbols, probabilities = self._expected(model, source, batch_reads=31)
+            symbols, probabilities, positions = self._expected(model, source, batch_reads=31)
             self.assertGreater(len(symbols), 1000)
             output = root / "compressed.fqdc"
             with mock.patch.object(
@@ -158,7 +172,7 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                 statistics = self._encode(source, output, checkpoint)
             self.assertEqual(forward.call_count, statistics.batch_count)
             self.assertEqual(statistics.quality_symbols, len(symbols))
-            self._assert_report(output, statistics, symbols, probabilities)
+            self._assert_report(output, statistics, symbols, probabilities, positions)
 
     def test_loaded_adapter_predictions_are_reported_and_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -177,15 +191,14 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                 "base_checkpoint_sha256": digest,
                 "adapter": serialize_head(adapted_head, digest), "report": {},
             }))
-            original_symbols, original_probabilities = self._expected(model, source, 31)
+            original_symbols, original_probabilities, _ = self._expected(model, source, 31)
             self.assertFalse(np.all(original_probabilities.argmax(axis=1) == original_symbols))
             model.output_head = adapted_head
-            symbols, probabilities = self._expected(model, source, 31)
+            symbols, probabilities, positions = self._expected(model, source, 31)
             output = root / "adapted.fqdc"
             statistics = self._encode(source, output, checkpoint, head_adapter_path=adapter_path)
-            lines = self._assert_report(output, statistics, symbols, probabilities)
+            self._assert_report(output, statistics, symbols, probabilities, positions)
             self.assertEqual(statistics.prediction_top1_accuracy, 1.0)
-            self.assertTrue(all(line.endswith(" yes") for line in lines[8:]))
             restored = root / "restored.fq"
             decode_fastq(output, restored, checkpoint, device=torch.device("cpu"),
                          batch_reads=31, progress=False)
@@ -226,7 +239,7 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                         streams.append(encoder.finish())
                     self.assertEqual(streams[0], streams[1])
                     self.assertEqual(report.total_symbols, int(batch.active_mask.sum()))
-                    expected_symbols, expected_probabilities = self._expected(model, source, 31)
+                    expected_symbols, expected_probabilities, expected_positions = self._expected(model, source, 31)
                     report_path = root / f"quantizer{version}.predictions.txt"
                     report.write(report_path)
                     lines = report_path.read_text(encoding="utf-8").splitlines()
@@ -243,6 +256,15 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                         f"rank6 {(ranks == 5).mean() * 100:.6f}%",
                         f"rank其它 {(ranks >= 6).mean() * 100:.6f}%",
                     ])
+                    true_probabilities = expected_probabilities[np.arange(len(expected_symbols)), expected_symbols]
+                    expected_bins, _ = np.histogram(true_probabilities, bins=np.arange(11) / 10)
+                    self.assertEqual(report.probability_counts, tuple(expected_bins))
+                    self.assertEqual(report.low_probability_count, int((true_probabilities <= 0.3).sum()))
+                    self.assertEqual(report.position_totals, tuple(np.bincount(expected_positions)[1:]))
+                    self.assertEqual(report.low_probability_position_counts, tuple(
+                        np.bincount(expected_positions[true_probabilities <= 0.3],
+                                    minlength=int(expected_positions.max()) + 1)[1:]
+                    ))
 
     def test_report_ranks_use_unquantized_scores_and_individual_rank_frequencies(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -265,27 +287,60 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                 b"@r\nA\n+\n" + bytes([33 + quality]) + b"\n"
                 for quality in (5, 6, 20, 0, 1, 2, 3)
             ))
-            symbols, probabilities = self._expected(model, source, 31)
+            symbols, probabilities, positions = self._expected(model, source, 31)
             output = root / "close_logits.fqdc"
             statistics = self._encode(source, output, checkpoint)
-            lines = self._assert_report(output, statistics, symbols, probabilities)
+            lines = self._assert_report(output, statistics, symbols, probabilities, positions)
             self.assertEqual(lines[1:8], [
                 "rank1 14.285714%", "rank2 14.285714%", "rank3 14.285714%",
                 "rank4 14.285714%", "rank5 14.285714%", "rank6 14.285714%",
                 "rank其它 14.285714%",
             ])
 
-    def test_ties_choose_smaller_q_in_top_one_and_top_five(self):
+    def test_uniform_scores_keep_rank_ties_and_put_true_probabilities_in_first_bin(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkpoint, model = self._checkpoint(root, uniform=True)
             source = self._source(root, count=15)
-            symbols, probabilities = self._expected(model, source, 31)
+            symbols, probabilities, positions = self._expected(model, source, 31)
             output = root / "uniform.fqdc"
             statistics = self._encode(source, output, checkpoint)
-            lines = self._assert_report(output, statistics, symbols, probabilities)
-            for line in lines[8:]:
-                self.assertEqual([int(value) for value in line.split()[:10:2]], [0, 1, 2, 3, 4])
+            lines = self._assert_report(output, statistics, symbols, probabilities, positions)
+            self.assertEqual(lines[8], "[0.0,0.1) 100.000000%")
+
+    def test_low_probability_positions_use_read_cycles_and_ignore_ragged_padding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, model = self._checkpoint(root, uniform=True)
+            with torch.no_grad():
+                model.output_head.bias.fill_(-1000.0)
+                model.output_head.bias[0] = float(np.log(0.85))
+                model.output_head.bias[1] = float(np.log(0.15))
+            save_training_checkpoint(
+                checkpoint, model=model, optimizer=None, epoch=1, global_step=1,
+                data_split={}, sampler_config={}, sampler_statistics={},
+                best_validation_bits_per_quality=1.0, validation_metrics={},
+            )
+            source = root / "ragged.fq"
+            source.write_bytes(
+                b"@empty\n\n+\n\n"
+                b"@one\nA\n+\n\"\n"
+                b"@three\nAAA\n+\n!\"!\n"
+                b"@two\nAA\n+\n\"!\n"
+            )
+            symbols, probabilities, positions = self._expected(model, source, 31)
+            self.assertEqual(len(symbols), 6)
+            output = root / "ragged.fqdc"
+            statistics = self._encode(source, output, checkpoint)
+            lines = self._assert_report(output, statistics, symbols, probabilities, positions)
+            # p_max is always 0.85, but three true Q1 characters have
+            # p_true=0.15. An empty read and all batch padding contribute zero.
+            self.assertEqual(lines[18], "low_probability=[0.0,0.3] count=3 total=6 proportion=50.000000%")
+            self.assertEqual(lines[20:], [
+                "position1 66.666667% low=2 total=3 rate=66.666667%",
+                "position2 33.333333% low=1 total=2 rate=50.000000%",
+                "position3 0.000000% low=0 total=1 rate=0.000000%",
+            ])
 
     def test_no_quality_symbols_produce_header_only_without_nan(self):
         for contents in (b"", b"@empty\n\n+\n\n" * 3):
@@ -296,7 +351,7 @@ class PredictionReportIntegrationTest(unittest.TestCase):
                 source.write_bytes(contents)
                 output = root / "empty.fqdc"
                 statistics = self._encode(source, output, checkpoint)
-                self._assert_report(output, statistics, np.empty(0), np.empty((0, 42)))
+                self._assert_report(output, statistics, np.empty(0), np.empty((0, 42)), np.empty(0, dtype=int))
 
     def test_report_path_collisions_fail_before_loading_checkpoint(self):
         cases = ("existing", "input", "output", "checkpoint", "loaded_adapter", "exported_adapter", "dangling_symlink")

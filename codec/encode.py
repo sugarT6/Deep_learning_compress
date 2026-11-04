@@ -202,7 +202,7 @@ def _quantize_verified_batch(
         _add_timing(timings, "logits_transfer_and_context", stage_started)
         if prediction_report is not None:
             stage_started = time.perf_counter()
-            prediction_report.observe(active_logits, symbols)
+            prediction_report.observe(active_logits, symbols, positions=cycles + 1)
             _add_timing(timings, "prediction_diagnostic", stage_started)
         stage_started = time.perf_counter()
         neural_theoretical_bits = (
@@ -819,8 +819,8 @@ class _NeuralEncoderParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = _NeuralEncoderParser(
         description="Compress plain/gzip FASTQ with pure neural probabilities and optional head fitting",
-        epilog="Also writes <output-stem>.predictions.txt: whole-file top-1 accuracy "
-               "and up to 1,000 positions with top-five probabilities.",
+        epilog="Also writes <output-stem>.predictions.txt: whole-file top-1/rank statistics, "
+               "true-Q probability bins and read positions with true-Q probability <= 0.3.",
         allow_abbrev=False,
     )
     parser.add_argument("input", type=Path)
