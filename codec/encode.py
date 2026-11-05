@@ -387,9 +387,10 @@ def _encode_fastq_compat(
     if block_enabled:
         if batch_reads != model.config.block_reads:
             raise ValueError("block-conditioned encoding requires --batch-reads equal to checkpoint block_reads")
-        if (head_adaptation_config is not None or head_adapter_path is not None
-                or save_head_adapter_path is not None):
-            raise ValueError("block-conditioned encoding does not yet support file adapters")
+        if head_adaptation_config is not None and (
+                head_adaptation_config.backbone_layers or head_adaptation_config.lora
+                or head_adaptation_config.read_quality_state):
+            raise ValueError("block-conditioned encoding supports only output-head adaptation, without backbone, LoRA, or read-state adaptation")
         if online_prior_config is not None or use_rank or hasattr(model, "read_state_conditioning"):
             raise ValueError("block-conditioned encoding requires neural coding without priors or read-state adapters")
     _synchronize_device(device)
@@ -422,6 +423,10 @@ def _encode_fastq_compat(
                 raise ValueError("invalid adapter artifact or base checkpoint mismatch")
             adapter = artifact["adapter"]
             if adapter is not None:
+                if block_enabled and (not isinstance(adapter, dict)
+                        or type(adapter.get("version")) is not int
+                        or adapter["version"] not in (1, 2, 4)):
+                    raise ValueError("block-conditioned encoding supports only linear, residual, or cross-layer output-head adapters")
                 apply_head_adapter(model, adapter, checkpoint_sha256)
             adaptation_report = {"accepted": adapter is not None, "reason": "loaded_artifact",
                                  "artifact_source": artifact.get("source"), "original_report": artifact["report"]}
@@ -736,6 +741,8 @@ def _encode_fastq_compat(
     state_stream_bytes, state_metadata_bytes = state_container_overhead(container_info)
     block_stream_bytes = container_info.section("block_features").length if block_enabled else 0
     block_metadata_bytes = block_feature_metadata_bytes(container_info.metadata, compressed=compress_metadata)
+    if block_enabled and adaptation_report is not None:
+        adaptation_report["container_adapter_bytes"] = adaptation_metadata_bytes(container_info.metadata, compressed=False)[0]
     if compress_metadata:
         adapter_bytes, state_metadata_bytes = adaptation_metadata_bytes(container_info.metadata, compressed=True)
         if adaptation_report is not None:

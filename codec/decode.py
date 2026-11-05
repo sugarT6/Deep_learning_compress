@@ -184,7 +184,7 @@ def _validate_checkpoint(
         raise ModelMismatchError("checkpoint feature schema does not match container")
     loaded.model.eval()
     if metadata["format_version"] in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION) or (
-            metadata["format_version"] == RANK_CONTAINER_VERSION and "head_adapter" in metadata):
+            metadata["format_version"] in (RANK_CONTAINER_VERSION, BLOCK_FEATURE_CONTAINER_VERSION) and "head_adapter" in metadata):
         from .head_adapter import apply_head_adapter
         apply_head_adapter(loaded.model, metadata["head_adapter"], observed_hash)
     return loaded.model

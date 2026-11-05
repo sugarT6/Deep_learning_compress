@@ -235,7 +235,15 @@ def block_feature_metadata_bytes(metadata: Mapping[str, Any], *, compressed: boo
         return 0
     from .model import DirectQualityModelConfig, feature_schema
 
-    baseline = copy.deepcopy(dict(metadata))
+    # Charge block information first and the optional output head afterwards.
+    # This order avoids counting compression interactions twice when both are
+    # present: adapter cost is measured against this unadapted block metadata.
+    actual = dict(metadata)
+    if "head_adapter" in actual:
+        actual.pop("head_adapter")
+        if actual.get("probability_profile", object()) is None:
+            actual.pop("probability_profile")
+    baseline = copy.deepcopy(actual)
     baseline.pop("block_features")
     baseline["sections"] = [section for section in metadata["sections"] if section["name"] != "block_features"]
     config = dict(baseline["checkpoint"]["model_config"])
@@ -244,7 +252,7 @@ def block_feature_metadata_bytes(metadata: Mapping[str, Any], *, compressed: boo
     plain_config = DirectQualityModelConfig.from_dict(config)
     baseline["checkpoint"]["model_config"] = plain_config.to_dict()
     baseline["checkpoint"]["feature_schema"] = feature_schema(plain_config)
-    return len(metadata_payload(metadata, compressed=compressed)) - len(metadata_payload(baseline, compressed=compressed))
+    return len(metadata_payload(actual, compressed=compressed)) - len(metadata_payload(baseline, compressed=compressed))
 
 
 def _integer(value: Any, *, name: str, minimum: int = 0) -> int:
@@ -370,8 +378,8 @@ def _validate_metadata(
         expected_block_bytes = expected_batches * (BLOCK_FEATURE_BYTES if mode == "features" else 0)
         if _integer(block.get("stream_bytes"), name="block feature stream_bytes") != expected_block_bytes:
             raise ContainerError("block feature stream length does not match block count and mode")
-        if probability_profile is not None or any(name in metadata for name in ("head_adapter", "read_state", "rank_encoding")):
-            raise ContainerError("block coding does not support probability profiles, adapters, read states, or rank coding")
+        if probability_profile is not None or any(name in metadata for name in ("read_state", "rank_encoding")):
+            raise ContainerError("block coding does not support probability profiles, read states, or rank coding")
         sections = metadata.get("sections", [])
         block_sections = [section for section in sections if isinstance(section, dict) and section.get("name") == "block_features"]
         if len(block_sections) != 1 or any(
@@ -393,7 +401,7 @@ def _validate_metadata(
     elif "rank_encoding" in metadata:
         raise ContainerError("rank_encoding requires container version 5")
     if format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION) or (
-            format_version == RANK_CONTAINER_VERSION and "head_adapter" in metadata):
+            format_version in (RANK_CONTAINER_VERSION, BLOCK_FEATURE_CONTAINER_VERSION) and "head_adapter" in metadata):
         if "probability_profile" not in metadata:
             raise ContainerError("version-3 requires explicit probability_profile (null for neural-only)")
         try:
@@ -401,6 +409,10 @@ def _validate_metadata(
             validate_head_adapter(metadata.get("head_adapter"),
                                   checkpoint["model_config"].get("d_model"), checkpoint["sha256"])
             adapter = metadata["head_adapter"]
+            if format_version == BLOCK_FEATURE_CONTAINER_VERSION and (
+                    adapter.get("version") not in (1, 2, 4)
+                    or (adapter["version"] == 4 and checkpoint["model_config"].get("num_layers", 4) < 4)):
+                raise ValueError("block coding supports only linear, residual, or cross-layer output-head adapters")
             if adapter.get("version") in (7, 8, 9) and (
                     adapter["num_layers"] != checkpoint["model_config"].get("num_layers")
                     or adapter["feedforward_dim"] != checkpoint["model_config"].get("feedforward_dim")):
@@ -420,7 +432,7 @@ def _validate_metadata(
         except ValueError as exc:
             raise ContainerError(f"invalid head_adapter: {exc}") from exc
     elif "head_adapter" in metadata:
-        raise ContainerError("head_adapter requires container version 3, 4 or 5")
+        raise ContainerError("head_adapter requires container version 3, 4, 5 or 6")
     if format_version != READ_STATE_CONTAINER_VERSION and "read_state" in metadata:
         raise ContainerError("read_state requires container version 4")
     if format_version == LEGACY_CONTAINER_VERSION:

@@ -82,6 +82,35 @@ constant模式使用双方已知的全零描述，不读取未来Q得到模型�
 `block_feature_stream_bytes`和`block_feature_metadata_bytes`分别记录描述流及新增metadata，
 两者加入`quality_and_adapter_bytes`。普通v1～5文件继续支持。
 
-第一版block模型直接使用神经概率编码，`--batch-reads`须与checkpoint相同；
-暂不组合rank编码、旧prior、read-state或文件级head/LoRA适配。模型不接收免费未来Q。
+block模型直接使用神经概率编码，`--batch-reads`须与checkpoint相同；
+支持仅输出头微调及导出/复用线性、residual、cross-layer头；主干及block条件网络冻结。
+暂不组合rank编码、旧prior、read-state或suffix/LoRA适配。模型不接收免费未来Q。
 特征提取是固定统计，当前训练的是条件网络和主干，还不是学习式hyperencoder。
+
+## 仅输出头微调后压缩CNR0847462
+
+以下使用已训练完成的block模型，沿用residual64/cross16头、2000步；不设秒数上限。
+8000-read上限向下保留7936条完整block，按完整block划分5888训练/2048验证，
+实际EOF尾块可保留。微调缓存使用原文件完整block描述的wire恢复值，与正式编码一致。
+原输出头验证接受逻辑保留；报告`head_adaptation.accepted/steps_completed`记录实际使用情况。
+
+```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+block_head_dir=$(mktemp -d codec/output/CNR0847462_block_head_XXXXXX)
+CUDA_VISIBLE_DEVICES=0 /home/share/huadjyin/home/tanglei2/envs/scgpt/bin/python -m codec.encode \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  "$block_head_dir/CNR0847462.block_head.fqdc" \
+  codec/runs/block_quality_expanded20_y6qHS0/best.pt \
+  --device cuda --batch-reads 256 \
+  --quality-coding neural --quantizer floor --coder-backend native \
+  --finetune-head --head-type residual --head-residual-dim 64 \
+  --head-cross-layer --head-cross-dim 16 \
+  --head-max-reads 8000 --head-max-symbols 1200000 \
+  --head-steps 2000 --head-max-seconds 0 \
+  --save-head-adapter "$block_head_dir/head.adapter.json" \
+  > "$block_head_dir/metrics.json"
+```
+
+压缩进度和微调日志保留在终端。预测报告为同目录
+`CNR0847462.block_head.predictions.txt`。比较`range_stream_bytes`和
+`quality_and_adapter_bytes`，后者已计入头及block描述；2M条read需要7813块、125008B描述流。

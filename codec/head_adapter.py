@@ -306,9 +306,15 @@ def apply_head_adapter(model, metadata, base_sha256):
 def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256, config):
     """Return optional adapter + report; mutate only the accepted model head.
 
-    Prefix split is by whole reads (first 75% train, last 25% validation).
+    Prefix split is by whole reads (first 75% train, last 25% validation),
+    or by whole original blocks for a block-conditioned checkpoint.
     Admission tests neural quantized bits, not hybrid or whole-file savings.
     """
+    block_enabled = bool(getattr(model.config, "block_quality_features", False))
+    if block_enabled and (config.backbone_layers or config.lora or config.read_quality_state):
+        raise ValueError("block-conditioned adaptation supports output-head fitting only")
+    if block_enabled and batch_reads != model.config.block_reads:
+        raise ValueError("block-conditioned adaptation requires batch_reads equal to block_reads")
     if config.backbone_layers:
         from .backbone_adapter import adapt_backbone
         return adapt_backbone(model, source, device=device, batch_reads=batch_reads,
@@ -364,14 +370,50 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
             report["prefix_symbols"] += length
     finally:
         iterator.close()
+    if block_enabled:
+        # A cap must not turn part of an original block into a new descriptor.
+        # Only a genuine file tail may use fewer than block_reads records.
+        block_reads = model.config.block_reads
+        if report["sample_stop"] != "eof":
+            records = records[:len(records) // block_reads * block_reads]
+        report["prefix_symbols"] = sum(len(r.quality) for r in records)
+        digest = hashlib.sha256()
+        for record in records:
+            digest.update(record.to_bytes())
     stages["prefix_read"] = time.perf_counter() - started
     report["prefix_sha256"] = digest.hexdigest()
     report["prefix_reads"] = len(records)
     if len(records) < 4:
         return finish()
     split = len(records) * 3 // 4
+    if block_enabled:
+        block_count = (len(records) + block_reads - 1) // block_reads
+        if block_count < 2:
+            report["reason"] = "insufficient_prefix_blocks"
+            return finish()
+        split = max(1, min(block_count - 1, block_count * 3 // 4)) * block_reads
+        report.update(block_reads=block_reads, prefix_blocks=block_count,
+                      block_feature_mode=model.config.block_feature_mode)
     report.update(train_reads=split, validation_reads=len(records) - split,
                   train_read_range=[0, split], validation_read_range=[split, len(records)])
+
+    def make_batch(rows):
+        return make_fastq_batch([encode_base_ids(r.sequence) for r in rows],
+            [np.frombuffer(r.quality, dtype=np.uint8) - 33 for r in rows],
+            [r.read_index for r in rows], source_name=Path(source).name)
+
+    block_inputs = None
+    if block_enabled:
+        from .block_features import BLOCK_FEATURE_DIM, decode_block_features, encode_block_features
+        block_inputs = np.zeros((len(records), BLOCK_FEATURE_DIM), dtype=np.float32)
+        if model.config.block_feature_mode == "features":
+            for begin in range(0, len(records), block_reads):
+                if time.perf_counter() >= work_deadline:
+                    report["reason"] = "feature_time_budget"
+                    return finish()
+                rows = records[begin:begin + block_reads]
+                block_inputs[begin:begin + len(rows)] = decode_block_features(
+                    encode_block_features(make_batch(rows)))
     original_training = model.training
     original_requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
     model.eval()
@@ -380,7 +422,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         feature_started = time.perf_counter()
         cached = []
         # Preallocate active-only features; avoid an additional full-size cat copy.
-        for name, subset in (("train", records[:split]), ("validation", records[split:])):
+        for name, subset, source_begin in (("train", records[:split], 0),
+                                          ("validation", records[split:], split)):
             n = sum(len(r.quality) for r in subset)
             report[name + "_symbols"] = n
             if not n:
@@ -393,10 +436,12 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
                     report["reason"] = "feature_time_budget"
                     return finish()
                 rows = subset[begin:begin + batch_reads]
-                batch = make_fastq_batch([encode_base_ids(r.sequence) for r in rows],
-                    [np.frombuffer(r.quality, dtype=np.uint8) - 33 for r in rows],
-                    [r.read_index for r in rows], source_name=Path(source).name)
+                batch = make_batch(rows)
                 tensors = fastq_batch_to_tensors(batch, device)
+                if block_inputs is not None:
+                    tensors["block_features"] = torch.as_tensor(
+                        block_inputs[source_begin + begin:source_begin + begin + len(rows)],
+                        dtype=torch.float32, device=device)
                 with torch.no_grad():
                     h = (model.forward_cross_layer_features(**tensors) if config.cross_layer
                          else model.forward_features(**tensors))
