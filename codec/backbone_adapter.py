@@ -249,15 +249,19 @@ def sample_records(source, config, skip_reads, deadline):
     return selected, report
 
 
-def _tensors(records, device, source):
+def _tensors(records, device, source, block_features=None):
     batch = make_fastq_batch([encode_base_ids(r.sequence) for r in records],
         [np.frombuffer(r.quality, dtype=np.uint8) - 33 for r in records],
         [r.read_index for r in records], source_name=str(source))
-    return fastq_batch_to_tensors(batch, device)
+    tensors = fastq_batch_to_tensors(batch, device)
+    if block_features is not None:
+        tensors["block_features"] = torch.as_tensor(block_features, dtype=torch.float32, device=device)
+    return tensors
 
 
 @torch.no_grad()
-def score_model(model, records, *, device, batch_reads, source, total, version, deadline, quantized):
+def score_model(model, records, *, device, batch_reads, source, total, version, deadline, quantized,
+                block_features=None):
     was_training = model.training
     model.eval()
     try:
@@ -265,7 +269,8 @@ def score_model(model, records, *, device, batch_reads, source, total, version, 
         for begin in range(0, len(records), batch_reads):
             if time.perf_counter() >= deadline:
                 return None
-            tensors = conditioned_tensors(model, _tensors(records[begin:begin + batch_reads], device, source))
+            features = None if block_features is None else block_features[begin:begin + batch_reads]
+            tensors = conditioned_tensors(model, _tensors(records[begin:begin + batch_reads], device, source, features))
             active = tensors["active_mask"]
             logits, labels = model.forward_full(**tensors)[active], tensors["qualities"][active]
             if not torch.isfinite(logits).all():
@@ -290,6 +295,9 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     )
     if config.backbone_layers > model.config.num_layers:
         raise ValueError("cannot adapt more backbone layers than the model contains")
+    block_enabled = bool(getattr(model.config, "block_quality_features", False))
+    if block_enabled and (not config.backbone_lora_rank or config.read_quality_state):
+        raise ValueError("block-conditioned backbone adaptation requires suffix LoRA without read-state adaptation")
     if not config.backbone_lora_rank and (
         model.config.relative_position_bias or model.config.base_cross_attention
     ):
@@ -316,6 +324,14 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
                   backbone_lora_rank=config.backbone_lora_rank,
                   backbone_selection_policy="best_trained_state_without_gain_gate",
                   backbone_validation_scope="random_read_holdout_after_warmup_prefix")
+    validate = config.validation_enabled
+    if not validate:
+        report.update(backbone_selection_policy="final_trained_step_without_validation",
+                      backbone_validation_scope="disabled",
+                      backbone_before_validation_bits_per_quality=None,
+                      backbone_after_validation_bits_per_quality=None)
+    elif block_enabled:
+        report["backbone_validation_scope"] = "random_original_block_holdout_after_warmup_prefix"
 
     def finish(adapter, reason):
         if device.type == "cuda":
@@ -335,13 +351,27 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
         return adapter, report
 
     sampling_started = time.perf_counter()
-    records, sample = sample_records(source, config, warm_report["prefix_reads"], deadline)
+    block_inputs = None
+    if block_enabled:
+        from .block_adaptation import sample_block_records
+        records, sample, block_inputs = sample_block_records(source, config,
+            warm_report["prefix_reads"], deadline, block_reads=model.config.block_reads,
+            feature_mode=model.config.block_feature_mode)
+    else:
+        records, sample = sample_records(source, config, warm_report["prefix_reads"], deadline)
     report["backbone_sampling"] = sample
     report["backbone_stage_seconds"]["sampling"] = time.perf_counter() - sampling_started
     if not sample["sampling_complete"] or len(records) < 4:
         raise ValueError("backbone sampling timed out or has fewer than four eligible reads")
-    split = len(records) * 3 // 4
+    split = len(records) if not validate else len(records) * 3 // 4
+    if validate and block_enabled:
+        counts = sample["sampled_block_read_counts"]
+        if len(counts) < 2:
+            raise ValueError("validated block adaptation needs at least two sampled blocks")
+        split = sum(counts[:max(1, min(len(counts) - 1, len(counts) * 3 // 4))])
     train, validation = records[:split], records[split:]
+    train_features = None if block_inputs is None else block_inputs[:split]
+    validation_features = None if block_inputs is None else block_inputs[split:]
     report.update(backbone_train_reads=len(train), backbone_validation_reads=len(validation))
     candidate = copy.deepcopy(model).eval().requires_grad_(False)
     if warm is None:
@@ -386,28 +416,40 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     ])
     common = dict(device=device, batch_reads=config.backbone_batch_reads, source=source,
                   total=total, version=config.quantization_version, deadline=deadline)
-    initial_loss = score_model(candidate, validation, quantized=False, **common)
-    if initial_loss is None:
-        raise ValueError("backbone initial validation timed out")
-    if not math.isfinite(initial_loss):
-        raise ValueError("backbone initial validation is nonfinite")
+    score_options = {} if validation_features is None else {"block_features": validation_features}
     # Select among trained states, even if all are worse than the warm-up head.
     # Step zero must not silently act as the old head-only fallback.
     best_loss, best = float("inf"), None
-    control = TrainingControl(optimizer, TrainingControlConfig(
-        lr_scheduler="plateau", lr_patience=2,
-        min_lr=min(config.learning_rate, config.backbone_learning_rate) * .01,
-        early_stopping_patience=config.backbone_patience), best_bits=initial_loss)
-    report["backbone_validation_history"].append(dict(step=0, bits_per_quality=initial_loss))
+    control = None
+    if validate:
+        initial_loss = score_model(candidate, validation, quantized=False, **score_options, **common)
+        if initial_loss is None:
+            raise ValueError("backbone initial validation timed out")
+        if not math.isfinite(initial_loss):
+            raise ValueError("backbone initial validation is nonfinite")
+        control = TrainingControl(optimizer, TrainingControlConfig(
+            lr_scheduler="plateau", lr_patience=2,
+            min_lr=min(config.learning_rate, config.backbone_learning_rate) * .01,
+            early_stopping_patience=config.backbone_patience), best_bits=initial_loss)
+        report["backbone_validation_history"].append(dict(step=0, bits_per_quality=initial_loss))
     report["backbone_trainable_parameters"] = sum(p.numel() for p in backbone)
     report["head_trainable_parameters"] = sum(p.numel() for p in head)
     rng = random.Random(config.seed)
+    nonempty_train = [index for index, record in enumerate(train) if record.quality]
+    if not nonempty_train:
+        raise ValueError("backbone adaptation training sample contains no quality symbols")
     optimization_started = time.perf_counter()
     for step in range(1, config.backbone_steps + 1):
         if time.perf_counter() >= deadline:
             break
-        rows = rng.sample(train, min(config.backbone_batch_reads, len(train)))
-        tensors = conditioned_tensors(candidate, _tensors(rows, device, source))
+        if train_features is None:
+            rows = rng.sample(train, min(config.backbone_batch_reads, len(train)))
+            features = None
+        else:
+            indices = rng.sample(nonempty_train, min(config.backbone_batch_reads, len(nonempty_train)))
+            rows = [train[index] for index in indices]
+            features = train_features[indices]
+        tensors = conditioned_tensors(candidate, _tensors(rows, device, source, features))
         optimizer.zero_grad(set_to_none=True)
         active = tensors["active_mask"]
         loss = F.cross_entropy(candidate.forward_full(**tensors)[active], tensors["qualities"][active])
@@ -419,8 +461,11 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
         torch.nn.utils.clip_grad_norm_(list(trainable.values()), 1.)
         optimizer.step()
         report["backbone_steps_completed"] = step
-        if step % config.backbone_eval_every == 0 or step == config.backbone_steps:
-            value = score_model(candidate, validation, quantized=False, **common)
+        if not validate:
+            if step % config.backbone_eval_every == 0 or step == config.backbone_steps:
+                print(f"Backbone step={step}/{config.backbone_steps} train_loss={float(loss.detach()):.6f} validation=disabled", file=sys.stderr)
+        elif step % config.backbone_eval_every == 0 or step == config.backbone_steps:
+            value = score_model(candidate, validation, quantized=False, **score_options, **common)
             if value is None:
                 break
             if not math.isfinite(value):
@@ -438,11 +483,18 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
                 report["backbone_stopped_early"] = True
                 break
     report["backbone_stage_seconds"]["optimization"] = time.perf_counter() - optimization_started
-    if best is None:
-        raise ValueError("backbone training ended before a trained state could be validated")
-    with torch.no_grad():
-        for name, parameter in trainable.items():
-            parameter.copy_(best[name])
+    if validate:
+        if best is None:
+            raise ValueError("backbone training ended before a trained state could be validated")
+        with torch.no_grad():
+            for name, parameter in trainable.items():
+                parameter.copy_(best[name])
+    else:
+        if not report["backbone_steps_completed"]:
+            raise ValueError("backbone training ended before any update")
+        if not all(torch.isfinite(parameter).all() for parameter in trainable.values()):
+            raise ValueError("backbone final parameters are nonfinite")
+        report["backbone_selected_step"] = report["backbone_steps_completed"]
     serialization_started = time.perf_counter()
     if config.backbone_lora_rank:
         from .suffix_lora_adapter import serialize_suffix_lora
@@ -457,8 +509,8 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
     wire.eval()
     report["backbone_stage_seconds"]["serialization"] = time.perf_counter() - serialization_started
     validation_started = time.perf_counter()
-    before = score_model(model, validation, quantized=True, **common)
-    after = score_model(wire, validation, quantized=True, **common)
+    before = score_model(model, validation, quantized=True, **score_options, **common) if validate else None
+    after = score_model(wire, validation, quantized=True, **score_options, **common) if validate else None
     report["backbone_stage_seconds"]["wire_validation"] = time.perf_counter() - validation_started
     report.update(candidate_parameter_bytes=adapter["parameter_bytes"],
                   candidate_metadata_bytes=len(json.dumps(adapter, sort_keys=True,
@@ -467,6 +519,17 @@ def adapt_backbone(model, source, *, device, batch_reads, total, base_sha256, co
                   candidate_backbone_raw_bytes=adapter["raw_bytes"],
                   backbone_before_validation_bits_per_quality=before,
                   backbone_after_validation_bits_per_quality=after)
+    if not validate:
+        report["backbone_stage_seconds"].pop("wire_validation")
+        report.update(estimated_quality_saving_bytes=None,
+                      estimated_net_saving_bytes=None,
+                      incremental_adapter_bytes=adapter_container_bytes(adapter) - adapter_container_bytes(warm),
+                      estimated_read_state_stream_bytes=(
+                          (sample["total_file_reads"] * bits_per_label(config.read_state_classes) + 7) // 8
+                          if config.read_quality_state else 0))
+        apply_head_adapter(model, adapter, base_sha256)
+        report["backbone_accepted"] = True
+        return finish(adapter, "backbone_final_trained_step_without_validation")
     if before is None or after is None:
         raise ValueError("backbone wire validation timed out")
     if not math.isfinite(before) or not math.isfinite(after):

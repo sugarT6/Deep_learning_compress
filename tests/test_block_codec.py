@@ -4,12 +4,14 @@ import struct
 import tempfile
 import unittest
 import zlib
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import torch
 
 from codec.block_features import encode_block_features
-from codec.checkpoint import save_training_checkpoint
+from codec.checkpoint import load_training_checkpoint, save_training_checkpoint
 from codec.container import (
     BLOCK_FEATURE_CONTAINER_VERSION,
     ContainerError,
@@ -20,9 +22,9 @@ from codec.container import (
     sha256_file,
 )
 from codec.decode import decode_fastq
-from codec.encode import _encode_fastq_compat, encode_fastq
+from codec.encode import _encode_fastq_compat, encode_fastq, build_parser, main as encode_main
 from codec.fastq_stream import iter_fastq_batches
-from codec.head_adapter import HeadAdaptationConfig
+from codec.head_adapter import HeadAdaptationConfig, adapt_output_head
 from codec.model import DirectQualityModelConfig, DirectQualityTransformer, feature_schema
 from codec.online_prior import DEFAULT_ONLINE_PRIOR_CONFIG
 
@@ -268,6 +270,55 @@ class BlockCodecTest(unittest.TestCase):
                         self.assertEqual(result.quality_and_adapter_bytes,
                             result.range_stream_bytes + result.block_feature_stream_bytes + expected_metadata)
 
+    def test_head_without_validation_trains_all_prefix_and_never_scores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "adapt.fastq"
+            source.write_bytes(b"@read\nACGT\n+\n5555\n" * 4)
+            checkpoint = self.checkpoint(root)
+            for block_enabled in (True, False):
+                model = load_training_checkpoint(checkpoint).model
+                if not block_enabled:
+                    model = DirectQualityTransformer(replace(model.config, block_quality_features=False))
+                before = {name: value.detach().clone() for name, value in model.state_dict().items()}
+                config = HeadAdaptationConfig(max_reads=4, max_symbols=16,
+                    steps=2, symbols_per_step=16, max_seconds=0,
+                    learning_rate=0.01, min_gain_bits_per_quality=1000,
+                    validation_enabled=False)
+                with mock.patch("codec.head_adapter.logits_to_cdfs", side_effect=AssertionError("validation was called")):
+                    adapter, report = adapt_output_head(model, source, device=torch.device("cpu"),
+                        batch_reads=4, total=65536, base_sha256=sha256_file(checkpoint), config=config)
+                self.assertIsNotNone(adapter)
+                self.assertEqual(report["steps_completed"], 2)
+                self.assertTrue(report["accepted"])
+                self.assertEqual(report["reason"], "final_step_without_validation")
+                self.assertEqual(report["train_reads"], 4)
+                self.assertEqual(report["train_symbols"], 16)
+                self.assertEqual(report["validation_reads"], 0)
+                self.assertEqual(report["validation_symbols"], 0)
+                self.assertIsNone(report["before_validation_bits_per_quality"])
+                self.assertIsNone(report["after_validation_bits_per_quality"])
+                self.assertIsNone(report["selection_metric"])
+                self.assertNotIn("validation", report["stage_seconds"])
+                self.assertTrue(any(not torch.equal(before[name], value) for name, value in model.state_dict().items()
+                                    if name.startswith("output_head.")))
+                for name, value in model.state_dict().items():
+                    if not name.startswith("output_head."):
+                        self.assertTrue(torch.equal(before[name], value), name)
+
+    def test_no_adaptation_validation_cli_requires_finetune_head(self):
+        parser = build_parser()
+        defaults = parser.parse_args(["input.fastq", "output.fqdc", "model.pt"])
+        self.assertFalse(defaults.no_adaptation_validation)
+        enabled = parser.parse_args(["input.fastq", "output.fqdc", "model.pt",
+                                     "--finetune-head", "--no-adaptation-validation"])
+        self.assertTrue(enabled.no_adaptation_validation)
+        with mock.patch("sys.argv", ["codec.encode", "input.fastq", "output.fqdc", "model.pt", "--no-adaptation-validation"]):
+            with self.assertRaisesRegex(SystemExit, "requires --finetune-head"):
+                encode_main()
+        with self.assertRaisesRegex(ValueError, "validation_enabled must be bool"):
+            HeadAdaptationConfig(validation_enabled=1)
+
     def test_block_encoder_rejects_mismatched_batch_and_unsupported_combinations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -287,14 +338,14 @@ class BlockCodecTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _encode_fastq_compat(source, root / "prior.fqdc", checkpoint, device=torch.device("cpu"),
                                      batch_reads=4, online_prior_config=DEFAULT_ONLINE_PRIOR_CONFIG, progress=False)
-            for version in (6, 7, 8, 9):
+            for version in (6, 7, 9):
                 artifact = root / f"unsupported{version}.json"
                 artifact.write_text(json.dumps({
                     "format": "direct-quality-head-adaptation-artifact", "version": 1,
                     "base_checkpoint_sha256": sha256_file(checkpoint),
                     "adapter": {"version": version}, "report": {},
                 }))
-                with self.assertRaisesRegex(ValueError, "only linear, residual, or cross-layer"):
+                with self.assertRaisesRegex(ValueError, "only output-head or suffix-LoRA"):
                     self.encode(source, root / f"bad_adapter{version}.fqdc", checkpoint, head_adapter_path=artifact)
             self.assertFalse(list(root.glob("*.fqdc")))
 

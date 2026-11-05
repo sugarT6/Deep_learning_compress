@@ -388,9 +388,10 @@ def _encode_fastq_compat(
         if batch_reads != model.config.block_reads:
             raise ValueError("block-conditioned encoding requires --batch-reads equal to checkpoint block_reads")
         if head_adaptation_config is not None and (
-                head_adaptation_config.backbone_layers or head_adaptation_config.lora
+                (head_adaptation_config.backbone_layers and not head_adaptation_config.backbone_lora_rank)
+                or head_adaptation_config.lora
                 or head_adaptation_config.read_quality_state):
-            raise ValueError("block-conditioned encoding supports only output-head adaptation, without backbone, LoRA, or read-state adaptation")
+            raise ValueError("block-conditioned encoding supports output-head and suffix-LoRA adaptation, without dense, legacy LoRA, or read-state adaptation")
         if online_prior_config is not None or use_rank or hasattr(model, "read_state_conditioning"):
             raise ValueError("block-conditioned encoding requires neural coding without priors or read-state adapters")
     _synchronize_device(device)
@@ -425,8 +426,8 @@ def _encode_fastq_compat(
             if adapter is not None:
                 if block_enabled and (not isinstance(adapter, dict)
                         or type(adapter.get("version")) is not int
-                        or adapter["version"] not in (1, 2, 4)):
-                    raise ValueError("block-conditioned encoding supports only linear, residual, or cross-layer output-head adapters")
+                        or adapter["version"] not in (1, 2, 4, 8)):
+                    raise ValueError("block-conditioned encoding supports only output-head or suffix-LoRA adapters")
                 apply_head_adapter(model, adapter, checkpoint_sha256)
             adaptation_report = {"accepted": adapter is not None, "reason": "loaded_artifact",
                                  "artifact_source": artifact.get("source"), "original_report": artifact["report"]}
@@ -443,7 +444,7 @@ def _encode_fastq_compat(
             print(f"Selected adapter: {adaptation_report['selected_adapter_type']}; "
                   f"backbone_accepted={adaptation_report['backbone_accepted']}; "
                   f"fallback={adaptation_report['backbone_fallback']}", file=sys.stderr)
-            if "estimated_net_saving_bytes" in adaptation_report:
+            if adaptation_report.get("estimated_net_saving_bytes") is not None:
                 print(f"Estimated quality saving={adaptation_report['estimated_quality_saving_bytes']:.0f} B; "
                       f"extra adapter={adaptation_report['incremental_adapter_bytes']} B; "
                       f"net saving={adaptation_report['estimated_net_saving_bytes']:.0f} B", file=sys.stderr)
@@ -904,6 +905,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="adapt frozen-feature output head before pure-neural encoding")
     adaptation_options.add_argument("--head-adapter", type=Path, help="load exported adapter, without retraining")
     parser.add_argument("--save-head-adapter", type=Path, help="export accepted head or explicit fallback for paired tests")
+    parser.add_argument("--no-adaptation-validation", action="store_true",
+        help="train all adaptation samples and transmit the final step; skip held-out validation and intermediate selection; requires --finetune-head")
     parser.add_argument("--head-max-reads", type=int, default=4096)
     parser.add_argument("--head-max-symbols", type=int, default=600000)
     parser.add_argument("--head-max-read-length", type=int, default=2048)
@@ -953,6 +956,8 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         head_config = None
+        if args.no_adaptation_validation and not args.finetune_head:
+            raise ValueError("--no-adaptation-validation requires --finetune-head")
         if args.read_state_classes != 4 and not args.read_quality_state:
             raise ValueError("--read-state-classes requires --read-quality-state")
         if not args.head_lora and (args.head_lora_rank != 4 or args.head_lora_steps != 1000 or args.head_lora_learning_rate != 0.0003):
@@ -983,7 +988,8 @@ def main() -> int:
                 backbone_eval_every=args.backbone_eval_every, backbone_patience=args.backbone_patience,
                 backbone_max_reads=args.backbone_max_reads, backbone_max_symbols=args.backbone_max_symbols,
                 backbone_lora_rank=args.backbone_lora_rank, read_quality_state=args.read_quality_state,
-                read_state_classes=args.read_state_classes)
+                read_state_classes=args.read_state_classes,
+                validation_enabled=not args.no_adaptation_validation)
         elif any(getattr(args, name) != build_parser().get_default(name) for name in (
             "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
             "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",

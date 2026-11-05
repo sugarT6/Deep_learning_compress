@@ -410,9 +410,9 @@ def _validate_metadata(
                                   checkpoint["model_config"].get("d_model"), checkpoint["sha256"])
             adapter = metadata["head_adapter"]
             if format_version == BLOCK_FEATURE_CONTAINER_VERSION and (
-                    adapter.get("version") not in (1, 2, 4)
+                    adapter.get("version") not in (1, 2, 4, 8)
                     or (adapter["version"] == 4 and checkpoint["model_config"].get("num_layers", 4) < 4)):
-                raise ValueError("block coding supports only linear, residual, or cross-layer output-head adapters")
+                raise ValueError("block coding supports only output-head or suffix-LoRA adapters")
             if adapter.get("version") in (7, 8, 9) and (
                     adapter["num_layers"] != checkpoint["model_config"].get("num_layers")
                     or adapter["feedforward_dim"] != checkpoint["model_config"].get("feedforward_dim")):

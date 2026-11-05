@@ -83,8 +83,9 @@ constant模式使用双方已知的全零描述，不读取未来Q得到模型�
 两者加入`quality_and_adapter_bytes`。普通v1～5文件继续支持。
 
 block模型直接使用神经概率编码，`--batch-reads`须与checkpoint相同；
-支持仅输出头微调及导出/复用线性、residual、cross-layer头；主干及block条件网络冻结。
-暂不组合rank编码、旧prior、read-state或suffix/LoRA适配。模型不接收免费未来Q。
+支持仅输出头微调及导出/复用线性、residual、cross-layer头；也支持suffix LoRA v8。
+block条件网络在文件适配中冻结，LoRA仅更新选定Transformer矩阵的低秩因子、final norm和头。
+暂不组合rank编码、旧prior、read-state、dense suffix或旧单层head-LoRA。模型不接收免费未来Q。
 特征提取是固定统计，当前训练的是条件网络和主干，还不是学习式hyperencoder。
 
 ## 仅输出头微调后压缩CNR0847462
@@ -114,3 +115,43 @@ CUDA_VISIBLE_DEVICES=0 /home/share/huadjyin/home/tanglei2/envs/scgpt/bin/python 
 压缩进度和微调日志保留在终端。预测报告为同目录
 `CNR0847462.block_head.predictions.txt`。比较`range_stream_bytes`和
 `quality_and_adapter_bytes`，后者已计入头及block描述；2M条read需要7813块、125008B描述流。
+
+## 四层LoRA与block：直接采用最后一步
+
+`--no-adaptation-validation`关闭头部与主干的验证评分。头部使用全部前缀；LoRA使用全部
+采样read，不留验证集，不运行初始/中间/结束验证，不按验证降LR或早停，不复制最佳状态。
+只要训练及权重有效，直接使用实际完成的最后一步；未指定该开关时保留原验证选优逻辑。
+SHA、参数有限性、adapter恢复等无损协议检查继续执行。
+
+block适配按原文件完整block做reservoir抽样，最多125块/32000条/4.8M Q；
+排除头部前缀，保留EOF尾块，随机16条read的每步输入仍使用其原block的wire描述。
+不把随机read重新聚合成block，也不跨block拆分描述以适应采样上限。
+
+```bash
+cd /home/share/huadjyin/home/s_qiuping1/tanglei/fastq_quality_residual
+block_lora_dir=$(mktemp -d codec/output/CNR0847462_block_lora4_noval_XXXXXX)
+CUDA_VISIBLE_DEVICES=0 /home/share/huadjyin/home/tanglei2/envs/scgpt/bin/python -m codec.encode \
+  data/2nd/CNR0847462_1.head2M.fastq.gz \
+  "$block_lora_dir/CNR0847462.block_lora4.fqdc" \
+  codec/runs/block_quality_expanded20_y6qHS0/best.pt \
+  --device cuda --batch-reads 256 \
+  --quality-coding neural --quantizer floor --coder-backend native \
+  --finetune-head --head-type residual --head-residual-dim 64 \
+  --head-cross-layer --head-cross-dim 16 \
+  --head-max-reads 8000 --head-max-symbols 1200000 \
+  --head-steps 2000 --head-max-seconds 0 \
+  --finetune-last-layers 4 --backbone-lora-rank 4 \
+  --backbone-steps 10000 --backbone-batch-reads 16 \
+  --backbone-learning-rate 0.0003 \
+  --backbone-max-reads 32000 --backbone-max-symbols 4800000 \
+  --no-adaptation-validation \
+  --save-head-adapter "$block_lora_dir/lora.adapter.json" \
+  > "$block_lora_dir/metrics.json"
+```
+
+关闭验证时日志`backbone_validation_history=[]`、`backbone_validation_reads=0`，
+`backbone_selection_policy=final_trained_step_without_validation`，
+`backbone_selected_step`等于实际完成步数；验证BPQ及预计收益为null，实际压缩指标照常记录。
+默认种子保持原head/LoRA的20260921，学习率固定：head .001、LoRA .0003。
+步数预算为head2000＋LoRA10000；此命令无秒数上限。省去验证可减少额外前向，
+FASTQ抽样扫描及10000次训练更新仍需执行。

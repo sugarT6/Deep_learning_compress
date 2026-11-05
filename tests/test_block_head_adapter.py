@@ -233,12 +233,12 @@ class BlockHeadAdapterTest(unittest.TestCase):
         for name, value in original.items():
             self.assertTrue(torch.equal(value, model.block_conditioning.state_dict()[name]), name)
 
-    def test_unsupported_backbone_lora_and_wrong_batch_reject_before_source_access(self):
+    def test_unsupported_dense_legacy_lora_and_wrong_batch_reject_before_source_access(self):
         model = block_model(layers=4)
         missing = Path("missing-block-head-source.fastq")
-        with self.assertRaisesRegex(ValueError, "head fitting only"):
+        with self.assertRaisesRegex(ValueError, "without dense, legacy LoRA"):
             adapt(model, missing, adaptation_config(backbone_layers=1))
-        with self.assertRaisesRegex(ValueError, "head fitting only"):
+        with self.assertRaisesRegex(ValueError, "without dense, legacy LoRA"):
             adapt(model, missing, adaptation_config(
                 head_type="residual", cross_layer=True, lora=True,
             ))

@@ -60,8 +60,11 @@ class HeadAdaptationConfig:
     backbone_lora_rank: int = 0
     read_quality_state: bool = False
     read_state_classes: int = 4
+    validation_enabled: bool = True
 
     def __post_init__(self):
+        if type(self.validation_enabled) is not bool:
+            raise ValueError("validation_enabled must be bool")
         if type(self.read_quality_state) is not bool or (self.read_quality_state and not self.backbone_layers):
             raise ValueError("read_quality_state requires Transformer suffix adaptation")
         if type(self.read_state_classes) is not int or self.read_state_classes not in (2, 4):
@@ -308,11 +311,13 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
 
     Prefix split is by whole reads (first 75% train, last 25% validation),
     or by whole original blocks for a block-conditioned checkpoint.
-    Admission tests neural quantized bits, not hybrid or whole-file savings.
+    By default admission tests held-out neural quantized bits.  With validation
+    disabled, all sampled reads train the head and the finite final step is used.
     """
     block_enabled = bool(getattr(model.config, "block_quality_features", False))
-    if block_enabled and (config.backbone_layers or config.lora or config.read_quality_state):
-        raise ValueError("block-conditioned adaptation supports output-head fitting only")
+    if block_enabled and ((config.backbone_layers and not config.backbone_lora_rank)
+                          or config.lora or config.read_quality_state):
+        raise ValueError("block-conditioned adaptation supports output heads and suffix LoRA, without dense, legacy LoRA, or read-state adaptation")
     if block_enabled and batch_reads != model.config.block_reads:
         raise ValueError("block-conditioned adaptation requires batch_reads equal to block_reads")
     if config.backbone_layers:
@@ -320,6 +325,8 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         return adapt_backbone(model, source, device=device, batch_reads=batch_reads,
                               total=total, base_sha256=base_sha256, config=config)
     if config.lora:
+        if not config.validation_enabled:
+            raise ValueError("disabling adaptation validation does not support legacy head LoRA")
         from .lora_adapter import adapt_last_layer
         return adapt_last_layer(model, source, device=device, batch_reads=batch_reads,
                                total=total, base_sha256=base_sha256, config=config)
@@ -327,14 +334,17 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         raise ValueError("cross-layer adaptation requires at least 4 Transformer layers")
     started = time.perf_counter()
     deadline = started + config.max_seconds if config.max_seconds else float("inf")
-    work_deadline = started + config.max_seconds * 0.70 if config.max_seconds else float("inf")
+    work_deadline = (started + config.max_seconds * 0.70
+                     if config.validation_enabled and config.max_seconds else deadline)
     report = {"config": asdict(config), "accepted": False, "reason": "insufficient_prefix",
               "steps_completed": 0, "prefix_reads": 0, "prefix_symbols": 0,
               "train_reads": 0, "validation_reads": 0, "train_symbols": 0,
               "validation_symbols": 0, "parameter_bytes": 0, "metadata_bytes": 0,
               "before_validation_bits_per_quality": None,
               "after_validation_bits_per_quality": None,
-              "selection_metric": "neural_only_quantized_bits_per_quality",
+              "selection_metric": "neural_only_quantized_bits_per_quality" if config.validation_enabled else None,
+              "validation_enabled": config.validation_enabled,
+              "validation_policy": "heldout_quantized_bits" if config.validation_enabled else "disabled",
               "prefix_sha256": None, "sample_stop": "max_reads"}
     stages = {}
 
@@ -385,13 +395,14 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
     report["prefix_reads"] = len(records)
     if len(records) < 4:
         return finish()
-    split = len(records) * 3 // 4
+    split = len(records) * 3 // 4 if config.validation_enabled else len(records)
     if block_enabled:
         block_count = (len(records) + block_reads - 1) // block_reads
-        if block_count < 2:
+        if config.validation_enabled and block_count < 2:
             report["reason"] = "insufficient_prefix_blocks"
             return finish()
-        split = max(1, min(block_count - 1, block_count * 3 // 4)) * block_reads
+        if config.validation_enabled:
+            split = max(1, min(block_count - 1, block_count * 3 // 4)) * block_reads
         report.update(block_reads=block_reads, prefix_blocks=block_count,
                       block_feature_mode=model.config.block_feature_mode)
     report.update(train_reads=split, validation_reads=len(records) - split,
@@ -422,8 +433,10 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         feature_started = time.perf_counter()
         cached = []
         # Preallocate active-only features; avoid an additional full-size cat copy.
-        for name, subset, source_begin in (("train", records[:split], 0),
-                                          ("validation", records[split:], split)):
+        subsets = [("train", records[:split], 0)]
+        if config.validation_enabled:
+            subsets.append(("validation", records[split:], split))
+        for name, subset, source_begin in subsets:
             n = sum(len(r.quality) for r in subset)
             report[name + "_symbols"] = n
             if not n:
@@ -453,7 +466,9 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
                 sync()
             cached.append((features, labels))
         stages["features"] = time.perf_counter() - feature_started
-        (train_h, train_y), (val_h, val_y) = cached
+        train_h, train_y = cached[0]
+        if config.validation_enabled:
+            val_h, val_y = cached[1]
         if config.head_type == "residual":
             head = _new_head(model.config.d_model, config.residual_dim, device=device,
                              dtype=model.output_head.weight.dtype, seed=config.seed,
@@ -500,6 +515,13 @@ def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256,
         report["candidate_parameter_bytes"] = adapter["parameter_bytes"]
         report["candidate_metadata_bytes"] = len(json.dumps(adapter, sort_keys=True, separators=(",", ":")).encode())
         stages["serialization"] = time.perf_counter() - serialization_started
+        if not config.validation_enabled:
+            apply_head_adapter(model, adapter, base_sha256)
+            sync()
+            report.update(accepted=True, reason="final_step_without_validation",
+                          parameter_bytes=adapter["parameter_bytes"],
+                          metadata_bytes=report["candidate_metadata_bytes"])
+            return finish(adapter)
         validation_started = time.perf_counter()
 
         def score(candidate):
