@@ -1,0 +1,10 @@
+{
+  "architecture": "direct-quality-causal-transformer",
+  "architecture_version": 1,
+  "d_model": 1536,
+  "num_heads": 24,
+  "num_layers": 27,
+  "feedforward_dim": 3072,
+  "context_length": 256,
+  "dropout": 0.1
+}

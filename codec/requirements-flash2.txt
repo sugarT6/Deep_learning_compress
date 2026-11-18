@@ -1,0 +1,2 @@
+# Optional native sliding-window backend; retain the existing PyTorch install.
+flash-attn==2.5.9.post1
