@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""Decode a version-1 neural quality container back to byte-exact FASTQ."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import json
+import os
+import tempfile
+import time
+from contextlib import ExitStack
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, BinaryIO, Dict, List, Sequence, Tuple
+
+import numpy as np
+import torch
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional
+    tqdm = None
+
+from codec.coding._range_common import RANGE_CODER_VERSION
+from codec.models.checkpoint import CHECKPOINT_SCHEMA_VERSION, load_training_checkpoint
+from codec.coding.container import (
+    CONTAINER_FORMAT,
+    CONTAINER_VERSION,
+    ADAPTED_CONTAINER_VERSION,
+    READ_STATE_CONTAINER_VERSION,
+    RANK_CONTAINER_VERSION,
+    BLOCK_FEATURE_CONTAINER_VERSION,
+    LEGACY_CONTAINER_VERSION,
+    ContainerError,
+    ContainerIntegrityError,
+    SideRecord,
+    SideStreamReader,
+    read_container,
+    sha256_file,
+)
+from codec.coding.encode import (
+    CodecDeterminismError,
+    _add_timing,
+    _synchronize_device,
+    choose_device,
+)
+from codec.coding.rank_coding import quality_order, validate_rank_metadata
+from codec.data.fastq_stream import (
+    BASE_PAD_ID,
+    DEFAULT_BATCH_READS,
+    MAX_BATCH_READS,
+    PHRED_OFFSET,
+    QUALITY_ALPHABET_SIZE,
+    QUALITY_PAD_ID,
+    encode_base_ids,
+    make_fastq_batch,
+)
+from codec.data.block_features import BLOCK_FEATURE_BYTES, decode_block_features, encode_block_features
+from codec.models.transformer import DirectQualityModelConfig, DirectQualityTransformer, feature_schema
+from codec.priors.online_prior import (
+    OnlinePriorConfig,
+    OnlinePriorError,
+    OnlinePriorState,
+)
+from codec.coding.probability_quantization import (
+    QUANTIZATION_VERSION,
+    logits_to_cdfs,
+    validate_total,
+)
+from codec.coding.range_decoder import RangeDecoder
+from codec.adaptation.read_state import StateReader, classify_reads
+from codec.priors.adaptive_prior import AdaptivePriorState
+from codec.priors.mixture_prior import (MixturePriorConfig, MixturePriorState,
+    make_prior_state, parse_probability_profile, fuse_profile_positions)
+
+
+SUPPORTED_OUTPUT_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+
+
+class ModelMismatchError(ContainerError):
+    """Raised before decoding when the supplied checkpoint is not the encoded one."""
+
+
+@dataclass(frozen=True)
+class DecodeStatistics:
+    container_bytes: int
+    output_bytes: int
+    output_uncompressed_bytes: int
+    read_count: int
+    quality_symbols: int
+    decode_seconds: float
+    reconstructed_sha256: str
+    quality_model_prediction_seconds: float
+    quality_entropy_decoding_seconds: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _validate_output_path(output_path: Path) -> None:
+    if output_path.exists():
+        raise FileExistsError(f"{output_path}: output already exists")
+    if not any(output_path.name.endswith(suffix) for suffix in SUPPORTED_OUTPUT_SUFFIXES):
+        raise ValueError(
+            f"{output_path}: output must end in .fastq, .fq, .fastq.gz, or .fq.gz"
+        )
+
+
+def _validate_codec_metadata(
+    metadata: Dict[str, Any], *, batch_reads: int
+) -> Tuple[int, OnlinePriorConfig | MixturePriorConfig | None]:
+    if metadata["format"] != CONTAINER_FORMAT:
+        raise ContainerError("unsupported container format")
+    format_version = int(metadata["format_version"])
+    if format_version not in (LEGACY_CONTAINER_VERSION, CONTAINER_VERSION, ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION, BLOCK_FEATURE_CONTAINER_VERSION):
+        raise ContainerError("unsupported container version")
+    stored_batch_reads = int(metadata["batch_reads"])
+    if batch_reads != stored_batch_reads:
+        raise ContainerError(
+            f"decoder batch_reads={batch_reads} does not match container value "
+            f"{stored_batch_reads}"
+        )
+    gzip_streams = metadata["gzip_side_streams"]
+    if int(gzip_streams["record_schema_version"]) != 1:
+        raise ContainerError("unsupported gzip side-stream record schema")
+    quantization = metadata["probability_quantization"]
+    if int(quantization["version"]) not in (1, 2):
+        raise ContainerError("unsupported probability quantization version")
+    if int(quantization["version"]) == 2 and metadata.get("probability_profile") is not None:
+        raise ContainerError("floor quantizer requires neural-only probabilities")
+    if int(quantization["quality_alphabet_size"]) != QUALITY_ALPHABET_SIZE:
+        raise ContainerError("container quality alphabet is not Q0-Q41")
+    if int(quantization["phred_offset"]) != PHRED_OFFSET:
+        raise ContainerError("container does not use Phred+33")
+    if quantization.get("float_contract") != "finite_cpu_float64":
+        raise ContainerError("unsupported probability float contract")
+    total = validate_total(quantization["total"])
+    range_coder = metadata["range_coder"]
+    if int(range_coder["version"]) != RANGE_CODER_VERSION:
+        raise ContainerError("unsupported range coder version")
+    if int(range_coder["stream_count"]) != 1:
+        raise ContainerError("version 1 requires one quality range stream")
+    if metadata["inference_runtime"]["dtype"] != "float32":
+        raise ContainerError("unsupported model inference dtype")
+    probability_profile = metadata.get("probability_profile")
+    if format_version == LEGACY_CONTAINER_VERSION or (format_version in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION, RANK_CONTAINER_VERSION, BLOCK_FEATURE_CONTAINER_VERSION) and probability_profile is None):
+        if probability_profile is not None:
+            raise ContainerError("legacy container unexpectedly declares a prior")
+        online_prior_config = None
+    else:
+        if probability_profile is None:
+            raise ContainerError("online-prior probability_profile is missing")
+        try:
+            online_prior_config = parse_probability_profile(
+                probability_profile
+            )
+        except OnlinePriorError as exc:
+            raise ContainerError(f"invalid online-prior profile: {exc}") from exc
+    return total, online_prior_config
+
+
+def _validate_checkpoint(
+    checkpoint_path: Path,
+    metadata: Dict[str, Any],
+    device: torch.device,
+) -> DirectQualityTransformer:
+    checkpoint_metadata = metadata["checkpoint"]
+    observed_hash = sha256_file(checkpoint_path)
+    if observed_hash != checkpoint_metadata["sha256"]:
+        raise ModelMismatchError(
+            "checkpoint SHA-256 does not match the model required by the container"
+        )
+    loaded = load_training_checkpoint(checkpoint_path, device=device)
+    if int(checkpoint_metadata["checkpoint_schema_version"]) != CHECKPOINT_SCHEMA_VERSION:
+        raise ModelMismatchError("checkpoint schema version does not match container")
+    stored_config = DirectQualityModelConfig.from_dict(
+        checkpoint_metadata["model_config"]
+    ).to_dict()
+    if loaded.model.config.to_dict() != stored_config:
+        raise ModelMismatchError("checkpoint model configuration does not match container")
+    if feature_schema(loaded.model.config) != checkpoint_metadata["feature_schema"]:
+        raise ModelMismatchError("checkpoint feature schema does not match container")
+    loaded.model.eval()
+    if metadata["format_version"] in (ADAPTED_CONTAINER_VERSION, READ_STATE_CONTAINER_VERSION) or (
+            metadata["format_version"] in (RANK_CONTAINER_VERSION, BLOCK_FEATURE_CONTAINER_VERSION) and "head_adapter" in metadata):
+        from codec.adaptation.head_adapter import apply_head_adapter
+        apply_head_adapter(loaded.model, metadata["head_adapter"], observed_hash)
+    return loaded.model
+
+
+def _batch_tensors(
+    base_records: Sequence[SideRecord], device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    base_rows = [encode_base_ids(record.field) for record in base_records]
+    lengths_array = np.asarray([row.size for row in base_rows], dtype=np.int64)
+    maximum_length = int(lengths_array.max()) if len(base_rows) else 0
+    bases_array = np.full(
+        (len(base_rows), maximum_length), BASE_PAD_ID, dtype=np.uint8
+    )
+    for row_index, row in enumerate(base_rows):
+        bases_array[row_index, : row.size] = row
+    active_array = (
+        np.arange(maximum_length, dtype=np.int64)[None, :]
+        < lengths_array[:, None]
+    )
+    return (
+        torch.as_tensor(bases_array, dtype=torch.long, device=device),
+        torch.as_tensor(lengths_array, dtype=torch.long, device=device),
+        torch.as_tensor(active_array, dtype=torch.bool, device=device),
+    )
+
+
+def _decode_quality_batch(
+    model: DirectQualityTransformer,
+    range_decoder: RangeDecoder,
+    base_records: Sequence[SideRecord],
+    *,
+    device: torch.device,
+    quantization_total: int,
+    first_read_index: int,
+    timings: Dict[str, float],
+    verify_cdf: bool,
+    online_prior: OnlinePriorState | MixturePriorState | None,
+    quantization_version: int = 1,
+    read_states: np.ndarray | None = None,
+    rank_cdf: np.ndarray | None = None,
+    block_features: np.ndarray | None = None,
+) -> Tuple[np.ndarray, int]:
+    stage_started = time.perf_counter()
+    bases, lengths, active_mask = _batch_tensors(base_records, device)
+    _synchronize_device(device)
+    _add_timing(timings, "tensor_transfer", stage_started)
+    state_inputs = {} if read_states is None else {"read_states": torch.as_tensor(read_states, dtype=torch.long, device=device)}
+    if block_features is not None:
+        state_inputs["block_features"] = torch.as_tensor(block_features, dtype=torch.float32, device=device)
+    read_count, maximum_length = bases.shape
+    decoded = torch.full(
+        (read_count, maximum_length),
+        QUALITY_PAD_ID,
+        dtype=torch.long,
+        device=device,
+    )
+    decoded_cpu = np.full(
+        (read_count, maximum_length), QUALITY_PAD_ID, dtype=np.int64
+    )
+    lengths_cpu = np.fromiter(
+        (len(record.field) for record in base_records),
+        dtype=np.int64,
+        count=read_count,
+    )
+    verification_cdfs: List[np.ndarray] = []
+    decoded_symbols = 0
+
+    with torch.inference_mode():
+        for cycle in range(maximum_length):
+            _synchronize_device(device)
+            stage_started = time.perf_counter()
+            step_logits = model.forward_step(
+                bases,
+                decoded[:, :cycle],
+                lengths,
+                active_mask,
+                **state_inputs,
+            )
+            _synchronize_device(device)
+            _add_timing(timings, "model_forward_step", stage_started)
+            stage_started = time.perf_counter()
+            active_rows = np.flatnonzero(lengths_cpu > cycle)
+            active_logits = step_logits.detach().cpu().numpy()[active_rows]
+            if isinstance(online_prior, AdaptivePriorState):
+                active_logits = online_prior.fuse_positions(active_logits, decoded_cpu,
+                    active_rows, np.full(active_rows.size, cycle, dtype=np.int64), capture=True)
+            elif online_prior is not None:
+                active_logits = fuse_profile_positions(online_prior, active_logits,
+                    decoded_cpu, active_rows, np.full(active_rows.size, cycle, dtype=np.int64))
+            cycle_cdfs = logits_to_cdfs(
+                active_logits,
+                total=quantization_total,
+                version=quantization_version,
+            )
+            _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
+
+            stage_started = time.perf_counter()
+            if rank_cdf is None:
+                cycle_symbols = range_decoder.decode_prevalidated_batch(
+                    cycle_cdfs, total=quantization_total if quantization_version == 1 else None
+                )
+            else:
+                order = quality_order(cycle_cdfs)
+                ranks = range_decoder.decode_prevalidated_batch(
+                    np.broadcast_to(rank_cdf, (active_rows.size, rank_cdf.size)),
+                    total=int(rank_cdf[-1]))
+                cycle_symbols = order[np.arange(active_rows.size), ranks]
+            if isinstance(online_prior, AdaptivePriorState):
+                online_prior.observe_symbols(np.asarray(cycle_symbols, dtype=np.int64))
+            active_rows_tensor = torch.as_tensor(
+                active_rows, dtype=torch.long, device=device
+            )
+            decoded[active_rows_tensor, cycle] = torch.as_tensor(
+                cycle_symbols, dtype=torch.long, device=device
+            )
+            decoded_cpu[active_rows, cycle] = cycle_symbols
+            if verify_cdf:
+                verification_cdfs.append(cycle_cdfs)
+            decoded_symbols += active_rows.size
+            _synchronize_device(device)
+            _add_timing(timings, "range_decode_and_symbol_update", stage_started)
+
+        if verify_cdf:
+            _synchronize_device(device)
+            stage_started = time.perf_counter()
+            full_logits = model.forward_full(bases, decoded, lengths, active_mask, **state_inputs)
+            _synchronize_device(device)
+            _add_timing(timings, "model_forward_full_verification", stage_started)
+            stage_started = time.perf_counter()
+            active_mask_cpu = active_mask.detach().cpu().numpy()
+            cycles, rows = np.nonzero(active_mask_cpu.T)
+            active_full_logits = full_logits.detach().cpu().numpy()[rows, cycles]
+            if online_prior is not None:
+                active_full_logits = fuse_profile_positions(online_prior,
+                    active_full_logits, decoded_cpu, rows, cycles)
+            full_cdfs = logits_to_cdfs(
+                active_full_logits,
+                total=quantization_total,
+                version=quantization_version,
+            )
+            step_cdfs = (
+                np.concatenate(verification_cdfs, axis=0)
+                if verification_cdfs
+                else np.empty((0, QUALITY_ALPHABET_SIZE + 1), dtype=np.int64)
+            )
+            if not np.array_equal(full_cdfs, step_cdfs):
+                mismatch = np.argwhere(full_cdfs != step_cdfs)[0]
+                position = int(mismatch[0])
+                raise CodecDeterminismError(
+                    "decoder forward_step/forward_full integer CDF mismatch at "
+                    f"read {first_read_index + int(rows[position])}, "
+                    f"cycle {int(cycles[position])}"
+                )
+            _add_timing(timings, "cdf_verification_and_transfer", stage_started)
+    if online_prior is not None:
+        active_mask_cpu = (
+            np.arange(maximum_length, dtype=np.int64)[None, :]
+            < lengths_cpu[:, None]
+        )
+        online_prior.update_batch(decoded_cpu, active_mask_cpu)
+    if read_states is not None:
+        expected = classify_reads(decoded_cpu, lengths_cpu, model.read_state_conditioning.thresholds)
+        if not np.array_equal(expected, read_states):
+            raise ContainerIntegrityError("decoded read quality means do not match transmitted states")
+    return decoded_cpu, decoded_symbols
+
+
+def _validate_side_records(
+    header: SideRecord,
+    base: SideRecord,
+    plus: SideRecord,
+    *,
+    read_index: int,
+    read_count: int,
+) -> None:
+    if not header.field.startswith(b"@"):
+        raise ContainerIntegrityError(f"decoded read {read_index} header lacks @")
+    if not plus.field.startswith(b"+"):
+        raise ContainerIntegrityError(f"decoded read {read_index} plus line lacks +")
+    if not header.line_ending or not base.line_ending or not plus.line_ending:
+        raise ContainerIntegrityError(
+            f"decoded read {read_index} has a missing non-quality line ending"
+        )
+    if plus.quality_line_ending is None:
+        raise ContainerIntegrityError("plus side stream lacks quality line ending")
+    if not plus.quality_line_ending and read_index != read_count - 1:
+        raise ContainerIntegrityError(
+            "only the final FASTQ quality line may omit its line ending"
+        )
+
+
+def _record_bytes(
+    header: SideRecord,
+    base: SideRecord,
+    plus: SideRecord,
+    quality_ids: np.ndarray,
+) -> bytes:
+    quality = bytes((quality_ids.astype(np.uint16) + PHRED_OFFSET).tolist())
+    return b"".join(
+        (
+            header.field,
+            header.line_ending,
+            base.field,
+            base.line_ending,
+            plus.field,
+            plus.line_ending,
+            quality,
+            plus.quality_line_ending or b"",
+        )
+    )
+
+
+def _decode_to_handle(
+    container_info: Any,
+    output: BinaryIO,
+    model: DirectQualityTransformer,
+    range_decoder: RangeDecoder,
+    *,
+    device: torch.device,
+    batch_reads: int,
+    quantization_total: int,
+    progress_bar: Any,
+    timings: Dict[str, float],
+    verify_cdf: bool,
+    online_prior_config: OnlinePriorConfig | MixturePriorConfig | None,
+) -> Tuple[int, int, str]:
+    metadata = container_info.metadata
+    rank_cdf = (validate_rank_metadata(metadata["rank_encoding"], quantization_total,
+                                      int(metadata["quality_symbol_count"]))
+                if metadata["format_version"] == RANK_CONTAINER_VERSION else None)
+    read_count = int(metadata["read_count"])
+    reconstructed_digest = hashlib.sha256()
+    reconstructed_size = 0
+    decoded_symbols = 0
+    online_prior = make_prior_state(online_prior_config)
+
+    with ExitStack() as stack:
+        block_handle = (stack.enter_context(container_info.open_section("block_features"))
+                        if metadata["format_version"] == BLOCK_FEATURE_CONTAINER_VERSION else None)
+        block_mode = metadata["block_features"]["mode"] if block_handle is not None else None
+        state_reader = (StateReader(stack.enter_context(container_info.open_section("read_state")), read_count,
+                                   class_count=metadata["read_state"]["class_count"])
+                        if metadata["format_version"] == READ_STATE_CONTAINER_VERSION else None)
+        header_compressed = stack.enter_context(
+            container_info.open_section("header_gzip")
+        )
+        base_compressed = stack.enter_context(container_info.open_section("base_gzip"))
+        plus_compressed = stack.enter_context(container_info.open_section("plus_gzip"))
+        header_reader = SideStreamReader(
+            header_compressed,
+            "header",
+            expected_uncompressed_length=container_info.section(
+                "header_gzip"
+            ).uncompressed_length,
+        )
+        base_reader = SideStreamReader(
+            base_compressed,
+            "base",
+            expected_uncompressed_length=container_info.section(
+                "base_gzip"
+            ).uncompressed_length,
+        )
+        plus_reader = SideStreamReader(
+            plus_compressed,
+            "plus",
+            expected_uncompressed_length=container_info.section(
+                "plus_gzip"
+            ).uncompressed_length,
+        )
+        stack.callback(header_reader.close)
+        stack.callback(base_reader.close)
+        stack.callback(plus_reader.close)
+
+        for batch_start in range(0, read_count, batch_reads):
+            current_batch_reads = min(batch_reads, read_count - batch_start)
+            headers = []
+            bases = []
+            pluses = []
+            stage_started = time.perf_counter()
+            for batch_row in range(current_batch_reads):
+                read_index = batch_start + batch_row
+                header = header_reader.read_record()
+                base = base_reader.read_record()
+                plus = plus_reader.read_record()
+                _validate_side_records(
+                    header,
+                    base,
+                    plus,
+                    read_index=read_index,
+                    read_count=read_count,
+                )
+                headers.append(header)
+                bases.append(base)
+                pluses.append(plus)
+            _add_timing(timings, "side_stream_read", stage_started)
+
+            block_inputs = None
+            block_payload = None
+            if block_handle is not None:
+                block_payload = (block_handle.read(BLOCK_FEATURE_BYTES)
+                                 if block_mode == "features" else bytes(BLOCK_FEATURE_BYTES))
+                if len(block_payload) != BLOCK_FEATURE_BYTES:
+                    raise ContainerIntegrityError("truncated block feature description")
+                block_inputs = np.broadcast_to(decode_block_features(block_payload), (current_batch_reads, BLOCK_FEATURE_BYTES)).copy()
+            decoded, batch_symbols = _decode_quality_batch(
+                model,
+                range_decoder,
+                bases,
+                device=device,
+                quantization_total=quantization_total,
+                first_read_index=batch_start,
+                timings=timings,
+                verify_cdf=verify_cdf,
+                online_prior=online_prior,
+                quantization_version=int(metadata["probability_quantization"]["version"]),
+                read_states=state_reader.read(current_batch_reads) if state_reader else None,
+                rank_cdf=rank_cdf,
+                block_features=block_inputs,
+            )
+            if block_mode == "features":
+                decoded_batch = make_fastq_batch(
+                    [encode_base_ids(record.field) for record in bases],
+                    [decoded[row, :len(record.field)] for row, record in enumerate(bases)],
+                    range(batch_start, batch_start + current_batch_reads),
+                    source_name=metadata["source_basename"],
+                )
+                if encode_block_features(decoded_batch) != block_payload:
+                    raise ContainerIntegrityError("decoded qualities do not match transmitted block description")
+            decoded_symbols += batch_symbols
+            stage_started = time.perf_counter()
+            for row, (header, base, plus) in enumerate(
+                zip(headers, bases, pluses)
+            ):
+                length = len(base.field)
+                record = _record_bytes(header, base, plus, decoded[row, :length])
+                output.write(record)
+                reconstructed_digest.update(record)
+                reconstructed_size += len(record)
+            _add_timing(timings, "fastq_output_write", stage_started)
+            if progress_bar is not None:
+                progress_bar.update(batch_symbols)
+
+        stage_started = time.perf_counter()
+        if state_reader is not None:
+            state_reader.finish()
+        if block_handle is not None and block_handle.read(1):
+            raise ContainerIntegrityError("block feature stream has trailing descriptions")
+        header_reader.finish()
+        base_reader.finish()
+        plus_reader.finish()
+        _add_timing(timings, "side_stream_read", stage_started)
+
+    stage_started = time.perf_counter()
+    range_decoder.finish()
+    _add_timing(timings, "range_decode_and_symbol_update", stage_started)
+    return reconstructed_size, decoded_symbols, reconstructed_digest.hexdigest()
+
+
+def decode_fastq(
+    container_path: Path,
+    output_path: Path,
+    checkpoint_path: Path,
+    *,
+    device: torch.device,
+    batch_reads: int = DEFAULT_BATCH_READS,
+    progress: bool = True,
+    verify_cdf: bool = False,
+) -> DecodeStatistics:
+    """Validate and atomically reconstruct the original uncompressed FASTQ bytes."""
+
+    started = time.perf_counter()
+    container_path = Path(container_path)
+    output_path = Path(output_path)
+    checkpoint_path = Path(checkpoint_path)
+    if not container_path.is_file():
+        raise FileNotFoundError(container_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+    _validate_output_path(output_path)
+    if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
+        raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
+
+    timings = {
+        "container_validation": 0.0,
+        "checkpoint_hash_and_load": 0.0,
+        "quality_stream_read_and_init": 0.0,
+        "side_stream_read": 0.0,
+        "tensor_transfer": 0.0,
+        "model_forward_step": 0.0,
+        "cdf_quantization_and_transfer": 0.0,
+        "range_decode_and_symbol_update": 0.0,
+        "model_forward_full_verification": 0.0,
+        "cdf_verification_and_transfer": 0.0,
+        "decoded_tensor_to_cpu": 0.0,
+        "fastq_output_write": 0.0,
+        "output_finalize": 0.0,
+    }
+    stage_started = time.perf_counter()
+    container_info = read_container(container_path, verify_checksums=True)
+    quantization_total, online_prior_config = _validate_codec_metadata(
+        container_info.metadata, batch_reads=batch_reads
+    )
+    _add_timing(timings, "container_validation", stage_started)
+    stage_started = time.perf_counter()
+    model = _validate_checkpoint(checkpoint_path, container_info.metadata, device)
+    _synchronize_device(device)
+    _add_timing(timings, "checkpoint_hash_and_load", stage_started)
+    stage_started = time.perf_counter()
+    quality_range_bytes = container_info.read_section("quality_range")
+    range_decoder = RangeDecoder(quality_range_bytes)
+    expected_symbols = int(container_info.metadata["quality_symbol_count"])
+    if range_decoder.metadata.symbol_count != expected_symbols:
+        raise ContainerIntegrityError(
+            "quality range-stream symbol count does not match container metadata"
+        )
+    if (
+        range_decoder.metadata.payload_bit_count
+        != int(container_info.metadata["range_coder"]["payload_bit_count"])
+    ):
+        raise ContainerIntegrityError(
+            "quality range payload length does not match container metadata"
+        )
+    _add_timing(timings, "quality_stream_read_and_init", stage_started)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.", suffix=".tmp", dir=str(output_path.parent)
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    progress_bar = None
+    if progress and tqdm is not None:
+        progress_bar = tqdm(
+            total=expected_symbols,
+            desc="decode quality",
+            unit="Q",
+            leave=True,
+        )
+    try:
+        with temporary_path.open("wb") as raw_output:
+            if output_path.name.endswith(".gz"):
+                with gzip.GzipFile(
+                    filename="",
+                    mode="wb",
+                    compresslevel=6,
+                    fileobj=raw_output,
+                    mtime=0,
+                ) as decoded_output:
+                    reconstructed_size, decoded_symbols, reconstructed_hash = (
+                        _decode_to_handle(
+                            container_info,
+                            decoded_output,
+                            model,
+                            range_decoder,
+                            device=device,
+                            batch_reads=batch_reads,
+                            quantization_total=quantization_total,
+                            progress_bar=progress_bar,
+                            timings=timings,
+                            verify_cdf=verify_cdf,
+                            online_prior_config=online_prior_config,
+                        )
+                    )
+            else:
+                reconstructed_size, decoded_symbols, reconstructed_hash = (
+                    _decode_to_handle(
+                        container_info,
+                        raw_output,
+                        model,
+                        range_decoder,
+                        device=device,
+                        batch_reads=batch_reads,
+                        quantization_total=quantization_total,
+                        progress_bar=progress_bar,
+                        timings=timings,
+                        verify_cdf=verify_cdf,
+                        online_prior_config=online_prior_config,
+                    )
+                )
+            stage_started = time.perf_counter()
+            raw_output.flush()
+            os.fsync(raw_output.fileno())
+            _add_timing(timings, "output_finalize", stage_started)
+
+        if decoded_symbols != expected_symbols:
+            raise ContainerIntegrityError(
+                "decoded quality symbol count does not match container metadata"
+            )
+        if reconstructed_size != int(
+            container_info.metadata["source_uncompressed_size"]
+        ):
+            raise ContainerIntegrityError("reconstructed FASTQ size mismatch")
+        if reconstructed_hash != container_info.metadata["source_uncompressed_sha256"]:
+            raise ContainerIntegrityError("reconstructed FASTQ SHA-256 mismatch")
+        stage_started = time.perf_counter()
+        os.replace(str(temporary_path), str(output_path))
+        _add_timing(timings, "output_finalize", stage_started)
+    except Exception:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+    decode_seconds = time.perf_counter() - started
+    quality_model_prediction_seconds = timings["model_forward_step"]
+    quality_entropy_decoding_seconds = (
+        timings["cdf_quantization_and_transfer"]
+        + timings["range_decode_and_symbol_update"]
+    )
+    return DecodeStatistics(
+        container_bytes=container_info.file_size,
+        output_bytes=output_path.stat().st_size,
+        output_uncompressed_bytes=reconstructed_size,
+        read_count=int(container_info.metadata["read_count"]),
+        quality_symbols=decoded_symbols,
+        decode_seconds=decode_seconds,
+        reconstructed_sha256=reconstructed_hash,
+        quality_model_prediction_seconds=quality_model_prediction_seconds,
+        quality_entropy_decoding_seconds=quality_entropy_decoding_seconds,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Decode a no-SeqArc neural container to FASTQ or gzip FASTQ"
+    )
+    parser.add_argument("input", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--batch-reads", type=int, default=DEFAULT_BATCH_READS)
+    parser.add_argument(
+        "--verify-cdf",
+        action="store_true",
+        help=(
+            "slow debug check: compare forward_step and forward_full integer "
+            "CDFs after every decoded batch"
+        ),
+    )
+    parser.add_argument("--no-progress", action="store_true")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        statistics = decode_fastq(
+            args.input,
+            args.output,
+            args.checkpoint,
+            device=choose_device(args.device),
+            batch_reads=args.batch_reads,
+            progress=not args.no_progress,
+            verify_cdf=args.verify_cdf,
+        )
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(statistics.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = ["DecodeStatistics", "ModelMismatchError", "decode_fastq"]

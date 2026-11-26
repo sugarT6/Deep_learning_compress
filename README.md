@@ -1,5 +1,45 @@
 # FASTQ quality compression experiments
 
+## Code layout
+
+The maintained implementation is organized by function under `codec/`:
+
+| Directory | Contents |
+| --- | --- |
+| [`codec/models/`](codec/models/) | Transformer models, base/quality features, conditioning, checkpoint loading and saving |
+| [`codec/data/`](codec/data/) | FASTQ records, training caches, dataset registry, block descriptions |
+| [`codec/training/`](codec/training/) | Training loops, mixed-read sampling, losses, learning-rate control and loss curves |
+| [`codec/adaptation/`](codec/adaptation/) | Per-file output heads, backbone updates, LoRA and adapter serialization |
+| [`codec/coding/`](codec/coding/) | Encoding/decoding, containers, probability quantization and range coding |
+| [`codec/priors/`](codec/priors/) | Historical probability models retained for old-container decoding |
+| [`codec/diagnostics/`](codec/diagnostics/) | Evaluation, prediction reports and adaptation diagnostics |
+| [`codec/experiments/`](codec/experiments/) | Training comparisons, ablations and benchmarks |
+| [`codec/utils/`](codec/utils/) | Shared resource paths and compatibility for previous import paths |
+
+Use the common command entry point to discover and run operations:
+
+```bash
+python -m codec --help
+python -m codec encode --help
+python -m codec decode --help
+python -m codec train --help
+python -m codec train-mixed --help
+python -m codec build-native
+```
+
+New code should import from the functional packages, for example
+`from codec.models.transformer import DirectQualityTransformer` and
+`from codec.coding.encode import encode_fastq`. Previous imports such as
+`codec.model` and commands such as `python -m codec.encode` continue to work
+through one shared compatibility layer; implementations are not duplicated.
+Existing commands in the experiment documents remain valid.
+
+Data, model weights and experiment results stay in their existing locations.
+`codec/native/` holds the C++ source and its build cache; `codec/document/`,
+`codec/runs/` and `codec/output/` retain their previous locations. Shared paths
+are defined in [`codec/utils/paths.py`](codec/utils/paths.py), so moving Python
+modules does not change the default cache, model or output paths.
+
 ## No-SeqArc direct-quality path
 
 The current production direction is the independent `codec/` package. It

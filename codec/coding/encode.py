@@ -1,0 +1,1033 @@
+#!/usr/bin/env python3
+"""Pure-neural FASTQ encoding, with optional transmitted output-head adaptation.
+
+Private historical profile branches are retained for decoder regression fixtures.
+Neither the public encoder nor its CLI can select those branches.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import sys
+import tempfile
+import time
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+import torch
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional
+    tqdm = None
+
+from codec.coding._range_common import RANGE_CODER_VERSION
+from codec.models.checkpoint import CHECKPOINT_SCHEMA_VERSION, load_training_checkpoint
+from codec.coding.container import (
+    CONTAINER_FORMAT,
+    CONTAINER_VERSION,
+    ADAPTED_CONTAINER_VERSION,
+    READ_STATE_CONTAINER_VERSION,
+    RANK_CONTAINER_VERSION,
+    BLOCK_FEATURE_CONTAINER_VERSION,
+    LEGACY_CONTAINER_VERSION,
+    ContainerError,
+    SectionSource,
+    SideStreamWriter,
+    sha256_file,
+    write_container,
+)
+from codec.data.fastq_stream import (
+    DEFAULT_BATCH_READS,
+    MAX_BATCH_READS,
+    PHRED_OFFSET,
+    QUALITY_ALPHABET_SIZE,
+    SUPPORTED_FASTQ_SUFFIXES,
+    FastqBatch,
+)
+from codec.data.fastq_stream import iter_fastq_batches
+from codec.models.transformer import DirectQualityTransformer, fastq_batch_to_tensors, feature_schema
+from codec.diagnostics.prediction_report import PredictionReport
+from codec.priors.online_prior import (
+    BOS_QUALITY_ID,
+    DEFAULT_ONLINE_PRIOR_CONFIG,
+    OnlinePriorConfig,
+    OnlinePriorState,
+)
+from codec.coding.encode_fastpath import fuse_batch_logits, selected_quantized_bits
+from codec.priors.adaptive_prior import AdaptivePriorState
+from codec.priors.mixture_prior import (
+    MixturePriorConfig, MixturePriorState, make_prior_state,
+    fuse_profile_positions,
+)
+from codec.coding.probability_quantization import (
+    QUANTIZATION_VERSION,
+    TOTAL,
+    logits_symbols_bits,
+    logits_to_cdfs,
+    logits_to_intervals,
+    validate_total,
+)
+from codec.coding.range_encoder import RangeEncoder
+from codec.adaptation.head_adapter import HeadAdaptationConfig, adapt_output_head, apply_head_adapter, adapter_container_bytes
+from codec.coding.container import adaptation_metadata_bytes, block_feature_metadata_bytes
+from codec.data.block_features import (
+    BLOCK_FEATURE_BYTES, block_feature_schema, encode_block_features, decode_block_features,
+)
+from codec.adaptation.read_state import StateWriter, classify_reads, label_metadata, state_container_overhead
+from codec.coding.rank_coding import ranks_from_cdfs, make_rank_metadata, validate_rank_metadata, global_rank_bits
+
+
+SUPPORTED_INPUT_SUFFIXES = SUPPORTED_FASTQ_SUFFIXES
+GZIP_COMPRESSLEVEL = 6
+
+
+class CodecDeterminismError(ContainerError):
+    """Raised when full and step inference quantize to different CDFs."""
+
+
+@dataclass(frozen=True)
+class EncodeStatistics:
+    input_bytes: int
+    output_bytes: int
+    output_to_input_ratio: float
+    read_count: int
+    batch_count: int
+    quality_symbols: int
+    quantized_theoretical_bits: float
+    quantized_theoretical_bits_per_quality: Optional[float]
+    neural_only_theoretical_bits: Optional[float]
+    neural_only_theoretical_bits_per_quality: Optional[float]
+    range_payload_bits: int
+    range_payload_bits_per_quality: Optional[float]
+    range_stream_bytes: int
+    range_stream_bits_per_quality: Optional[float]
+    header_gzip_bytes: int
+    base_gzip_bytes: int
+    plus_gzip_bytes: int
+    container_header_bytes: int
+    encode_seconds: float
+    quality_model_prediction_seconds: float
+    quality_entropy_coding_seconds: float
+    encoding_stage_seconds: Dict[str, float]
+    online_adaptation: Optional[Dict[str, Any]]
+    head_adaptation: Optional[Dict[str, Any]]
+    quality_and_adapter_bytes: int
+    coder_backend: str
+    read_state_stream_bytes: int
+    read_state_metadata_bytes: int
+    read_state_stream_bits_per_quality: Optional[float]
+    prediction_top1_accuracy: Optional[float]
+    prediction_correct_symbols: int
+    prediction_report_path: str
+    quality_coding: str = "neural"
+    rank_histogram: Optional[list] = None
+    rank_table_bytes: int = 0
+    original_quantized_theoretical_bits: Optional[float] = None
+    block_feature_stream_bytes: int = 0
+    block_feature_metadata_bytes: int = 0
+    block_feature_stream_bits_per_quality: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def choose_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is not available")
+    return device
+
+
+def _synchronize_device(device: torch.device) -> None:
+    """Finish queued CUDA work so wall-clock stage timings are meaningful."""
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _add_timing(timings: Optional[Dict[str, float]], name: str, started: float) -> None:
+    if timings is not None:
+        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - started)
+
+
+def _validate_paths(input_path: Path, output_path: Path, checkpoint_path: Path) -> None:
+    if not input_path.is_file():
+        raise FileNotFoundError(input_path)
+    if not any(input_path.name.endswith(suffix) for suffix in SUPPORTED_INPUT_SUFFIXES):
+        raise ValueError(
+            f"{input_path}: input must end in .fastq, .fq, .fastq.gz, or .fq.gz"
+        )
+    if output_path.exists():
+        raise FileExistsError(f"{output_path}: output already exists")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+
+
+def _quantize_verified_batch(
+    model: DirectQualityTransformer,
+    batch: FastqBatch,
+    device: torch.device,
+    *,
+    total: int,
+    online_prior: Optional[OnlinePriorState | MixturePriorState] = None,
+    timings: Optional[Dict[str, float]] = None,
+    verify_cdf: bool = True,
+    report_neural_only_bits: bool = True,
+    quantization_version: int = 1,
+    read_states: Optional[np.ndarray] = None,
+    prediction_report: Optional[PredictionReport] = None,
+    rank_coding: bool = False,
+    block_features: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Any, float, float]:
+    """Return cycle-major symbols and CDFs (v1) or low/high/total arrays (v2)."""
+
+    stage_started = time.perf_counter()
+    tensors = fastq_batch_to_tensors(batch, device)
+    state_inputs = {} if read_states is None else {"read_states": torch.as_tensor(read_states, dtype=torch.long, device=device)}
+    if block_features is not None:
+        state_inputs["block_features"] = torch.as_tensor(block_features, dtype=torch.float32, device=device)
+    tensors.update(state_inputs)
+    _synchronize_device(device)
+    _add_timing(timings, "tensor_transfer", stage_started)
+    with torch.inference_mode():
+        _synchronize_device(device)
+        stage_started = time.perf_counter()
+        full_logits = model.forward_full(**tensors)
+        _synchronize_device(device)
+        _add_timing(timings, "model_forward_full", stage_started)
+
+        stage_started = time.perf_counter()
+        full_logits_cpu = full_logits.detach().cpu().numpy()
+        cycles, rows = np.nonzero(batch.active_mask.T)
+        symbols = np.asarray(batch.qualities[rows, cycles], dtype=np.int64)
+        active_logits = full_logits_cpu[rows, cycles]
+        _add_timing(timings, "logits_transfer_and_context", stage_started)
+        if prediction_report is not None:
+            stage_started = time.perf_counter()
+            prediction_report.observe(active_logits, symbols, positions=cycles + 1)
+            _add_timing(timings, "prediction_diagnostic", stage_started)
+        stage_started = time.perf_counter()
+        neural_theoretical_bits = (
+            logits_symbols_bits(active_logits, symbols) if report_neural_only_bits else 0.0
+        )
+        _add_timing(timings, "neural_only_diagnostic", stage_started)
+        stage_started = time.perf_counter()
+        if online_prior is None:
+            fused_logits = active_logits
+        elif isinstance(online_prior, AdaptivePriorState):
+            fused_logits = online_prior.fuse_positions(active_logits, batch.qualities, rows, cycles, capture=True)
+        elif isinstance(online_prior, MixturePriorState):
+            fused_logits = online_prior.fuse_positions(active_logits, batch.qualities, rows, cycles)
+        else:
+            previous = np.full(symbols.shape, BOS_QUALITY_ID, dtype=np.int64)
+            later = cycles > 0
+            previous[later] = batch.qualities[rows[later], cycles[later] - 1]
+            fused_logits = fuse_batch_logits(online_prior, active_logits, previous, cycles)
+        _add_timing(timings, "prior_fusion", stage_started)
+        stage_started = time.perf_counter()
+        encoded = (logits_to_intervals(fused_logits, symbols, total=total)
+                   if quantization_version == 2 and not rank_coding
+                   else logits_to_cdfs(fused_logits, total=total, version=quantization_version))
+        _add_timing(timings, "cdf_quantization", stage_started)
+        stage_started = time.perf_counter()
+        theoretical_bits = (float(-np.log2((encoded[1]-encoded[0]).astype(np.float64)/encoded[2]).sum())
+                            if quantization_version == 2 and not rank_coding
+                            else selected_quantized_bits(symbols, encoded,
+                                encoded[:, -1] if quantization_version == 2 else total))
+        _add_timing(timings, "quantized_bits", stage_started)
+
+        if verify_cdf:
+            cdfs = (logits_to_cdfs(fused_logits, total=total, version=2)
+                    if quantization_version == 2 and not rank_coding else encoded)
+            if quantization_version == 2 and not rank_coding:
+                indices = np.arange(symbols.size)
+                if not (np.array_equal(encoded[0], cdfs[indices, symbols])
+                        and np.array_equal(encoded[1], cdfs[indices, symbols+1])
+                        and np.array_equal(encoded[2], cdfs[:, -1])):
+                    raise CodecDeterminismError("direct interval/full CDF mismatch")
+            offset = 0
+            for cycle in range(batch.max_read_length):
+                _synchronize_device(device)
+                stage_started = time.perf_counter()
+                step_logits = model.forward_step(
+                    tensors["bases"],
+                    tensors["qualities"][:, :cycle],
+                    tensors["lengths"],
+                    tensors["active_mask"],
+                    **state_inputs,
+                )
+                _synchronize_device(device)
+                _add_timing(
+                    timings, "model_forward_step_verification", stage_started
+                )
+                stage_started = time.perf_counter()
+                active_rows = np.flatnonzero(batch.active_mask[:, cycle])
+                step_scores = step_logits.detach().cpu().numpy()[active_rows]
+                if online_prior is not None:
+                    step_scores = fuse_profile_positions(online_prior,
+                        step_scores, batch.qualities, active_rows,
+                        np.full(active_rows.size, cycle, dtype=np.int64))
+                step_cdfs = logits_to_cdfs(step_scores, total=total, version=quantization_version)
+                stop = offset + active_rows.size
+                full_cycle_cdfs = cdfs[offset:stop]
+                if not np.array_equal(full_cycle_cdfs, step_cdfs):
+                    mismatch = np.argwhere(full_cycle_cdfs != step_cdfs)[0]
+                    row = int(active_rows[int(mismatch[0])])
+                    read_index = int(batch.read_indices[row])
+                    raise CodecDeterminismError(
+                        "forward_full/forward_step integer CDF mismatch at "
+                        f"read {read_index}, cycle {cycle}"
+                    )
+                offset = stop
+                _add_timing(timings, "cdf_quantization_and_transfer", stage_started)
+            if offset != symbols.size:
+                raise ContainerError("CDF verification did not cover every quality")
+    return symbols, encoded, theoretical_bits, neural_theoretical_bits
+
+
+def _encode_fastq_compat(
+    input_path: Path,
+    output_path: Path,
+    checkpoint_path: Path,
+    *,
+    device: torch.device,
+    batch_reads: int = DEFAULT_BATCH_READS,
+    quantization_total: int = TOTAL,
+    progress: bool = True,
+    verify_cdf: bool = False,
+    online_prior_config: Optional[OnlinePriorConfig | MixturePriorConfig] = DEFAULT_ONLINE_PRIOR_CONFIG,
+    report_neural_only_bits: bool = False,
+    head_adaptation_config: Optional[HeadAdaptationConfig] = None,
+    head_adapter_path: Optional[Path] = None,
+    save_head_adapter_path: Optional[Path] = None,
+    quantization_version: int = 1,
+    coder_backend: str = "auto",
+    compress_metadata: bool = False,
+    quality_coding: str = "neural",
+) -> EncodeStatistics:
+    """Shared engine; expert profiles are for historical decoder fixtures only."""
+
+    started = time.perf_counter()
+    if quality_coding not in ("neural", "rank"):
+        raise ValueError("quality_coding must be neural or rank")
+    use_rank = quality_coding == "rank"
+    if use_rank and online_prior_config is not None:
+        raise ValueError("rank coding does not support historical probability profiles")
+    if use_rank and head_adaptation_config is not None and head_adaptation_config.read_quality_state:
+        raise ValueError("rank coding does not support read-state adapters")
+    if type(compress_metadata) is not bool:
+        raise ValueError("compress_metadata must be a boolean")
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    checkpoint_path = Path(checkpoint_path)
+    _validate_paths(input_path, output_path, checkpoint_path)
+    prediction_report_path = output_path.with_suffix(".predictions.txt")
+    protected_paths = {input_path.resolve(), output_path.resolve(), checkpoint_path.resolve()}
+    for adapter_path in (head_adapter_path, save_head_adapter_path):
+        if adapter_path is not None:
+            protected_paths.add(Path(adapter_path).resolve())
+    if prediction_report_path.resolve() in protected_paths:
+        raise ValueError("prediction report path must be distinct from input, output, checkpoint and adapters")
+    if prediction_report_path.exists() or prediction_report_path.is_symlink():
+        raise FileExistsError(f"{prediction_report_path}: prediction report already exists")
+    if type(quantization_version) is not int or quantization_version not in (1, 2):
+        raise ValueError("unsupported quantization version")
+    if quantization_version == 2 and online_prior_config is not None:
+        raise ValueError("floor quantizer is restricted to neural-only encoding")
+    if head_adaptation_config is not None and not isinstance(head_adaptation_config, HeadAdaptationConfig):
+        raise ValueError("invalid head_adaptation_config")
+    if head_adaptation_config is not None and head_adapter_path is not None:
+        raise ValueError("cannot train and load an adapter together")
+    if save_head_adapter_path is not None:
+        save_head_adapter_path = Path(save_head_adapter_path)
+        if head_adaptation_config is None:
+            raise ValueError("saving an adapter requires head adaptation")
+        if save_head_adapter_path.exists() or save_head_adapter_path.resolve() in {
+            input_path.resolve(), output_path.resolve(), checkpoint_path.resolve()
+        }:
+            raise FileExistsError("adapter export path must be new and distinct")
+    if batch_reads <= 0 or batch_reads > MAX_BATCH_READS:
+        raise ValueError(f"batch_reads must be in [1, {MAX_BATCH_READS}]")
+    quantization_total = validate_total(quantization_total)
+    if online_prior_config is not None and not isinstance(
+        online_prior_config, (OnlinePriorConfig, MixturePriorConfig)
+    ):
+        raise ValueError("online_prior_config must be a supported prior config or None")
+
+    range_encoder = RangeEncoder(backend=coder_backend)
+    print(f"Range coder backend: {range_encoder.backend} (single-threaded)", file=sys.stderr)
+    timings = {
+        "checkpoint_hash_and_load": 0.0,
+        "fastq_parse": 0.0,
+        "side_stream_record_write": 0.0,
+        "tensor_transfer": 0.0,
+        "model_forward_full": 0.0,
+        "model_forward_step_verification": 0.0,
+        "cdf_quantization_and_transfer": 0.0,
+        "range_encode": 0.0,
+        "range_finalize_and_stage": 0.0,
+        "container_write": 0.0,
+        "prediction_diagnostic": 0.0,
+        "prediction_report_write": 0.0,
+    }
+    stage_started = time.perf_counter()
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+    loaded = load_training_checkpoint(checkpoint_path, device=device)
+    model = loaded.model
+    model.eval()
+    block_enabled = bool(getattr(model.config, "block_quality_features", False))
+    if block_enabled:
+        if batch_reads != model.config.block_reads:
+            raise ValueError("block-conditioned encoding requires --batch-reads equal to checkpoint block_reads")
+        if head_adaptation_config is not None and (
+                (head_adaptation_config.backbone_layers and not head_adaptation_config.backbone_lora_rank)
+                or head_adaptation_config.lora
+                or head_adaptation_config.read_quality_state):
+            raise ValueError("block-conditioned encoding supports output-head and suffix-LoRA adaptation, without dense, legacy LoRA, or read-state adaptation")
+        if online_prior_config is not None or use_rank or hasattr(model, "read_state_conditioning"):
+            raise ValueError("block-conditioned encoding requires neural coding without priors or read-state adapters")
+    _synchronize_device(device)
+    _add_timing(timings, "checkpoint_hash_and_load", stage_started)
+    adapter = None
+    adaptation_report = None
+    if head_adaptation_config is not None or head_adapter_path is not None:
+        stage_started = time.perf_counter()
+        if head_adaptation_config is not None:
+            scope = ("Transformer suffix LoRA + output head" if head_adaptation_config.backbone_lora_rank
+                     else "Transformer suffix + output head" if head_adaptation_config.backbone_layers
+                     else "output head on a bounded prefix")
+            print(f"Adapting {scope} (experts disabled)...", file=sys.stderr)
+            adapter, adaptation_report = adapt_output_head(model, input_path, device=device,
+                batch_reads=batch_reads, total=quantization_total, base_sha256=checkpoint_sha256,
+                config=replace(head_adaptation_config, quantization_version=quantization_version))
+            if save_head_adapter_path is not None:
+                artifact = {"format": "direct-quality-head-adaptation-artifact", "version": 1,
+                            "base_checkpoint_sha256": checkpoint_sha256, "adapter": adapter,
+                            "report": adaptation_report, "source": str(input_path.resolve())}
+                save_head_adapter_path.parent.mkdir(parents=True, exist_ok=True)
+                with save_head_adapter_path.open("x", encoding="utf-8") as handle:
+                    json.dump(artifact, handle, sort_keys=True, allow_nan=False)
+        else:
+            artifact = json.loads(Path(head_adapter_path).read_text())
+            if (not isinstance(artifact, dict) or artifact.get("format") != "direct-quality-head-adaptation-artifact"
+                    or type(artifact.get("version")) is not int or artifact["version"] != 1
+                    or artifact.get("base_checkpoint_sha256") != checkpoint_sha256
+                    or "adapter" not in artifact or not isinstance(artifact.get("report"), dict)):
+                raise ValueError("invalid adapter artifact or base checkpoint mismatch")
+            adapter = artifact["adapter"]
+            if adapter is not None:
+                if block_enabled and (not isinstance(adapter, dict)
+                        or type(adapter.get("version")) is not int
+                        or adapter["version"] not in (1, 2, 4, 8)):
+                    raise ValueError("block-conditioned encoding supports only output-head or suffix-LoRA adapters")
+                apply_head_adapter(model, adapter, checkpoint_sha256)
+            adaptation_report = {"accepted": adapter is not None, "reason": "loaded_artifact",
+                                 "artifact_source": artifact.get("source"), "original_report": artifact["report"]}
+        _synchronize_device(device)
+        _add_timing(timings, "head_adaptation", stage_started)
+        adaptation_report["total_stage_seconds"] = timings["head_adaptation"]
+        adaptation_report["parameter_bytes"] = adapter["parameter_bytes"] if adapter else 0
+        adaptation_report["container_adapter_bytes"] = adapter_container_bytes(adapter)
+        if adapter is not None and online_prior_config is not None:
+            adaptation_report["container_adapter_bytes"] -= len('"probability_profile":null,')
+        print(f"Head adaptation: {adaptation_report['reason']}; "
+              f"accepted={adaptation_report['accepted']}; {timings['head_adaptation']:.3f}s", file=sys.stderr)
+        if "backbone_accepted" in adaptation_report:
+            print(f"Selected adapter: {adaptation_report['selected_adapter_type']}; "
+                  f"backbone_accepted={adaptation_report['backbone_accepted']}; "
+                  f"fallback={adaptation_report['backbone_fallback']}", file=sys.stderr)
+            if adaptation_report.get("estimated_net_saving_bytes") is not None:
+                print(f"Estimated quality saving={adaptation_report['estimated_quality_saving_bytes']:.0f} B; "
+                      f"extra adapter={adaptation_report['incremental_adapter_bytes']} B; "
+                      f"net saving={adaptation_report['estimated_net_saving_bytes']:.0f} B", file=sys.stderr)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    source_digest = hashlib.sha256()
+    source_uncompressed_size = 0
+    read_count = 0
+    batch_count = 0
+    quality_symbols = 0
+    quantized_theoretical_bits = 0.0
+    neural_only_theoretical_bits = 0.0
+    prediction_report = PredictionReport()
+    rank_counts = np.zeros(QUALITY_ALPHABET_SIZE, dtype=np.int64)
+    rank_metadata = None
+    original_quantized_bits = 0.0
+    online_prior = make_prior_state(online_prior_config) if online_prior_config is not None else None
+    progress_bar = None
+    if progress and tqdm is not None:
+        progress_bar = tqdm(desc="encode FASTQ", unit="read", leave=True)
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f".{output_path.name}.sections.", dir=str(output_path.parent)
+        ) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            header_path = temporary_root / "header.gz"
+            base_path = temporary_root / "base.gz"
+            plus_path = temporary_root / "plus.gz"
+            quality_path = temporary_root / "quality.range"
+            state_path = temporary_root / "read_state.bin"
+            block_path = temporary_root / "block_features.bin"
+            state_enabled = hasattr(model, "read_state_conditioning")
+            if use_rank and state_enabled:
+                raise ValueError("rank coding does not support read-state adapters")
+            if state_enabled and online_prior_config is not None:
+                raise ValueError("read-state encoding requires neural-only probabilities")
+
+            with SideStreamWriter(
+                header_path, "header", compresslevel=GZIP_COMPRESSLEVEL
+            ) as header_writer, SideStreamWriter(
+                base_path, "base", compresslevel=GZIP_COMPRESSLEVEL
+            ) as base_writer, SideStreamWriter(
+                plus_path, "plus", compresslevel=GZIP_COMPRESSLEVEL
+            ) as plus_writer, state_path.open("wb") as state_handle, (temporary_root / "ranks.u1").open("wb") as rank_spool, block_path.open("wb") as block_handle:
+                state_writer = (StateWriter(state_handle,
+                    class_count=model.read_state_conditioning.class_count) if state_enabled else None)
+                batch_iterator = iter_fastq_batches(
+                    input_path, batch_reads=batch_reads
+                )
+                while True:
+                    stage_started = time.perf_counter()
+                    try:
+                        batch = next(batch_iterator)
+                    except StopIteration:
+                        _add_timing(timings, "fastq_parse", stage_started)
+                        break
+                    _add_timing(timings, "fastq_parse", stage_started)
+                    if len(batch.raw_records) != batch.read_count:
+                        raise ContainerError(
+                            "direct FASTQ batch is missing raw records"
+                        )
+                    stage_started = time.perf_counter()
+                    for record in batch.raw_records:
+                        raw_record = record.to_bytes()
+                        source_digest.update(raw_record)
+                        source_uncompressed_size += len(raw_record)
+                        header_writer.write_record(
+                            record.header, record.line_endings[0]
+                        )
+                        base_writer.write_record(
+                            record.sequence, record.line_endings[1]
+                        )
+                        plus_writer.write_record(
+                            record.plus,
+                            record.line_endings[2],
+                            quality_line_ending=record.line_endings[3],
+                        )
+                    _add_timing(timings, "side_stream_record_write", stage_started)
+
+                    read_states = None
+                    block_inputs = None
+                    if block_enabled:
+                        stage_started = time.perf_counter()
+                        payload = (encode_block_features(batch)
+                                   if model.config.block_feature_mode == "features" else bytes(BLOCK_FEATURE_BYTES))
+                        if model.config.block_feature_mode == "features":
+                            block_handle.write(payload)
+                        # Use the same quantized description the decoder receives.
+                        block_inputs = np.broadcast_to(decode_block_features(payload), (batch.read_count, BLOCK_FEATURE_BYTES)).copy()
+                        _add_timing(timings, "block_feature_compute_and_write", stage_started)
+                    if state_writer is not None:
+                        stage_started = time.perf_counter()
+                        read_states = classify_reads(batch.qualities, batch.lengths,
+                            model.read_state_conditioning.thresholds)
+                        state_writer.write(read_states)
+                        _add_timing(timings, "read_state_classify_and_write", stage_started)
+                    (
+                        symbols,
+                        cdfs,
+                        batch_theoretical_bits,
+                        batch_neural_only_bits,
+                    ) = _quantize_verified_batch(
+                        model,
+                        batch,
+                        device,
+                        total=quantization_total,
+                        online_prior=online_prior,
+                        timings=timings,
+                        verify_cdf=verify_cdf,
+                        report_neural_only_bits=report_neural_only_bits,
+                        quantization_version=quantization_version,
+                        read_states=read_states,
+                        prediction_report=prediction_report,
+                        rank_coding=use_rank,
+                        block_features=block_inputs,
+                    )
+                    stage_started = time.perf_counter()
+                    if use_rank:
+                        ranks = ranks_from_cdfs(cdfs, symbols)
+                        rank_spool.write(ranks.tobytes())
+                        rank_counts += np.bincount(ranks, minlength=QUALITY_ALPHABET_SIZE)
+                    elif quantization_version == 2:
+                        range_encoder.encode_prevalidated_intervals(*cdfs)
+                    else:
+                        range_encoder.encode_prevalidated_batch(symbols, cdfs, total=quantization_total)
+                    _add_timing(timings, "range_encode", stage_started)
+                    if online_prior is not None:
+                        stage_started = time.perf_counter()
+                        if isinstance(online_prior, AdaptivePriorState):
+                            online_prior.observe_symbols(symbols)
+                        _add_timing(timings, "adaptive_weight_feedback", stage_started)
+                        stage_started = time.perf_counter()
+                        online_prior.update_batch(batch.qualities, batch.active_mask)
+                        _add_timing(timings, "prior_update", stage_started)
+                    read_count += batch.read_count
+                    batch_count += 1
+                    quality_symbols += int(symbols.size)
+                    quantized_theoretical_bits += batch_theoretical_bits
+                    neural_only_theoretical_bits += batch_neural_only_bits
+                    if progress_bar is not None:
+                        progress_bar.update(batch.read_count)
+
+                if state_writer is not None:
+                    state_writer.finish()
+
+            stage_started = time.perf_counter()
+            if use_rank:
+                original_quantized_bits = quantized_theoretical_bits
+                rank_metadata = make_rank_metadata(rank_counts.tolist(), quantization_total)
+                rank_cdf = validate_rank_metadata(rank_metadata, quantization_total, quality_symbols)
+                quantized_theoretical_bits = global_rank_bits(rank_counts, rank_cdf)
+                print("Rank coding: fixed global histogram; encoding temporary rank stream", file=sys.stderr)
+                with (temporary_root / "ranks.u1").open("rb") as handle:
+                    rank_progress = (tqdm(total=quality_symbols, desc="encode ranks", unit="Q")
+                                     if progress and tqdm is not None else None)
+                    try:
+                        while True:
+                            chunk = handle.read(1 << 20)
+                            if not chunk:
+                                break
+                            ranks = np.frombuffer(chunk, dtype=np.uint8).astype(np.int64)
+                            range_encoder.encode_prevalidated_intervals(
+                                rank_cdf[ranks], rank_cdf[ranks + 1],
+                                np.full(ranks.size, quantization_total, dtype=np.int64))
+                            if rank_progress is not None:
+                                rank_progress.update(ranks.size)
+                    finally:
+                        if rank_progress is not None:
+                            rank_progress.close()
+            range_stream = range_encoder.finish()
+            quality_path.write_bytes(range_stream)
+            _add_timing(timings, "range_finalize_and_stage", stage_started)
+            if range_encoder.symbol_count != quality_symbols:
+                raise ContainerError(
+                    "range symbol count does not match FASTQ qualities"
+                )
+            if prediction_report.total_symbols != quality_symbols:
+                raise ContainerError("prediction report did not cover every active quality")
+
+            metadata = {
+                "format": CONTAINER_FORMAT,
+                "format_version": (
+                    CONTAINER_VERSION
+                    if online_prior_config is not None
+                    else LEGACY_CONTAINER_VERSION
+                ),
+                "source_basename": input_path.name,
+                "source_compressed_size": input_path.stat().st_size,
+                "source_uncompressed_size": source_uncompressed_size,
+                "source_uncompressed_sha256": source_digest.hexdigest(),
+                "read_count": read_count,
+                "batch_reads": batch_reads,
+                "batch_count": batch_count,
+                "last_batch_read_count": (
+                    0 if read_count == 0 else ((read_count - 1) % batch_reads) + 1
+                ),
+                "quality_symbol_count": quality_symbols,
+                "gzip_side_streams": {
+                    "compresslevel": GZIP_COMPRESSLEVEL,
+                    "record_schema_version": 1,
+                    "quality_line_ending_location": "plus_gzip",
+                },
+                "probability_quantization": {
+                    "version": quantization_version,
+                    "total": quantization_total,
+                    "quality_alphabet_size": QUALITY_ALPHABET_SIZE,
+                    "phred_offset": PHRED_OFFSET,
+                    "float_contract": "finite_cpu_float64",
+                },
+                "range_coder": {
+                    "version": RANGE_CODER_VERSION,
+                    "stream_count": 1,
+                    "payload_bit_count": range_encoder.metadata.payload_bit_count,
+                },
+                "checkpoint": {
+                    "sha256": checkpoint_sha256,
+                    "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                    "model_config": model.config.to_dict(),
+                    "feature_schema": feature_schema(model.config),
+                },
+                "inference_runtime": {
+                    "torch_version": torch.__version__,
+                    "device_type": device.type,
+                    "dtype": "float32",
+                },
+            }
+            if online_prior_config is not None:
+                metadata["probability_profile"] = (
+                    online_prior_config.to_profile_metadata()
+                )
+            if adapter is not None:
+                metadata["format_version"] = ADAPTED_CONTAINER_VERSION
+                metadata["head_adapter"] = adapter
+                metadata.setdefault("probability_profile", None)
+            if state_enabled:
+                metadata["format_version"] = READ_STATE_CONTAINER_VERSION
+                metadata["read_state"] = label_metadata(adapter, read_count)
+                if state_writer.count != read_count:
+                    raise ContainerError("read-state label count does not match FASTQ reads")
+                adaptation_report["read_state_class_counts"] = state_writer.class_counts.tolist()
+            if use_rank:
+                metadata["format_version"] = RANK_CONTAINER_VERSION
+                metadata["rank_encoding"] = rank_metadata
+            if block_enabled:
+                metadata["format_version"] = BLOCK_FEATURE_CONTAINER_VERSION
+                metadata["block_features"] = {
+                    "schema": block_feature_schema(block_reads=model.config.block_reads),
+                    "mode": model.config.block_feature_mode,
+                    "block_count": batch_count,
+                    "stream_bytes": block_path.stat().st_size,
+                }
+            stage_started = time.perf_counter()
+            container_info = write_container(
+                output_path,
+                metadata,
+                (
+                    SectionSource(
+                        "header_gzip", header_path, header_writer.uncompressed_length
+                    ),
+                    SectionSource(
+                        "base_gzip", base_path, base_writer.uncompressed_length
+                    ),
+                    SectionSource(
+                        "plus_gzip", plus_path, plus_writer.uncompressed_length
+                    ),
+                    SectionSource("quality_range", quality_path, len(range_stream)),
+                ) + ((SectionSource("read_state", state_path, state_path.stat().st_size),) if state_enabled else ())
+                + ((SectionSource("block_features", block_path, block_path.stat().st_size),) if block_enabled else ()),
+                compress_metadata=compress_metadata,
+            )
+            _add_timing(timings, "container_write", stage_started)
+            stage_started = time.perf_counter()
+            prediction_report.write(prediction_report_path)
+            _add_timing(timings, "prediction_report_write", stage_started)
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+    input_bytes = input_path.stat().st_size
+    print(f"Prediction report: {prediction_report_path.resolve()}", file=sys.stderr)
+    output_bytes = container_info.file_size
+    range_stream_bytes = container_info.section("quality_range").length
+    rank_table_bytes = 0
+    if use_rank:
+        from codec.coding.container import metadata_payload
+        rank_baseline = dict(container_info.metadata)
+        rank_baseline.pop("head_adapter", None)
+        if rank_baseline.get("probability_profile", object()) is None:
+            rank_baseline.pop("probability_profile")
+        without_rank = dict(rank_baseline)
+        without_rank.pop("rank_encoding")
+        rank_table_bytes = (len(metadata_payload(rank_baseline, compressed=compress_metadata))
+                            - len(metadata_payload(without_rank, compressed=compress_metadata)))
+    state_stream_bytes, state_metadata_bytes = state_container_overhead(container_info)
+    block_stream_bytes = container_info.section("block_features").length if block_enabled else 0
+    block_metadata_bytes = block_feature_metadata_bytes(container_info.metadata, compressed=compress_metadata)
+    if block_enabled and adaptation_report is not None:
+        adaptation_report["container_adapter_bytes"] = adaptation_metadata_bytes(container_info.metadata, compressed=False)[0]
+    if compress_metadata:
+        adapter_bytes, state_metadata_bytes = adaptation_metadata_bytes(container_info.metadata, compressed=True)
+        if adaptation_report is not None:
+            adaptation_report["container_adapter_bytes_uncompressed"] = adaptation_report["container_adapter_bytes"]
+            adaptation_report["container_adapter_bytes"] = adapter_bytes
+            adaptation_report["metadata_encoding"] = "canonical_json_zlib"
+        print(f"Compressed container metadata: {container_info.header_bytes} B; adapter: {adapter_bytes} B",
+              file=sys.stderr)
+    if state_stream_bytes or state_metadata_bytes:
+        print(f"Read-state labels: {state_stream_bytes} B; framing: {state_metadata_bytes} B; "
+              f"class counts: {state_writer.class_counts.tolist()}", file=sys.stderr)
+    encode_seconds = time.perf_counter() - started
+    quality_model_prediction_seconds = timings["model_forward_full"]
+    quality_entropy_coding_seconds = (
+        timings["cdf_quantization_and_transfer"]
+        + timings["range_encode"]
+        + timings["range_finalize_and_stage"]
+        + sum(timings.get(name, 0.0) for name in (
+            "logits_transfer_and_context", "neural_only_diagnostic", "prior_fusion",
+            "cdf_quantization", "quantized_bits", "prior_update",
+            "adaptive_weight_feedback",
+        ))
+    )
+    return EncodeStatistics(
+        input_bytes=input_bytes,
+        output_bytes=output_bytes,
+        output_to_input_ratio=(output_bytes / input_bytes if input_bytes else math.inf),
+        read_count=read_count,
+        batch_count=batch_count,
+        quality_symbols=quality_symbols,
+        quantized_theoretical_bits=quantized_theoretical_bits,
+        quantized_theoretical_bits_per_quality=(
+            quantized_theoretical_bits / quality_symbols
+            if quality_symbols
+            else None
+        ),
+        neural_only_theoretical_bits=(
+            neural_only_theoretical_bits if report_neural_only_bits else None
+        ),
+        neural_only_theoretical_bits_per_quality=(
+            neural_only_theoretical_bits / quality_symbols
+            if quality_symbols and report_neural_only_bits
+            else None
+        ),
+        range_payload_bits=range_encoder.metadata.payload_bit_count,
+        range_payload_bits_per_quality=(
+            range_encoder.metadata.payload_bit_count / quality_symbols
+            if quality_symbols
+            else None
+        ),
+        range_stream_bytes=range_stream_bytes,
+        range_stream_bits_per_quality=(
+            range_stream_bytes * 8 / quality_symbols
+            if quality_symbols
+            else None
+        ),
+        header_gzip_bytes=container_info.section("header_gzip").length,
+        base_gzip_bytes=container_info.section("base_gzip").length,
+        plus_gzip_bytes=container_info.section("plus_gzip").length,
+        container_header_bytes=container_info.header_bytes,
+        encode_seconds=encode_seconds,
+        quality_model_prediction_seconds=quality_model_prediction_seconds,
+        quality_entropy_coding_seconds=quality_entropy_coding_seconds,
+        encoding_stage_seconds=dict(timings),
+        online_adaptation=(online_prior.diagnostics() if isinstance(online_prior, AdaptivePriorState) else None),
+        head_adaptation=adaptation_report,
+        quality_and_adapter_bytes=range_stream_bytes + (
+            adaptation_report["container_adapter_bytes"] if adaptation_report else 0)
+            + state_stream_bytes + state_metadata_bytes + rank_table_bytes + block_stream_bytes + block_metadata_bytes,
+        coder_backend=range_encoder.backend,
+        read_state_stream_bytes=state_stream_bytes,
+        read_state_metadata_bytes=state_metadata_bytes,
+        read_state_stream_bits_per_quality=(state_stream_bytes * 8 / quality_symbols if quality_symbols else None),
+        prediction_top1_accuracy=prediction_report.accuracy,
+        prediction_correct_symbols=prediction_report.correct_symbols,
+        prediction_report_path=str(prediction_report_path.resolve()),
+        quality_coding=quality_coding,
+        rank_histogram=rank_counts.tolist() if use_rank else None,
+        rank_table_bytes=rank_table_bytes,
+        original_quantized_theoretical_bits=original_quantized_bits if use_rank else None,
+        block_feature_stream_bytes=block_stream_bytes,
+        block_feature_metadata_bytes=block_metadata_bytes,
+        block_feature_stream_bits_per_quality=(block_stream_bytes * 8 / quality_symbols if quality_symbols else None),
+    )
+
+
+def encode_fastq(
+    input_path: Path, output_path: Path, checkpoint_path: Path, *, device: torch.device,
+    batch_reads: int = DEFAULT_BATCH_READS, quantization_total: int = TOTAL,
+    progress: bool = True, verify_cdf: bool = False,
+    report_neural_only_bits: bool = False,
+    head_adaptation_config: Optional[HeadAdaptationConfig] = None,
+    head_adapter_path: Optional[Path] = None,
+    save_head_adapter_path: Optional[Path] = None,
+    quantization_version: int = 1,
+    coder_backend: str = "auto",
+    compress_metadata: bool = False,
+    quality_coding: str = "neural",
+) -> EncodeStatistics:
+    """Encode neural probabilities and write a sibling .predictions.txt report."""
+    return _encode_fastq_compat(
+        input_path, output_path, checkpoint_path, device=device, batch_reads=batch_reads,
+        quantization_total=quantization_total, progress=progress, verify_cdf=verify_cdf,
+        online_prior_config=None, report_neural_only_bits=report_neural_only_bits,
+        head_adaptation_config=head_adaptation_config, head_adapter_path=head_adapter_path,
+        save_head_adapter_path=save_head_adapter_path,
+        quantization_version=quantization_version,
+        coder_backend=coder_backend,
+        compress_metadata=compress_metadata,
+        quality_coding=quality_coding,
+    )
+
+
+class _NeuralEncoderParser(argparse.ArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        supplied = list(sys.argv[1:] if args is None else args)
+        for token in supplied:
+            option = token.split("=", 1)[0]
+            if option in ("--adaptive-weights", "--probability-profile") or option.startswith("--prior-"):
+                self.error(f"{option} has been retired: encoding is pure neural. "
+                           "Old expert containers remain decodable; historical v3 batch commands "
+                           "must not be reused for new neural runs.")
+        return super().parse_known_args(supplied, namespace)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _NeuralEncoderParser(
+        description="Compress plain/gzip FASTQ with pure neural probabilities and optional head fitting",
+        epilog="Also writes <output-stem>.predictions.txt: whole-file top-1/rank statistics, "
+               "true-Q probability bins and read positions with true-Q probability <= 0.3.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("input", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--quality-coding", choices=("neural", "rank"), default="neural",
+                        help="rank: encode neural probability ranks using one transmitted whole-file histogram")
+    parser.add_argument("--batch-reads", type=int, default=DEFAULT_BATCH_READS)
+    parser.add_argument("--quantization-total", type=int, default=TOTAL)
+    parser.add_argument("--quantizer", choices=("largest-remainder", "floor"), default="largest-remainder",
+                        help="floor: no remainder sorting, variable totals and direct symbol intervals")
+    parser.add_argument("--coder-backend", choices=("auto", "python", "native"), default="auto",
+                        help="native: require the single-threaded C++ coder; build with python -m codec.build_native")
+    parser.add_argument("--compress-metadata", action="store_true",
+                        help="losslessly compress container metadata, including the saved adapter")
+    parser.add_argument(
+        "--verify-cdf",
+        action="store_true",
+        help=(
+            "slow debug check: compare forward_full and forward_step integer "
+            "CDFs for every active quality"
+        ),
+    )
+    parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--neural-only", action="store_true", help="compatibility alias; encoding is always neural-only")
+    adaptation_options = parser.add_mutually_exclusive_group()
+    adaptation_options.add_argument("--finetune-head", action="store_true",
+        help="adapt frozen-feature output head before pure-neural encoding")
+    adaptation_options.add_argument("--head-adapter", type=Path, help="load exported adapter, without retraining")
+    parser.add_argument("--save-head-adapter", type=Path, help="export accepted head or explicit fallback for paired tests")
+    parser.add_argument("--no-adaptation-validation", action="store_true",
+        help="train all adaptation samples and transmit the final step; skip held-out validation and intermediate selection; requires --finetune-head")
+    parser.add_argument("--head-max-reads", type=int, default=4096)
+    parser.add_argument("--head-max-symbols", type=int, default=600000)
+    parser.add_argument("--head-max-read-length", type=int, default=2048)
+    parser.add_argument("--head-steps", type=int, default=50)
+    parser.add_argument("--head-symbols-per-step", type=int, default=8192)
+    parser.add_argument("--head-learning-rate", type=float, default=0.001)
+    parser.add_argument("--head-anchor-strength", type=float, default=0.01)
+    parser.add_argument("--head-max-seconds", type=float, default=20.0,
+                        help="total adaptation time budget; 0 disables the deadline")
+    parser.add_argument("--head-min-gain", type=float, default=0.0)
+    parser.add_argument("--head-seed", type=int, default=20260921)
+    parser.add_argument("--head-type", choices=("linear", "residual"), default="linear",
+        help="fitted output head: linear baseline or linear + small GELU residual")
+    parser.add_argument("--head-residual-dim", type=int, default=32,
+        help="residual hidden width (1..128); requires --head-type residual")
+    parser.add_argument("--head-cross-layer", action="store_true", help="add a trainable branch from frozen block 3; requires residual head")
+    parser.add_argument("--head-cross-dim", type=int, default=16, help="cross-layer branch width (1..128)")
+    parser.add_argument("--head-lora", action="store_true", help="adapt final-layer Q/V after fitting cross-layer head")
+    parser.add_argument("--head-lora-rank", type=int, default=4)
+    parser.add_argument("--head-lora-steps", type=int, default=1000, help="maximum extra sequence updates within total budget")
+    parser.add_argument("--head-lora-learning-rate", type=float, default=0.0003)
+    parser.add_argument("--finetune-last-layers", type=int, default=0,
+                        help="jointly fit this many final Transformer layers, final norm, and head "
+                             "(LoRA: up to model depth, at most 64; dense: 1..4)")
+    parser.add_argument("--read-quality-state", action="store_true",
+                        help="transmit read mean labels and condition each fitted Transformer block; requires --finetune-last-layers")
+    parser.add_argument("--read-state-classes", type=int, choices=(2, 4), default=4,
+                        help="2: median/1 bit per read; 4: quartiles/2 bits per read (default); requires --read-quality-state")
+    parser.add_argument("--backbone-steps", type=int, default=5000)
+    parser.add_argument("--backbone-batch-reads", type=int, default=16)
+    parser.add_argument("--backbone-learning-rate", type=float, default=0.0001)
+    parser.add_argument("--backbone-eval-every", type=int, default=200)
+    parser.add_argument("--backbone-patience", type=int, default=6,
+                        help="validation checks without a min-delta improvement before stopping; 0 disables")
+    parser.add_argument("--backbone-max-reads", type=int, default=32000)
+    parser.add_argument("--backbone-max-symbols", type=int, default=4800000)
+    parser.add_argument("--backbone-lora-rank", type=int, default=0,
+                        help="use rank 1..16 Q/K/V/O + FFN LoRA in selected final layers; 0 keeps dense updates")
+    parser.add_argument(
+        "--report-neural-only-bits", action="store_true",
+        help="extra diagnostic softmax pass; disabled by default for encoding speed",
+    )
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        head_config = None
+        if args.no_adaptation_validation and not args.finetune_head:
+            raise ValueError("--no-adaptation-validation requires --finetune-head")
+        if args.read_state_classes != 4 and not args.read_quality_state:
+            raise ValueError("--read-state-classes requires --read-quality-state")
+        if not args.head_lora and (args.head_lora_rank != 4 or args.head_lora_steps != 1000 or args.head_lora_learning_rate != 0.0003):
+            raise ValueError("--head-lora-* requires --head-lora")
+        if args.head_cross_dim != 16 and not args.head_cross_layer:
+            raise ValueError("--head-cross-dim requires --head-cross-layer")
+        if args.head_residual_dim != 32 and args.head_type != "residual":
+            raise ValueError("--head-residual-dim requires --head-type residual")
+        backbone_options = ("backbone_steps", "backbone_batch_reads", "backbone_learning_rate",
+                            "backbone_eval_every", "backbone_patience", "backbone_max_reads",
+                            "backbone_max_symbols", "backbone_lora_rank")
+        if not args.finetune_last_layers and any(
+                getattr(args, name) != build_parser().get_default(name) for name in backbone_options):
+            raise ValueError("--backbone-* requires --finetune-last-layers")
+        if args.finetune_head:
+            head_config = HeadAdaptationConfig(max_reads=args.head_max_reads, max_symbols=args.head_max_symbols,
+                max_read_length=args.head_max_read_length, steps=args.head_steps,
+                symbols_per_step=args.head_symbols_per_step, learning_rate=args.head_learning_rate,
+                anchor_strength=args.head_anchor_strength, max_seconds=args.head_max_seconds,
+                min_gain_bits_per_quality=args.head_min_gain, seed=args.head_seed,
+                head_type=args.head_type, residual_dim=args.head_residual_dim,
+                cross_layer=args.head_cross_layer, cross_dim=args.head_cross_dim,
+                lora=args.head_lora, lora_rank=args.head_lora_rank, lora_steps=args.head_lora_steps,
+                lora_learning_rate=args.head_lora_learning_rate,
+                backbone_layers=args.finetune_last_layers, backbone_steps=args.backbone_steps,
+                backbone_batch_reads=args.backbone_batch_reads,
+                backbone_learning_rate=args.backbone_learning_rate,
+                backbone_eval_every=args.backbone_eval_every, backbone_patience=args.backbone_patience,
+                backbone_max_reads=args.backbone_max_reads, backbone_max_symbols=args.backbone_max_symbols,
+                backbone_lora_rank=args.backbone_lora_rank, read_quality_state=args.read_quality_state,
+                read_state_classes=args.read_state_classes,
+                validation_enabled=not args.no_adaptation_validation)
+        elif any(getattr(args, name) != build_parser().get_default(name) for name in (
+            "head_max_reads", "head_max_symbols", "head_max_read_length", "head_steps", "head_symbols_per_step",
+            "head_learning_rate", "head_anchor_strength", "head_max_seconds", "head_min_gain", "head_seed",
+            "head_type", "head_residual_dim", "head_cross_layer", "head_cross_dim",
+            "head_lora", "head_lora_rank", "head_lora_steps", "head_lora_learning_rate",
+            "finetune_last_layers", "read_quality_state", "read_state_classes", *backbone_options)):
+            raise ValueError("adaptation training options require --finetune-head")
+        statistics = encode_fastq(
+            args.input,
+            args.output,
+            args.checkpoint,
+            device=choose_device(args.device),
+            batch_reads=args.batch_reads,
+            quantization_total=args.quantization_total,
+            quantization_version=2 if args.quantizer == "floor" else 1,
+            coder_backend=args.coder_backend,
+            progress=not args.no_progress,
+            verify_cdf=args.verify_cdf,
+            report_neural_only_bits=args.report_neural_only_bits,
+            head_adaptation_config=head_config,
+            head_adapter_path=args.head_adapter,
+            save_head_adapter_path=args.save_head_adapter,
+            compress_metadata=args.compress_metadata,
+            quality_coding=args.quality_coding,
+        )
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(statistics.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = [
+    "CodecDeterminismError",
+    "EncodeStatistics",
+    "choose_device",
+    "encode_fastq",
+]

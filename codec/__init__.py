@@ -6,7 +6,11 @@ minimal causal model, deterministic probability quantizer, integer range
 coder, and byte-exact FASTQ container contract.
 """
 
-from .fastq_stream import (
+from .utils.legacy_imports import install_legacy_imports as _install_legacy_imports
+
+_install_legacy_imports()
+
+from .data.fastq_stream import (
     DEFAULT_BATCH_READS,
     MAX_BATCH_READS,
     FastqBatch,
@@ -14,7 +18,7 @@ from .fastq_stream import (
     iter_fastq_batches,
     iter_fastq_records,
 )
-from ._range_common import (
+from .coding._range_common import (
     InvalidCDFError,
     InvalidRangeStreamError,
     RANGE_CODER_VERSION,
@@ -22,7 +26,7 @@ from ._range_common import (
     RangeCodingError,
     TruncatedRangeStreamError,
 )
-from .container import (
+from .coding.container import (
     CONTAINER_FORMAT,
     CONTAINER_VERSION,
     LEGACY_CONTAINER_VERSION,
@@ -31,7 +35,7 @@ from .container import (
     TruncatedContainerError,
     read_container,
 )
-from .online_prior import (
+from .priors.online_prior import (
     DEFAULT_ONLINE_PRIOR_CONFIG,
     ONLINE_PRIOR_PROFILE,
     ONLINE_PRIOR_VERSION,
@@ -39,7 +43,7 @@ from .online_prior import (
     OnlinePriorError,
     OnlinePriorState,
 )
-from .probability_quantization import (
+from .coding.probability_quantization import (
     QUANTIZATION_VERSION,
     TOTAL,
     logits_symbols_bits,
@@ -48,8 +52,8 @@ from .probability_quantization import (
     probabilities_to_cdf,
     quantized_symbols_bits,
 )
-from .range_decoder import RangeDecoder
-from .range_encoder import RangeEncoder
+from .coding.range_decoder import RangeDecoder
+from .coding.range_encoder import RangeEncoder
 
 __all__ = [
     "CONTAINER_FORMAT",

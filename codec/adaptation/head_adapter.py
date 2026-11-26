@@ -1,0 +1,564 @@
+"""Bounded prefix adaptation of a frozen causal model's FP32 output head.
+
+No online expert is invoked here. The decoder loads exact transmitted weights;
+it never repeats optimization. Deadline checks are cooperative, not real-time.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import math
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.nn import functional as F
+
+from codec.data.fastq_stream import encode_base_ids, iter_fastq_records, make_fastq_batch
+from codec.models.transformer import CrossLayerOutputHead, ResidualOutputHead, fastq_batch_to_tensors
+from codec.coding.probability_quantization import logits_to_cdfs
+from codec.coding.encode_fastpath import selected_quantized_bits
+
+
+ADAPTER_FORMAT = "direct-quality-output-head"
+
+
+@dataclass(frozen=True)
+class HeadAdaptationConfig:
+    max_reads: int = 4096
+    max_symbols: int = 600000
+    max_read_length: int = 2048
+    steps: int = 50
+    symbols_per_step: int = 8192
+    learning_rate: float = 0.001
+    anchor_strength: float = 0.01
+    max_seconds: float = 20.0
+    min_gain_bits_per_quality: float = 0.0
+    seed: int = 20260921
+    head_type: str = "linear"
+    residual_dim: int = 32
+    cross_layer: bool = False
+    cross_dim: int = 16
+    lora: bool = False
+    lora_rank: int = 4
+    lora_steps: int = 1000
+    lora_learning_rate: float = 0.0003
+    quantization_version: int = 1
+    backbone_layers: int = 0
+    backbone_steps: int = 5000
+    backbone_batch_reads: int = 16
+    backbone_learning_rate: float = 0.0001
+    backbone_eval_every: int = 200
+    backbone_patience: int = 6
+    backbone_max_reads: int = 32000
+    backbone_max_symbols: int = 4800000
+    backbone_lora_rank: int = 0
+    read_quality_state: bool = False
+    read_state_classes: int = 4
+    validation_enabled: bool = True
+
+    def __post_init__(self):
+        if type(self.validation_enabled) is not bool:
+            raise ValueError("validation_enabled must be bool")
+        if type(self.read_quality_state) is not bool or (self.read_quality_state and not self.backbone_layers):
+            raise ValueError("read_quality_state requires Transformer suffix adaptation")
+        if type(self.read_state_classes) is not int or self.read_state_classes not in (2, 4):
+            raise ValueError("read_state_classes must be 2 or 4")
+        if self.read_state_classes != 4 and not self.read_quality_state:
+            raise ValueError("read_state_classes requires read_quality_state")
+        if type(self.backbone_layers) is not int or not 0 <= self.backbone_layers <= 64:
+            raise ValueError("backbone_layers must be in [0, 64]")
+        if self.backbone_layers and self.lora:
+            raise ValueError("backbone adaptation cannot be combined with legacy --head-lora")
+        if type(self.backbone_lora_rank) is not int or not 0 <= self.backbone_lora_rank <= 16:
+            raise ValueError("backbone_lora_rank must be in [0, 16]")
+        if self.backbone_lora_rank and not self.backbone_layers:
+            raise ValueError("backbone_lora_rank requires backbone_layers")
+        if self.backbone_layers > 4 and not self.backbone_lora_rank:
+            raise ValueError("adapting more than four backbone layers requires suffix LoRA")
+        for name in ("backbone_steps", "backbone_batch_reads", "backbone_eval_every",
+                     "backbone_max_reads", "backbone_max_symbols"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"invalid {name}")
+        if self.backbone_batch_reads > 256 or self.backbone_max_reads < 4:
+            raise ValueError("invalid backbone batch/sample size")
+        if type(self.backbone_patience) is not int or self.backbone_patience < 0:
+            raise ValueError("backbone_patience must be nonnegative; 0 disables stopping")
+        if (isinstance(self.backbone_learning_rate, bool)
+                or not isinstance(self.backbone_learning_rate, (int, float))
+                or not math.isfinite(self.backbone_learning_rate) or self.backbone_learning_rate <= 0):
+            raise ValueError("invalid backbone_learning_rate")
+        if type(self.quantization_version) is not int or self.quantization_version not in (1, 2):
+            raise ValueError("invalid quantization_version")
+        if type(self.lora) is not bool or (self.lora and not self.cross_layer):
+            raise ValueError("lora requires cross_layer and a boolean flag")
+        if type(self.lora_rank) is not int or not 1 <= self.lora_rank <= 16:
+            raise ValueError("lora_rank must be in [1, 16]")
+        if type(self.lora_steps) is not int or self.lora_steps < 1:
+            raise ValueError("lora_steps must be positive")
+        if (isinstance(self.lora_learning_rate, bool) or not isinstance(self.lora_learning_rate, (float, int))
+                or not math.isfinite(self.lora_learning_rate) or self.lora_learning_rate <= 0):
+            raise ValueError("invalid lora_learning_rate")
+        if type(self.cross_layer) is not bool or (self.cross_layer and self.head_type != "residual"):
+            raise ValueError("cross_layer requires a residual head and a boolean flag")
+        if type(self.cross_dim) is not int or not 1 <= self.cross_dim <= 128:
+            raise ValueError("cross_dim must be in [1, 128]")
+        if self.head_type not in ("linear", "residual"):
+            raise ValueError("head_type must be linear or residual")
+        if type(self.residual_dim) is not int or not 1 <= self.residual_dim <= 128:
+            raise ValueError("residual_dim must be in [1, 128]")
+        for name in ("max_reads", "max_symbols", "max_read_length", "steps", "symbols_per_step", "seed"):
+            value = getattr(self, name)
+            if type(value) is not int or value < (0 if name == "seed" else 1):
+                raise ValueError(f"invalid head adaptation {name}")
+        if self.max_reads < 4:
+            raise ValueError("head adaptation needs max_reads >= 4")
+        for name in ("learning_rate", "anchor_strength", "max_seconds", "min_gain_bits_per_quality"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"invalid head adaptation {name}")
+        if self.learning_rate <= 0 or self.max_seconds < 0 or self.anchor_strength < 0 or self.min_gain_bits_per_quality < 0:
+            raise ValueError("invalid head adaptation rate, time, anchor or gain")
+
+
+def _head_parameters(head):
+    parameters = [head.weight, head.bias]
+    if isinstance(head, ResidualOutputHead):
+        parameters.extend((head.down.weight, head.down.bias, head.up.weight, head.up.bias))
+    if isinstance(head, CrossLayerOutputHead):
+        parameters.extend((head.cross_down.weight, head.cross_down.bias, head.cross_up.weight, head.cross_up.bias))
+    return parameters
+
+
+def _new_head(d_model, residual_dim, *, device, dtype, seed=0, cross_dim=None):
+    # Initialization runs on CPU with an isolated RNG, including during decode.
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        if cross_dim is not None:
+            head = CrossLayerOutputHead(d_model, residual_dim, cross_dim)
+        else:
+            head = (ResidualOutputHead(d_model, residual_dim) if residual_dim is not None
+                    else torch.nn.Linear(d_model, 42))
+    return head.to(device=device, dtype=dtype)
+
+
+def serialize_head(head, base_sha256):
+    arrays = [p.detach().cpu().numpy().astype("<f4", copy=False) for p in _head_parameters(head)]
+    if not all(np.isfinite(a).all() for a in arrays):
+        raise ValueError("adapter parameters must be finite")
+    raw = b"".join(a.tobytes(order="C") for a in arrays)
+    metadata = {
+        "format": ADAPTER_FORMAT, "version": 1, "dtype": "little_endian_float32",
+        "layout": "weight_row_major_then_bias", "application": "replace_output_head",
+        "base_checkpoint_sha256": base_sha256,
+        "weight_shape": list(arrays[0].shape), "bias_shape": list(arrays[1].shape),
+        "parameter_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+        "data_base64": base64.b64encode(raw).decode("ascii"),
+    }
+    if isinstance(head, ResidualOutputHead):
+        metadata.update(version=2, residual_dim=head.down.out_features, activation="gelu_exact",
+                        layout="weight_bias_down_weight_down_bias_up_weight_up_bias")
+        for name, array in zip(("down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"), arrays[2:]):
+            metadata[name] = list(array.shape)
+    if isinstance(head, CrossLayerOutputHead):
+        metadata.update(version=4, cross_dim=head.cross_down.out_features, source_layer=3,
+                        source_normalization="layer_norm_no_affine", source_eps=1e-5,
+                        layout=metadata["layout"] + "_cross_down_weight_cross_down_bias_cross_up_weight_cross_up_bias")
+        for name, array in zip(("cross_down_weight_shape", "cross_down_bias_shape", "cross_up_weight_shape", "cross_up_bias_shape"), arrays[6:]):
+            metadata[name] = list(array.shape)
+    return metadata
+
+
+def adapter_container_bytes(adapter):
+    """Actual additional canonical JSON members for a pure-neural adapter."""
+    if adapter is None:
+        return 0
+    return (len(json.dumps({"head_adapter": adapter}, sort_keys=True,
+                           separators=(",", ":")).encode()) - 1
+            + len('"probability_profile":null,'))
+
+
+def validate_head_adapter(metadata, d_model, base_sha256):
+    """Validate bounded plain data before allocating model tensors; no pickle."""
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 9:
+        from codec.adaptation.read_state import validate_read_state_adapter
+        return validate_read_state_adapter(metadata, d_model, base_sha256)
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 8:
+        from codec.adaptation.suffix_lora_adapter import validate_suffix_lora
+        return validate_suffix_lora(metadata, d_model, base_sha256)
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 6:
+        from codec.adaptation.lora_adapter import validate_lora_adapter
+        return validate_lora_adapter(metadata, d_model, base_sha256)
+    if isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata["version"] == 7:
+        from codec.adaptation.backbone_adapter import validate_backbone_adapter
+        return validate_backbone_adapter(metadata, d_model, base_sha256)
+    keys = {"format", "version", "dtype", "layout", "application", "base_checkpoint_sha256",
+            "weight_shape", "bias_shape", "parameter_bytes", "sha256", "data_base64"}
+    if not isinstance(metadata, dict):
+        raise ValueError("adapter fields missing or unknown")
+    version = metadata.get("version")
+    if type(version) is not int or version not in (1, 2, 4):
+        raise ValueError("unsupported adapter version")
+    if version >= 2:
+        keys.update(("residual_dim", "activation", "down_weight_shape", "down_bias_shape", "up_weight_shape", "up_bias_shape"))
+    if version == 4:
+        keys.update(("cross_dim", "source_layer", "source_normalization", "source_eps",
+                     "cross_down_weight_shape", "cross_down_bias_shape", "cross_up_weight_shape", "cross_up_bias_shape"))
+    if set(metadata) != keys:
+        raise ValueError("adapter fields missing or unknown")
+    layout = ("weight_row_major_then_bias" if version == 1 else
+              "weight_bias_down_weight_down_bias_up_weight_up_bias")
+    if version == 4:
+        layout += "_cross_down_weight_cross_down_bias_cross_up_weight_cross_up_bias"
+    if (metadata["format"] != ADAPTER_FORMAT or metadata["dtype"] != "little_endian_float32"
+            or metadata["layout"] != layout
+            or metadata["application"] != "replace_output_head"):
+        raise ValueError("unsupported adapter format or rules")
+    if type(d_model) is not int or not 1 <= d_model <= 65536:
+        raise ValueError("invalid adapter hidden dimension")
+    shapes = [("weight_shape", [42, d_model]), ("bias_shape", [42])]
+    if version >= 2:
+        width = metadata["residual_dim"]
+        if type(width) is not int or not 1 <= width <= 128 or metadata["activation"] != "gelu_exact":
+            raise ValueError("invalid residual head width or activation")
+        shapes.extend((("down_weight_shape", [width, d_model]), ("down_bias_shape", [width]),
+                       ("up_weight_shape", [42, width]), ("up_bias_shape", [42])))
+    if version == 4:
+        width = metadata["cross_dim"]
+        if (type(width) is not int or not 1 <= width <= 128
+                or type(metadata["source_layer"]) is not int or metadata["source_layer"] != 3
+                or metadata["source_normalization"] != "layer_norm_no_affine"
+                or type(metadata["source_eps"]) is not float or metadata["source_eps"] != 1e-5):
+            raise ValueError("invalid cross-layer head protocol")
+        shapes.extend((("cross_down_weight_shape", [width, d_model]), ("cross_down_bias_shape", [width]),
+                       ("cross_up_weight_shape", [42, width]), ("cross_up_bias_shape", [42])))
+    for name, expected in shapes:
+        shape = metadata[name]
+        if not isinstance(shape, list) or any(type(v) is not int for v in shape) or shape != expected:
+            raise ValueError("adapter shape mismatch")
+    if metadata["base_checkpoint_sha256"] != base_sha256:
+        raise ValueError("adapter base checkpoint SHA-256 mismatch")
+    size = sum(math.prod(shape) for _, shape in shapes) * 4
+    encoded = metadata["data_base64"]
+    if (type(metadata["parameter_bytes"]) is not int or metadata["parameter_bytes"] != size
+            or not isinstance(encoded, str) or len(encoded) != 4 * ((size + 2) // 3)):
+        raise ValueError("adapter parameter length mismatch")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("invalid adapter base64") from exc
+    if len(raw) != size or hashlib.sha256(raw).hexdigest() != metadata["sha256"]:
+        raise ValueError("adapter length or SHA-256 mismatch")
+    values = np.frombuffer(raw, dtype="<f4")
+    if not np.isfinite(values).all():
+        raise ValueError("adapter parameters must be finite")
+    return values
+
+
+def _restore_head(metadata, d_model, base_sha256, *, device, dtype):
+    values = validate_head_adapter(metadata, d_model, base_sha256)
+    head = _new_head(d_model, metadata.get("residual_dim"), device=device, dtype=dtype,
+                     cross_dim=metadata.get("cross_dim"))
+    offset = 0
+    with torch.no_grad():
+        for parameter in _head_parameters(head):
+            stop = offset + parameter.numel()
+            parameter.copy_(torch.from_numpy(values[offset:stop].copy().reshape(tuple(parameter.shape))))
+            offset = stop
+    return head
+
+
+def apply_head_adapter(model, metadata, base_sha256):
+    if isinstance(metadata, dict) and metadata.get("version") == 9:
+        from codec.adaptation.read_state import apply_read_state_adapter
+        return apply_read_state_adapter(model, metadata, base_sha256)
+    if isinstance(metadata, dict) and metadata.get("version") == 8:
+        from codec.adaptation.suffix_lora_adapter import apply_suffix_lora
+        return apply_suffix_lora(model, metadata, base_sha256)
+    if isinstance(metadata, dict) and metadata.get("version") == 7:
+        from codec.adaptation.backbone_adapter import apply_backbone_adapter
+        return apply_backbone_adapter(model, metadata, base_sha256)
+    if isinstance(metadata, dict) and metadata.get("version") == 6:
+        from codec.adaptation.lora_adapter import apply_lora_adapter
+        return apply_lora_adapter(model, metadata, base_sha256)
+    if isinstance(metadata, dict) and metadata.get("version") == 4 and model.config.num_layers < 4:
+        raise ValueError("cross-layer adapter requires at least 4 Transformer layers")
+    original = model.output_head
+    head = _restore_head(metadata, model.config.d_model, base_sha256,
+                         device=original.weight.device, dtype=original.weight.dtype)
+    from codec.adaptation.read_state import clear_conditioning
+    clear_conditioning(model)
+    if hasattr(model, "_backbone_original_parameters"):
+        from codec.adaptation.backbone_adapter import restore_backbone
+        restore_backbone(model)
+    head.train(original.training)
+    head.requires_grad_(original.weight.requires_grad)
+    head.bias.requires_grad_(original.bias.requires_grad)
+    if hasattr(model, "_lora_original_qkv"):
+        with torch.no_grad():
+            model.transformer.layers[3].self_attn.in_proj_weight.copy_(model._lora_original_qkv)
+        del model._lora_original_qkv
+    model.output_head = head
+
+
+def adapt_output_head(model, source, *, device, batch_reads, total, base_sha256, config):
+    """Return optional adapter + report; mutate only the accepted model head.
+
+    Prefix split is by whole reads (first 75% train, last 25% validation),
+    or by whole original blocks for a block-conditioned checkpoint.
+    By default admission tests held-out neural quantized bits.  With validation
+    disabled, all sampled reads train the head and the finite final step is used.
+    """
+    block_enabled = bool(getattr(model.config, "block_quality_features", False))
+    if block_enabled and ((config.backbone_layers and not config.backbone_lora_rank)
+                          or config.lora or config.read_quality_state):
+        raise ValueError("block-conditioned adaptation supports output heads and suffix LoRA, without dense, legacy LoRA, or read-state adaptation")
+    if block_enabled and batch_reads != model.config.block_reads:
+        raise ValueError("block-conditioned adaptation requires batch_reads equal to block_reads")
+    if config.backbone_layers:
+        from codec.adaptation.backbone_adapter import adapt_backbone
+        return adapt_backbone(model, source, device=device, batch_reads=batch_reads,
+                              total=total, base_sha256=base_sha256, config=config)
+    if config.lora:
+        if not config.validation_enabled:
+            raise ValueError("disabling adaptation validation does not support legacy head LoRA")
+        from codec.adaptation.lora_adapter import adapt_last_layer
+        return adapt_last_layer(model, source, device=device, batch_reads=batch_reads,
+                               total=total, base_sha256=base_sha256, config=config)
+    if config.cross_layer and model.config.num_layers < 4:
+        raise ValueError("cross-layer adaptation requires at least 4 Transformer layers")
+    started = time.perf_counter()
+    deadline = started + config.max_seconds if config.max_seconds else float("inf")
+    work_deadline = (started + config.max_seconds * 0.70
+                     if config.validation_enabled and config.max_seconds else deadline)
+    report = {"config": asdict(config), "accepted": False, "reason": "insufficient_prefix",
+              "steps_completed": 0, "prefix_reads": 0, "prefix_symbols": 0,
+              "train_reads": 0, "validation_reads": 0, "train_symbols": 0,
+              "validation_symbols": 0, "parameter_bytes": 0, "metadata_bytes": 0,
+              "before_validation_bits_per_quality": None,
+              "after_validation_bits_per_quality": None,
+              "selection_metric": "neural_only_quantized_bits_per_quality" if config.validation_enabled else None,
+              "validation_enabled": config.validation_enabled,
+              "validation_policy": "heldout_quantized_bits" if config.validation_enabled else "disabled",
+              "prefix_sha256": None, "sample_stop": "max_reads"}
+    stages = {}
+
+    def sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def finish(adapter=None):
+        sync()
+        report["seconds"] = time.perf_counter() - started
+        report["budget_exceeded"] = bool(config.max_seconds and report["seconds"] > config.max_seconds)
+        report["stage_seconds"] = stages
+        return adapter, report
+
+    records = []
+    digest = hashlib.sha256()
+    iterator = iter_fastq_records(Path(source))
+    try:
+        for _ in range(config.max_reads):
+            if time.perf_counter() >= work_deadline:
+                report["sample_stop"] = "time_budget"
+                break
+            record = next(iterator, None)
+            if record is None:
+                report["sample_stop"] = "eof"
+                break
+            length = len(record.quality)
+            if length > config.max_read_length or report["prefix_symbols"] + length > config.max_symbols:
+                report["sample_stop"] = "length_or_symbol_cap"
+                break
+            records.append(record)
+            digest.update(record.to_bytes())
+            report["prefix_symbols"] += length
+    finally:
+        iterator.close()
+    if block_enabled:
+        # A cap must not turn part of an original block into a new descriptor.
+        # Only a genuine file tail may use fewer than block_reads records.
+        block_reads = model.config.block_reads
+        if report["sample_stop"] != "eof":
+            records = records[:len(records) // block_reads * block_reads]
+        report["prefix_symbols"] = sum(len(r.quality) for r in records)
+        digest = hashlib.sha256()
+        for record in records:
+            digest.update(record.to_bytes())
+    stages["prefix_read"] = time.perf_counter() - started
+    report["prefix_sha256"] = digest.hexdigest()
+    report["prefix_reads"] = len(records)
+    if len(records) < 4:
+        return finish()
+    split = len(records) * 3 // 4 if config.validation_enabled else len(records)
+    if block_enabled:
+        block_count = (len(records) + block_reads - 1) // block_reads
+        if config.validation_enabled and block_count < 2:
+            report["reason"] = "insufficient_prefix_blocks"
+            return finish()
+        if config.validation_enabled:
+            split = max(1, min(block_count - 1, block_count * 3 // 4)) * block_reads
+        report.update(block_reads=block_reads, prefix_blocks=block_count,
+                      block_feature_mode=model.config.block_feature_mode)
+    report.update(train_reads=split, validation_reads=len(records) - split,
+                  train_read_range=[0, split], validation_read_range=[split, len(records)])
+
+    def make_batch(rows):
+        return make_fastq_batch([encode_base_ids(r.sequence) for r in rows],
+            [np.frombuffer(r.quality, dtype=np.uint8) - 33 for r in rows],
+            [r.read_index for r in rows], source_name=Path(source).name)
+
+    block_inputs = None
+    if block_enabled:
+        from codec.data.block_features import BLOCK_FEATURE_DIM, decode_block_features, encode_block_features
+        block_inputs = np.zeros((len(records), BLOCK_FEATURE_DIM), dtype=np.float32)
+        if model.config.block_feature_mode == "features":
+            for begin in range(0, len(records), block_reads):
+                if time.perf_counter() >= work_deadline:
+                    report["reason"] = "feature_time_budget"
+                    return finish()
+                rows = records[begin:begin + block_reads]
+                block_inputs[begin:begin + len(rows)] = decode_block_features(
+                    encode_block_features(make_batch(rows)))
+    original_training = model.training
+    original_requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
+    model.eval()
+    model.requires_grad_(False)
+    try:
+        feature_started = time.perf_counter()
+        cached = []
+        # Preallocate active-only features; avoid an additional full-size cat copy.
+        subsets = [("train", records[:split], 0)]
+        if config.validation_enabled:
+            subsets.append(("validation", records[split:], split))
+        for name, subset, source_begin in subsets:
+            n = sum(len(r.quality) for r in subset)
+            report[name + "_symbols"] = n
+            if not n:
+                return finish()
+            features = torch.empty((n, model.config.d_model * (2 if config.cross_layer else 1)), dtype=torch.float32, device=device)
+            labels = torch.empty(n, dtype=torch.long, device=device)
+            offset = 0
+            for begin in range(0, len(subset), batch_reads):
+                if time.perf_counter() >= work_deadline:
+                    report["reason"] = "feature_time_budget"
+                    return finish()
+                rows = subset[begin:begin + batch_reads]
+                batch = make_batch(rows)
+                tensors = fastq_batch_to_tensors(batch, device)
+                if block_inputs is not None:
+                    tensors["block_features"] = torch.as_tensor(
+                        block_inputs[source_begin + begin:source_begin + begin + len(rows)],
+                        dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    h = (model.forward_cross_layer_features(**tensors) if config.cross_layer
+                         else model.forward_features(**tensors))
+                    active = tensors["active_mask"]
+                    count = int(batch.active_mask.sum())
+                    features[offset:offset + count].copy_(h[active])
+                    labels[offset:offset + count].copy_(tensors["qualities"][active])
+                    offset += count
+                sync()
+            cached.append((features, labels))
+        stages["features"] = time.perf_counter() - feature_started
+        train_h, train_y = cached[0]
+        if config.validation_enabled:
+            val_h, val_y = cached[1]
+        if config.head_type == "residual":
+            head = _new_head(model.config.d_model, config.residual_dim, device=device,
+                             dtype=model.output_head.weight.dtype, seed=config.seed,
+                             cross_dim=config.cross_dim if config.cross_layer else None)
+            with torch.no_grad():
+                head.weight.copy_(model.output_head.weight)
+                head.bias.copy_(model.output_head.bias)
+        else:
+            head = copy.deepcopy(model.output_head)
+        head.requires_grad_(True)
+        anchor = [p.detach().clone() for p in head.parameters()]
+        optimizer = torch.optim.Adam(head.parameters(), lr=config.learning_rate)
+        generator = torch.Generator(device=device).manual_seed(config.seed)
+        train_started = time.perf_counter()
+        for _ in range(config.steps):
+            if time.perf_counter() >= work_deadline:
+                break
+            indices = torch.randint(train_y.numel(), (min(config.symbols_per_step, train_y.numel()),),
+                                    generator=generator, device=device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.cross_entropy(head(train_h[indices]), train_y[indices])
+            loss = loss + config.anchor_strength * sum(
+                (p - a).square().mean() for p, a in zip(head.parameters(), anchor))
+            if not torch.isfinite(loss):
+                report["reason"] = "nonfinite_training"
+                return finish()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            optimizer.step()
+            sync()
+            report["steps_completed"] += 1
+        stages["optimization"] = time.perf_counter() - train_started
+        if not report["steps_completed"]:
+            report["reason"] = "training_time_budget"
+            return finish()
+        if not all(torch.isfinite(p).all() for p in head.parameters()):
+            report["reason"] = "nonfinite_training"
+            return finish()
+        serialization_started = time.perf_counter()
+        adapter = serialize_head(head, base_sha256)
+        # Validate/restore the exact wire representation before admission scoring.
+        wire_head = _restore_head(adapter, model.config.d_model, base_sha256,
+                                  device=device, dtype=head.weight.dtype).requires_grad_(False)
+        report["candidate_parameter_bytes"] = adapter["parameter_bytes"]
+        report["candidate_metadata_bytes"] = len(json.dumps(adapter, sort_keys=True, separators=(",", ":")).encode())
+        stages["serialization"] = time.perf_counter() - serialization_started
+        if not config.validation_enabled:
+            apply_head_adapter(model, adapter, base_sha256)
+            sync()
+            report.update(accepted=True, reason="final_step_without_validation",
+                          parameter_bytes=adapter["parameter_bytes"],
+                          metadata_bytes=report["candidate_metadata_bytes"])
+            return finish(adapter)
+        validation_started = time.perf_counter()
+
+        def score(candidate):
+            bits = 0.0
+            with torch.no_grad():
+                for begin in range(0, val_y.numel(), 4096):
+                    if time.perf_counter() >= deadline:
+                        return None
+                    inputs = val_h[begin:begin + 4096]
+                    if config.cross_layer and not isinstance(candidate, CrossLayerOutputHead):
+                        inputs = inputs[:, :model.config.d_model]
+                    logits = candidate(inputs).cpu().numpy()
+                    targets = val_y[begin:begin + 4096].cpu().numpy()
+                    cdfs = logits_to_cdfs(logits, total=total, version=config.quantization_version)
+                    bits += selected_quantized_bits(targets, cdfs, cdfs[:, -1])
+            return bits / val_y.numel()
+
+        before, after = score(model.output_head), score(wire_head)
+        stages["validation"] = time.perf_counter() - validation_started
+        report["before_validation_bits_per_quality"] = before
+        report["after_validation_bits_per_quality"] = after
+        if before is None or after is None or time.perf_counter() >= deadline:
+            report["reason"] = "validation_time_budget"
+        elif before - after <= config.min_gain_bits_per_quality:
+            report["reason"] = "no_validation_gain"
+        else:
+            apply_head_adapter(model, adapter, base_sha256)
+            sync()
+            report.update(accepted=True, reason="validation_gain", parameter_bytes=adapter["parameter_bytes"],
+                          metadata_bytes=report["candidate_metadata_bytes"])
+            return finish(adapter)
+        return finish()
+    finally:
+        for name, p in model.named_parameters():
+            p.requires_grad_(original_requires_grad.get(name, original_requires_grad["output_head.weight"]))
+        model.train(original_training)
+
+
+__all__ = ["HeadAdaptationConfig", "adapt_output_head", "apply_head_adapter",
+           "serialize_head", "validate_head_adapter"]
